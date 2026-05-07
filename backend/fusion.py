@@ -31,7 +31,15 @@ DOMAIN = "maritime"
 # ----------------------------------------------------------------------
 # Tunables — would be config in production
 # ----------------------------------------------------------------------
-AIS_GAP_THRESHOLD = timedelta(minutes=15)   # AIS reports normally every 2-10 min
+# 8-minute threshold tuned against ~12 minutes of live Texas-shoreline AIS
+# data on 2026-05-07: 742 inter-arrival gaps across 299 vessels showed
+# p50=61s, p90=3min, p99=5.3min, max-observed=9.5min. 8min sits comfortably
+# beyond the 99th percentile of normal reporting cadence so genuine
+# dropouts surface without crying wolf on slow Class B reporters.
+# Revisit after we have a longer window — vessels moored in port may
+# legitimately go quiet for 15+ minutes and the current sample doesn't
+# include enough port-state observations to model that case.
+AIS_GAP_THRESHOLD = timedelta(minutes=8)
 SAR_AIS_MATCH_RADIUS_KM = 1.5               # how close a SAR blob must be to an AIS report
 SAR_AIS_MATCH_WINDOW = timedelta(minutes=20)
 

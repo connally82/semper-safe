@@ -44,9 +44,36 @@ app.add_middleware(
 maritime = FusionEngine()
 wildfire = WildfireFusion()
 
-# Background task handle so we can cancel cleanly on shutdown.
+# Background task handles so we can cancel cleanly on shutdown.
 _aisstream_task: asyncio.Task[None] | None = None
 _aisstream_cancel: asyncio.Event | None = None
+_gap_sweeper_task: asyncio.Task[None] | None = None
+_gap_sweeper_cancel: asyncio.Event | None = None
+
+# How often to scan maritime entities for AIS dropouts. The sweep is cheap
+# (in-memory iteration over self.entities); the real cost is the audit/store
+# writes for any newly-flagged gaps. 60s is a reasonable default — a 30s
+# sweep would surface dropouts faster but double the audit churn.
+GAP_SWEEP_INTERVAL_S = 60
+
+
+async def _gap_sweeper_loop(cancel: asyncio.Event) -> None:
+    """Periodic AIS-gap detection. Replaces the per-ingest detect_gaps
+    calls that the synthetic seed used — real-time AIS arrives one
+    message at a time, so dropouts only surface from a sweep."""
+    from datetime import datetime, timezone
+    while not cancel.is_set():
+        try:
+            await asyncio.wait_for(cancel.wait(), timeout=GAP_SWEEP_INTERVAL_S)
+        except asyncio.TimeoutError:
+            try:
+                # Run the (sync) sweep off the event loop so we don't block
+                # AISStream message handling on Postgres write-throughs.
+                await asyncio.to_thread(
+                    maritime.detect_gaps, datetime.now(timezone.utc),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("gap sweep crashed: %s", exc)
 
 
 def _seed_maritime() -> None:
@@ -134,7 +161,7 @@ def _bootstrap():
     # Phase 2: kick off the AISStream background task if a key is set.
     api_key = os.environ.get("AISSTREAM_API_KEY", "").strip()
     if api_key:
-        global _aisstream_task, _aisstream_cancel
+        global _aisstream_task, _aisstream_cancel, _gap_sweeper_task, _gap_sweeper_cancel
         _aisstream_cancel = asyncio.Event()
 
         async def _on_observation(obs):
@@ -167,21 +194,31 @@ def _bootstrap():
             payload={"bbox": aisstream.TEXAS_SHORELINE_BBOX},
         )
         log.info("aisstream worker started")
+
+        # Companion task: periodic AIS-gap sweep. Runs only when AIS is
+        # ingesting — without live data, the sweep wouldn't have anything
+        # to flag against (seed entities have synthetic last_seen times).
+        _gap_sweeper_cancel = asyncio.Event()
+        _gap_sweeper_task = loop.create_task(_gap_sweeper_loop(_gap_sweeper_cancel))
+        log.info("gap sweeper started (interval=%ds, threshold=%s)",
+                 GAP_SWEEP_INTERVAL_S, "8min")
     else:
-        log.info("AISSTREAM_API_KEY not set; skipping AIS ingestion")
+        log.info("AISSTREAM_API_KEY not set; skipping AIS ingestion + gap sweep")
 
 
 @app.on_event("shutdown")
 async def _shutdown():
-    global _aisstream_task, _aisstream_cancel
-    if _aisstream_cancel is not None:
-        _aisstream_cancel.set()
-    if _aisstream_task is not None:
-        _aisstream_task.cancel()
-        try:
-            await _aisstream_task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
+    global _aisstream_task, _aisstream_cancel, _gap_sweeper_task, _gap_sweeper_cancel
+    for cancel in (_aisstream_cancel, _gap_sweeper_cancel):
+        if cancel is not None:
+            cancel.set()
+    for task in (_aisstream_task, _gap_sweeper_task):
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
 
 
 class DecisionRequest(BaseModel):
