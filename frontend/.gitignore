@@ -1,0 +1,25 @@
+# Build artifacts
+dist
+.vite
+
+# Dependencies
+node_modules
+
+# Local env files (real values never in git)
+.env
+.env.local
+.env.*.local
+
+# Editor / OS
+.DS_Store
+.vscode
+.idea
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Type-check cache
+*.tsbuildinfo

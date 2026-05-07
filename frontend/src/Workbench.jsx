@@ -11,7 +11,10 @@ import React, { useState, useMemo, useRef, useEffect, useCallback } from "react"
 //     the API would return. Decisions stay client-side in offline mode.
 // =============================================================
 
-const API_BASE = "http://localhost:8000";
+// Configurable per environment via Vite's import.meta.env.
+//   dev:  VITE_API_BASE=http://localhost:8000  (frontend/.env.local)
+//   prod: VITE_API_BASE=https://semper-safe.fly.dev  (Vercel env)
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
 // =============================================================
 //   Embedded scenario data (offline fallback)
