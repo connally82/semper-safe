@@ -12,6 +12,8 @@ Run:  uvicorn main:app --reload --port 8000
 """
 
 from __future__ import annotations
+import os
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -71,12 +73,18 @@ def _bootstrap():
     audit_log.append(actor="system", event_type="process_started",
                      payload={"persistent": store.is_persistent()})
 
+    # SKIP_SEED=1 boots a Postgres-backed app without running the synthetic
+    # seed scenarios — useful for the first deploy against a fresh DB
+    # (~1788 Neon round-trips would exceed Fly's 60s grace_period cap).
+    # Once the seed pipeline is batched, this flag goes away.
+    skip_seed = os.environ.get("SKIP_SEED") == "1"
+
     if store.is_persistent() and not store.is_empty("maritime"):
         maritime.load_persisted_state()
         audit_log.append(actor="system", event_type="domain_resumed",
                          payload={"domain": "maritime",
                                   "entities": len(maritime.entities)})
-    else:
+    elif not skip_seed:
         _seed_maritime()
 
     if store.is_persistent() and not store.is_empty("wildfire"):
@@ -84,7 +92,7 @@ def _bootstrap():
         audit_log.append(actor="system", event_type="domain_resumed",
                          payload={"domain": "wildfire",
                                   "entities": len(wildfire.entities)})
-    else:
+    elif not skip_seed:
         _seed_wildfire()
 
 
