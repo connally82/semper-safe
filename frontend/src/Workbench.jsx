@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useRef, useEffect, useCallback } from "react";
+import MapLibreView from "./MapLibreView.jsx";
 
 // =============================================================
 //   SEMPER SAFE — Multi-Domain Workbench
@@ -1013,7 +1014,7 @@ export default function Workbench() {
               cfg={cfg}
             />
           </div>
-          <MapView
+          <MapLibreView
             entities={sortedEntities}
             selectedId={selectedId}
             onSelect={(id) => setSelection(s => ({ ...s, [domainKey]: id }))}
