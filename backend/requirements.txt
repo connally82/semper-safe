@@ -6,4 +6,5 @@ pydantic>=2.7
 sqlalchemy>=2.0
 psycopg[binary]>=3.2     # Postgres driver (binary wheel, no libpq required at runtime)
 geoalchemy2>=0.15        # PostGIS column types for SQLAlchemy
+shapely>=2.0             # geometry shape conversions used by geoalchemy2
 alembic>=1.13            # migrations

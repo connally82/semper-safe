@@ -27,7 +27,11 @@ from models import (
     Recommendation, ActionType, Decision, Geom,
 )
 from audit import audit_log
+from db import store
 from fusion import haversine_km   # reuse from core
+
+
+DOMAIN = "wildfire"
 
 
 # ----------------------------------------------------------------------
@@ -63,10 +67,18 @@ class WildfireFusion:
         self.entities: dict[str, Entity] = {}
         self.recommendations: dict[str, Recommendation] = {}
 
+    def load_persisted_state(self) -> None:
+        """Pull existing wildfire entities from Postgres into in-memory dicts."""
+        loaded = store.load_state(DOMAIN)
+        self.observations.update(loaded.observations)
+        self.entities.update(loaded.entities)
+        self.recommendations.update(loaded.recommendations)
+
     # --- ingest -------------------------------------------------------
     def ingest(self, obs: Observation) -> Entity | None:
         """Route observation to the right fusion path."""
         self.observations[obs.obs_id] = obs
+        store.put_observation(obs, domain=DOMAIN)
         audit_log.append(
             actor="system",
             event_type="observation_added",
@@ -124,6 +136,7 @@ class WildfireFusion:
                     payload={"obs_id": obs.obs_id, "entity_id": existing,
                              "method": "thermal_cluster"},
                 )
+            store.put_entity(ent, domain=DOMAIN)
             return ent
 
         # New hotspot — single detection, low priority until corroborated
@@ -143,6 +156,7 @@ class WildfireFusion:
                    "smoke corroboration before escalation."),
         )
         self.entities[eid] = ent
+        store.put_entity(ent, domain=DOMAIN)
         audit_log.append(
             actor="system",
             event_type="entity_created",
@@ -182,6 +196,7 @@ class WildfireFusion:
                     payload={"obs_id": obs.obs_id, "entity_id": nearest,
                              "method": "smoke_to_thermal"},
                 )
+            store.put_entity(ent, domain=DOMAIN)
             return ent
 
         # Orphan smoke detection — log as standalone smoke_plume entity
@@ -199,6 +214,7 @@ class WildfireFusion:
                    "Possibly distant fire, controlled burn, or dust."),
         )
         self.entities[eid] = ent
+        store.put_entity(ent, domain=DOMAIN)
         audit_log.append(
             actor="system", event_type="entity_created",
             payload={"entity_id": eid, "type": "smoke_plume", "via": "optical"},
@@ -240,6 +256,7 @@ class WildfireFusion:
                              "to": round(ent.priority_score, 2),
                              "reason": "red_flag_conditions"},
                 )
+            store.put_entity(ent, domain=DOMAIN)
         return None
 
     # --- false-positive suppression -----------------------------------
@@ -263,6 +280,7 @@ class WildfireFusion:
             attrs={"suppression_reason": label},
         )
         self.entities[eid] = ent
+        store.put_entity(ent, domain=DOMAIN)
         audit_log.append(
             actor="system", event_type="false_positive_suppressed",
             payload={"entity_id": eid, "label": label,
@@ -312,6 +330,7 @@ class WildfireFusion:
             suggested_at=ent.last_seen,
         )
         self.recommendations[rec.rec_id] = rec
+        store.put_recommendation(rec)
         audit_log.append(
             actor="system", event_type="recommendation_made",
             payload={"rec_id": rec.rec_id, "entity_id": ent.entity_id,
@@ -342,6 +361,7 @@ class WildfireFusion:
             rec.decided_by = operator
             rec.decided_at = now
             rec.decision_reason = reason
+            store.put_recommendation(rec)
             audit_log.append(
                 actor=operator, event_type="decision",
                 payload={"rec_id": rec.rec_id, "entity_id": entity_id,

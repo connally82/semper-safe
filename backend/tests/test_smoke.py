@@ -44,7 +44,9 @@ def test_health_returns_both_domains(client) -> None:
     assert isinstance(body["audit_head"], str) and len(body["audit_head"]) == 64
     # Seed scenarios produce a deterministic count (1788 entries as of 2026-05-07).
     # If this changes, double-check it was an intentional change to seed data, not a regression.
-    assert body["audit_entries"] == 1788
+    # Seed scenarios + 1 'process_started' entry on boot. If this changes,
+    # double-check it was an intentional change to seed data or startup events.
+    assert body["audit_entries"] == 1789
 
 
 def test_audit_chain_verifies(client) -> None:
@@ -53,7 +55,7 @@ def test_audit_chain_verifies(client) -> None:
     body = r.json()
     assert body["valid"] is True
     assert body["first_bad_seq"] is None
-    assert body["entry_count"] == 1788
+    assert body["entry_count"] == 1789
 
 
 def test_maritime_returns_dark_vessels_and_gaps(client) -> None:

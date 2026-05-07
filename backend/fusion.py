@@ -22,6 +22,10 @@ from models import (
     Recommendation, ActionType, Decision, Geom,
 )
 from audit import audit_log
+from db import store
+
+
+DOMAIN = "maritime"
 
 
 # ----------------------------------------------------------------------
@@ -55,10 +59,24 @@ class FusionEngine:
         # AIS source_id (MMSI) → entity_id  (each MMSI is one vessel)
         self._mmsi_index: dict[str, str] = {}
 
+    def load_persisted_state(self) -> None:
+        """Pull existing entities/observations/recommendations from Postgres
+        into in-memory state. Called once on startup if DB has data."""
+        loaded = store.load_state(DOMAIN)
+        self.observations.update(loaded.observations)
+        self.entities.update(loaded.entities)
+        self.recommendations.update(loaded.recommendations)
+        # Rebuild MMSI index from loaded entities
+        for ent in self.entities.values():
+            mmsi = ent.attrs.get("mmsi")
+            if mmsi:
+                self._mmsi_index[str(mmsi)] = ent.entity_id
+
     # --- ingest -------------------------------------------------------
     def ingest(self, obs: Observation) -> Entity:
         """Take an observation, fold it into the right entity."""
         self.observations[obs.obs_id] = obs
+        store.put_observation(obs, domain=DOMAIN)
         audit_log.append(
             actor="system",
             event_type="observation_added",
@@ -91,6 +109,7 @@ class FusionEngine:
                 attrs={"mmsi": mmsi, **obs.attrs},
             )
             self.entities[eid] = ent
+            store.put_entity(ent, domain=DOMAIN)
             audit_log.append(
                 actor="system",
                 event_type="entity_created",
@@ -111,6 +130,7 @@ class FusionEngine:
                 event_type="entity_reclassified",
                 payload={"entity_id": eid, "to": "vessel", "reason": "ais_resumed"},
             )
+        store.put_entity(ent, domain=DOMAIN)
         return ent
 
     def _ingest_sar(self, obs: Observation) -> Entity:
@@ -122,6 +142,7 @@ class FusionEngine:
             ent.observation_ids.append(obs.obs_id)
             ent.last_seen = max(ent.last_seen, obs.t)
             ent.confidence = min(1.0, ent.confidence + 0.005)
+            store.put_entity(ent, domain=DOMAIN)
             audit_log.append(
                 actor="system",
                 event_type="observation_associated",
@@ -142,6 +163,7 @@ class FusionEngine:
             # Repeated SAR detections with no AIS = stronger dark-vessel signal
             ent.confidence = min(0.95, ent.confidence + 0.05)
             ent.priority_score = min(1.0, ent.priority_score + 0.05)
+            store.put_entity(ent, domain=DOMAIN)
             audit_log.append(
                 actor="system",
                 event_type="observation_associated",
@@ -165,6 +187,7 @@ class FusionEngine:
             notes="SAR detection with no matching AIS report in window.",
         )
         self.entities[eid] = ent
+        store.put_entity(ent, domain=DOMAIN)
         audit_log.append(
             actor="system",
             event_type="entity_created",
@@ -226,6 +249,7 @@ class FusionEngine:
                 ent.priority_score = 0.55     # medium — could be benign or IUU
                 ent.notes = (f"AIS dropout. Last report "
                              f"{ent.last_seen.isoformat()}.")
+                store.put_entity(ent, domain=DOMAIN)
                 audit_log.append(
                     actor="system",
                     event_type="entity_reclassified",
@@ -261,6 +285,7 @@ class FusionEngine:
             suggested_at=ent.last_seen,
         )
         self.recommendations[rec.rec_id] = rec
+        store.put_recommendation(rec)
         audit_log.append(
             actor="system",
             event_type="recommendation_made",
@@ -282,6 +307,7 @@ class FusionEngine:
             rec.decided_by = operator
             rec.decided_at = now
             rec.decision_reason = reason
+            store.put_recommendation(rec)
             audit_log.append(
                 actor=operator,
                 event_type="decision",

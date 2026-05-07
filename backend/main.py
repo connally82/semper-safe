@@ -20,6 +20,7 @@ from models import Decision
 from fusion import FusionEngine
 from wildfire import WildfireFusion
 from audit import audit_log
+from db import store
 from seed_data import build_scenario, SCENARIO_START as MARITIME_START
 from wildfire_seed import build_wildfire_scenario
 
@@ -34,8 +35,7 @@ maritime = FusionEngine()
 wildfire = WildfireFusion()
 
 
-@app.on_event("startup")
-def _bootstrap():
+def _seed_maritime() -> None:
     audit_log.append(actor="system", event_type="domain_loaded",
                      payload={"domain": "maritime"})
     mar_scenario = build_scenario()
@@ -47,11 +47,45 @@ def _bootstrap():
             last_t = obs.t
     maritime.detect_gaps(mar_scenario[-1].t)
 
+
+def _seed_wildfire() -> None:
     audit_log.append(actor="system", event_type="domain_loaded",
                      payload={"domain": "wildfire"})
     fire_scenario = build_wildfire_scenario()
     for obs in fire_scenario:
         wildfire.ingest(obs)
+
+
+@app.on_event("startup")
+def _bootstrap():
+    """Phase 1 startup:
+       - If a DB is configured AND already has entities for a domain, load
+         them in-memory and skip the seed scenario for that domain.
+       - Otherwise, run the seed scenario (which now also writes through
+         to the DB on every ingest, when DATABASE_URL is set).
+
+    The audit log is shared across runs when DB-backed, so a "process_started"
+    entry on every cold-boot is what surfaces restarts in the chain — exactly
+    what the Phase 1 exit criterion calls for.
+    """
+    audit_log.append(actor="system", event_type="process_started",
+                     payload={"persistent": store.is_persistent()})
+
+    if store.is_persistent() and not store.is_empty("maritime"):
+        maritime.load_persisted_state()
+        audit_log.append(actor="system", event_type="domain_resumed",
+                         payload={"domain": "maritime",
+                                  "entities": len(maritime.entities)})
+    else:
+        _seed_maritime()
+
+    if store.is_persistent() and not store.is_empty("wildfire"):
+        wildfire.load_persisted_state()
+        audit_log.append(actor="system", event_type="domain_resumed",
+                         payload={"domain": "wildfire",
+                                  "entities": len(wildfire.entities)})
+    else:
+        _seed_wildfire()
 
 
 class DecisionRequest(BaseModel):

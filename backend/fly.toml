@@ -23,6 +23,12 @@ primary_region = "dfw"
   # Container PORT is read by the Dockerfile CMD.
   PORT = "8000"
 
+# Run Alembic migrations once before machines roll. Idempotent — if
+# the DB is already at head, this is a no-op. DATABASE_URL is read from
+# the secret set via `flyctl secrets set DATABASE_URL=...`.
+[deploy]
+  release_command = "alembic upgrade head"
+
 [http_service]
   internal_port = 8000
   force_https = true
@@ -31,8 +37,12 @@ primary_region = "dfw"
   min_machines_running = 0
   processes = ["app"]
 
+  # 180s grace covers the cold-start case where DB is empty and the
+  # seed scenario writes ~1,800 audit entries to Neon (each is a
+  # network round trip). Subsequent restarts skip the seed and boot
+  # in under 5 seconds.
   [[http_service.checks]]
-    grace_period = "15s"
+    grace_period = "180s"
     interval = "30s"
     method = "GET"
     timeout = "5s"
