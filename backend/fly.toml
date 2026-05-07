@@ -1,0 +1,45 @@
+# fly.toml — Semper Safe backend
+#
+# Generated stub. Adjust if `fly launch` rewrites it; the values here are
+# the ones we'd pick in the interactive prompts:
+#   - app name: semper-safe (already exists per Fly API)
+#   - region:   dfw (Dallas — closest to the Texas AOI)
+#   - port:     8000 internal, 80/443 public via Fly's edge
+#   - VM:       smallest shared-cpu (free tier covers this)
+#
+# Deploy with:
+#   cd backend
+#   fly deploy --remote-only
+#
+# `--remote-only` uses Fly's builders so you don't need Docker locally.
+
+app = "semper-safe"
+primary_region = "dfw"
+
+# The Dockerfile in this directory is the build context.
+[build]
+
+[env]
+  # Container PORT is read by the Dockerfile CMD.
+  PORT = "8000"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  [[http_service.checks]]
+    grace_period = "15s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1
