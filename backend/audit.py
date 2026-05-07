@@ -22,6 +22,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any
@@ -58,6 +60,11 @@ class _InMemoryAuditLog:
         self._entries: list[AuditEntry] = []
         self._lock = Lock()
 
+    @contextmanager
+    def batched(self) -> Iterator[None]:
+        """No-op in in-memory mode — appends are already cheap."""
+        yield
+
     def append(self, *, actor: str, event_type: str,
                payload: dict[str, Any]) -> AuditEntry:
         with self._lock:
@@ -91,15 +98,72 @@ class _InMemoryAuditLog:
 
 
 class _PostgresAuditLog:
-    """DB-backed implementation. Hash chain integrity backed by UNIQUE constraints."""
+    """DB-backed implementation. Hash chain integrity backed by UNIQUE constraints.
+
+    Supports a `batched()` context manager: appends inside the context are
+    buffered to an in-memory log, then flushed to Postgres in a single INSERT
+    on exit. Used by the seed pipeline so 1000+ entries cost ~1 round trip
+    instead of 1000.
+    """
 
     def __init__(self) -> None:
         # In-process lock to avoid hot retries when one FastAPI worker writes
         # rapidly. Cross-process safety still relies on UNIQUE(prev_hash).
         self._lock = Lock()
+        self._batch: _InMemoryAuditLog | None = None
+
+    @contextmanager
+    def batched(self) -> Iterator[None]:
+        """Buffer appends in memory; bulk-INSERT all on exit.
+
+        Caller must guarantee the DB chain is empty (or pre-coordinate a
+        seq+prev_hash starting point). The seed pipeline only enters this
+        context when both is_empty checks pass for the relevant domains.
+        """
+        if self._batch is not None:
+            raise RuntimeError("audit_log.batched() is not re-entrant")
+        with self._lock:
+            self._batch = _InMemoryAuditLog()
+        try:
+            yield
+        finally:
+            buf = self._batch
+            with self._lock:
+                self._batch = None
+            if buf is not None:
+                self._flush_batch(buf)
+
+    def _flush_batch(self, buf: "_InMemoryAuditLog") -> int:
+        from db import models as dbm
+        from db.session import session_scope
+
+        entries = buf.all()
+        if not entries:
+            return 0
+        rows = [
+            {
+                "seq": e.seq,
+                "t": e.t,
+                "actor": e.actor,
+                "event_type": e.event_type,
+                "payload": e.payload,
+                "prev_hash": e.prev_hash,
+                "self_hash": e.self_hash,
+            }
+            for e in entries
+        ]
+        with session_scope() as s:
+            s.execute(dbm.AuditEntryRow.__table__.insert(), rows)
+        return len(rows)
 
     def append(self, *, actor: str, event_type: str,
                payload: dict[str, Any]) -> AuditEntry:
+        # If we're inside batched(), defer to the in-memory buffer.
+        if self._batch is not None:
+            return self._batch.append(
+                actor=actor, event_type=event_type, payload=payload,
+            )
+
         # Imported lazily so importing audit.py without DATABASE_URL doesn't
         # try to construct an engine.
         from db import models as dbm
@@ -173,6 +237,38 @@ class _PostgresAuditLog:
                     return False, r.seq
                 prev_hash = r.self_hash
             return True, None
+
+    def bulk_append_from(self, in_mem: "_InMemoryAuditLog") -> int:
+        """Copy entries from an in-memory log to Postgres in a single INSERT.
+
+        Used by the seed pipeline. The in-memory log already has a
+        consistent hash chain starting from GENESIS_HASH; we just persist
+        it. Caller is responsible for ensuring the DB chain is empty
+        (or that the in-memory chain's first prev_hash matches the DB head),
+        otherwise UNIQUE(prev_hash) will reject the insert.
+        """
+        from db import models as dbm
+        from db.session import session_scope
+
+        entries = in_mem.all()
+        if not entries:
+            return 0
+
+        rows = [
+            {
+                "seq": e.seq,
+                "t": e.t,
+                "actor": e.actor,
+                "event_type": e.event_type,
+                "payload": e.payload,
+                "prev_hash": e.prev_hash,
+                "self_hash": e.self_hash,
+            }
+            for e in entries
+        ]
+        with self._lock, session_scope() as s:
+            s.execute(dbm.AuditEntryRow.__table__.insert(), rows)
+        return len(rows)
 
 
 def _build_audit_log():

@@ -60,40 +60,64 @@ def _seed_wildfire() -> None:
 
 @app.on_event("startup")
 def _bootstrap():
-    """Phase 1 startup:
-       - If a DB is configured AND already has entities for a domain, load
-         them in-memory and skip the seed scenario for that domain.
-       - Otherwise, run the seed scenario (which now also writes through
-         to the DB on every ingest, when DATABASE_URL is set).
+    """Phase 1.1 startup pipeline:
+       - DB has entities for a domain → load them in-memory.
+       - DB is empty + seed not skipped → run seed in a single bulk transaction:
+           a) audit_log.batched(): all audit appends buffer in memory
+           b) store.disable_persistence(): engines mutate in-memory only
+           c) _seed_maritime() + _seed_wildfire() run normally
+           d) on context exit: in-memory audit chain bulk-INSERTs
+           e) store.bulk_seed_state() flushes engine state in one txn per domain
+       - SKIP_SEED=1 boots empty (kept around as an escape hatch).
 
-    The audit log is shared across runs when DB-backed, so a "process_started"
-    entry on every cold-boot is what surfaces restarts in the chain — exactly
-    what the Phase 1 exit criterion calls for.
+    The first deploy used to take ~5 min (per-call commits over Neon).
+    This pipeline collapses it to ~5s — fits well inside Fly's 60s grace.
     """
-    audit_log.append(actor="system", event_type="process_started",
-                     payload={"persistent": store.is_persistent()})
-
-    # SKIP_SEED=1 boots a Postgres-backed app without running the synthetic
-    # seed scenarios — useful for the first deploy against a fresh DB
-    # (~1788 Neon round-trips would exceed Fly's 60s grace_period cap).
-    # Once the seed pipeline is batched, this flag goes away.
     skip_seed = os.environ.get("SKIP_SEED") == "1"
+    persistent = store.is_persistent()
 
-    if store.is_persistent() and not store.is_empty("maritime"):
+    maritime_empty = persistent and store.is_empty("maritime")
+    wildfire_empty = persistent and store.is_empty("wildfire")
+
+    if persistent and not maritime_empty:
         maritime.load_persisted_state()
-        audit_log.append(actor="system", event_type="domain_resumed",
-                         payload={"domain": "maritime",
-                                  "entities": len(maritime.entities)})
-    elif not skip_seed:
-        _seed_maritime()
-
-    if store.is_persistent() and not store.is_empty("wildfire"):
+    if persistent and not wildfire_empty:
         wildfire.load_persisted_state()
-        audit_log.append(actor="system", event_type="domain_resumed",
-                         payload={"domain": "wildfire",
-                                  "entities": len(wildfire.entities)})
-    elif not skip_seed:
-        _seed_wildfire()
+
+    if (not skip_seed) and (maritime_empty or not persistent) and \
+            (wildfire_empty or not persistent):
+        # Fresh DB (or no DB) — run the seed. Use the batched pipeline when
+        # DB-backed so it costs ~3 INSERTs total instead of thousands.
+        with audit_log.batched(), store.disable_persistence():
+            _seed_maritime()
+            _seed_wildfire()
+        if persistent:
+            mar_counts = store.bulk_seed_state(
+                observations=maritime.observations.values(),
+                entities=maritime.entities.values(),
+                recommendations=maritime.recommendations.values(),
+                domain="maritime",
+            )
+            fire_counts = store.bulk_seed_state(
+                observations=wildfire.observations.values(),
+                entities=wildfire.entities.values(),
+                recommendations=wildfire.recommendations.values(),
+                domain="wildfire",
+            )
+            audit_log.append(
+                actor="system", event_type="seed_persisted",
+                payload={"maritime": mar_counts, "wildfire": fire_counts},
+            )
+
+    # Boot marker — written AFTER any seed so the seed entries take seq=0..N-1
+    # and process_started follows them. Restarts append more process_started
+    # entries to the chain (Phase 1 exit criterion).
+    audit_log.append(actor="system", event_type="process_started",
+                     payload={"persistent": persistent,
+                              "domains_loaded":
+                                  [d for d, e in
+                                   [("maritime", maritime), ("wildfire", wildfire)]
+                                   if e.entities]})
 
 
 class DecisionRequest(BaseModel):

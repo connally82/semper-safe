@@ -14,6 +14,8 @@ the engines stay purely in-memory (used by pytest + local dev w/o a DB).
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from typing import NamedTuple
 
@@ -32,9 +34,30 @@ from models import (
 )
 
 
+# Module-level override used by the seed pipeline. When True, put_* are no-ops
+# even if DATABASE_URL is set. The seed runs the engines in pure in-memory
+# mode and then calls bulk_seed_state once at the end (one transaction).
+_force_in_memory = False
+
+
 def is_persistent() -> bool:
     """True if the store should write to / read from Postgres."""
+    if _force_in_memory:
+        return False
     return bool(os.environ.get("DATABASE_URL"))
+
+
+@contextmanager
+def disable_persistence() -> Iterator[None]:
+    """Suppress all put_* writes within this block. Used by the seed pipeline
+    so the engines mutate in-memory only; bulk_seed_state flushes after."""
+    global _force_in_memory
+    prev = _force_in_memory
+    _force_in_memory = True
+    try:
+        yield
+    finally:
+        _force_in_memory = prev
 
 
 # --- Conversions Pydantic ↔ ORM ----------------------------------------
@@ -250,6 +273,131 @@ def load_state(domain: str) -> LoadedState:
             entities=entities,
             recommendations=recommendations,
         )
+
+
+# --- Bulk seed flush ---------------------------------------------------
+
+def bulk_seed_state(
+    *,
+    observations: Iterable[Observation],
+    entities: Iterable[Entity],
+    recommendations: Iterable[Recommendation],
+    domain: str,
+) -> dict[str, int]:
+    """Bulk-insert seed state in a SINGLE transaction. Used once per domain
+    after engines run in disable_persistence() mode.
+
+    Per-call put_* would do ~3-5 round trips * ~1800 calls = 5-9 minutes
+    against Neon from Fly. This collapses it to ~4 round trips total
+    (one INSERT per table) → ~5 seconds.
+
+    Returns a counts dict for the audit summary entry the caller should write.
+    """
+    if not is_persistent():
+        return {"observations": 0, "entities": 0,
+                "recommendations": 0, "entity_observations": 0,
+                "recommendation_evidence": 0}
+
+    from db import models as dbm
+    from db.session import session_scope
+
+    obs_rows = [
+        {
+            "obs_id": o.obs_id,
+            "domain": domain,
+            "source": o.source.value,
+            "source_id": o.source_id,
+            "geom": _geom_to_wkt(o.geom),
+            "h3_cell": o.h3_cell,
+            "t": o.t,
+            "attrs": o.attrs,
+            "confidence": o.confidence,
+            "raw_lineage": o.raw_lineage,
+        }
+        for o in observations
+    ]
+    ent_list = list(entities)
+    ent_rows = [
+        {
+            "entity_id": e.entity_id,
+            "domain": domain,
+            "type": e.type.value,
+            "geom": _geom_to_wkt(e.geom),
+            "first_seen": e.first_seen,
+            "last_seen": e.last_seen,
+            "confidence": e.confidence,
+            "priority_score": e.priority_score,
+            "attrs": e.attrs,
+            "notes": e.notes,
+        }
+        for e in ent_list
+    ]
+    link_rows = [
+        {"entity_id": e.entity_id, "obs_id": oid}
+        for e in ent_list
+        for oid in e.observation_ids
+    ]
+    rec_list = list(recommendations)
+    rec_rows = [
+        {
+            "rec_id": r.rec_id,
+            "entity_id": r.entity_id,
+            "action": r.action.value,
+            "rationale": r.rationale,
+            "suggested_at": r.suggested_at,
+            "decision": r.decision.value,
+            "decided_by": r.decided_by,
+            "decided_at": r.decided_at,
+            "decision_reason": r.decision_reason,
+        }
+        for r in rec_list
+    ]
+    rec_ev_rows = [
+        {"rec_id": r.rec_id, "obs_id": oid}
+        for r in rec_list
+        for oid in r.evidence_obs_ids
+    ]
+
+    with session_scope() as s:
+        # Order matters: parents before children (FK constraints).
+        if obs_rows:
+            s.execute(
+                pg_insert(dbm.ObservationRow)
+                .values(obs_rows)
+                .on_conflict_do_nothing(index_elements=["obs_id"])
+            )
+        if ent_rows:
+            s.execute(
+                pg_insert(dbm.EntityRow)
+                .values(ent_rows)
+                .on_conflict_do_nothing(index_elements=["entity_id"])
+            )
+        if link_rows:
+            s.execute(
+                pg_insert(dbm.entity_observations)
+                .values(link_rows)
+                .on_conflict_do_nothing()
+            )
+        if rec_rows:
+            s.execute(
+                pg_insert(dbm.RecommendationRow)
+                .values(rec_rows)
+                .on_conflict_do_nothing(index_elements=["rec_id"])
+            )
+        if rec_ev_rows:
+            s.execute(
+                pg_insert(dbm.recommendation_evidence)
+                .values(rec_ev_rows)
+                .on_conflict_do_nothing()
+            )
+
+    return {
+        "observations": len(obs_rows),
+        "entities": len(ent_rows),
+        "entity_observations": len(link_rows),
+        "recommendations": len(rec_rows),
+        "recommendation_evidence": len(rec_ev_rows),
+    }
 
 
 # Heuristic guard: shapely is needed for from_shape/to_shape; ensure import
