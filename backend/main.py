@@ -49,12 +49,21 @@ _aisstream_task: asyncio.Task[None] | None = None
 _aisstream_cancel: asyncio.Event | None = None
 _gap_sweeper_task: asyncio.Task[None] | None = None
 _gap_sweeper_cancel: asyncio.Event | None = None
+_retention_task: asyncio.Task[None] | None = None
+_retention_cancel: asyncio.Event | None = None
 
 # How often to scan maritime entities for AIS dropouts. The sweep is cheap
 # (in-memory iteration over self.entities); the real cost is the audit/store
 # writes for any newly-flagged gaps. 60s is a reasonable default — a 30s
 # sweep would surface dropouts faster but double the audit churn.
 GAP_SWEEP_INTERVAL_S = 60
+
+# Retention: at ~9 AIS events/sec, observations + their FK link rows fill
+# Neon's 0.5 GB free tier in ~15 hours. 24h TTL keeps recent tracks
+# meaningful while bounding storage. Tunable via env once we move off the
+# free tier.
+OBSERVATION_TTL_HOURS = int(os.environ.get("OBSERVATION_TTL_HOURS", "24"))
+RETENTION_INTERVAL_S = 3600   # purge once per hour
 
 
 async def _gap_sweeper_loop(cancel: asyncio.Event) -> None:
@@ -74,6 +83,28 @@ async def _gap_sweeper_loop(cancel: asyncio.Event) -> None:
                 )
             except Exception as exc:  # noqa: BLE001
                 log.exception("gap sweep crashed: %s", exc)
+
+
+async def _retention_loop(cancel: asyncio.Event) -> None:
+    """Periodic deletion of observations older than OBSERVATION_TTL_HOURS.
+    Audit log is preserved (see store.purge_old_observations docstring)."""
+    while not cancel.is_set():
+        try:
+            await asyncio.wait_for(cancel.wait(), timeout=RETENTION_INTERVAL_S)
+        except asyncio.TimeoutError:
+            try:
+                deleted = await asyncio.to_thread(
+                    store.purge_old_observations,
+                    older_than_hours=OBSERVATION_TTL_HOURS,
+                )
+                if deleted:
+                    audit_log.append(
+                        actor="system", event_type="observations_purged",
+                        payload={"deleted": deleted, "ttl_hours": OBSERVATION_TTL_HOURS},
+                    )
+                    log.info("retention sweep: purged %d observations", deleted)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("retention sweep crashed: %s", exc)
 
 
 def _seed_maritime() -> None:
@@ -161,7 +192,9 @@ def _bootstrap():
     # Phase 2: kick off the AISStream background task if a key is set.
     api_key = os.environ.get("AISSTREAM_API_KEY", "").strip()
     if api_key:
-        global _aisstream_task, _aisstream_cancel, _gap_sweeper_task, _gap_sweeper_cancel
+        global _aisstream_task, _aisstream_cancel
+        global _gap_sweeper_task, _gap_sweeper_cancel
+        global _retention_task, _retention_cancel
         _aisstream_cancel = asyncio.Event()
 
         async def _on_observation(obs):
@@ -202,17 +235,26 @@ def _bootstrap():
         _gap_sweeper_task = loop.create_task(_gap_sweeper_loop(_gap_sweeper_cancel))
         log.info("gap sweeper started (interval=%ds, threshold=%s)",
                  GAP_SWEEP_INTERVAL_S, "8min")
+
+        # Retention task — only useful with persistent + live ingest.
+        if persistent:
+            _retention_cancel = asyncio.Event()
+            _retention_task = loop.create_task(_retention_loop(_retention_cancel))
+            log.info("retention sweeper started (every %ds, ttl=%dh)",
+                     RETENTION_INTERVAL_S, OBSERVATION_TTL_HOURS)
     else:
-        log.info("AISSTREAM_API_KEY not set; skipping AIS ingestion + gap sweep")
+        log.info("AISSTREAM_API_KEY not set; skipping AIS ingestion + gap sweep + retention")
 
 
 @app.on_event("shutdown")
 async def _shutdown():
-    global _aisstream_task, _aisstream_cancel, _gap_sweeper_task, _gap_sweeper_cancel
-    for cancel in (_aisstream_cancel, _gap_sweeper_cancel):
+    global _aisstream_task, _aisstream_cancel
+    global _gap_sweeper_task, _gap_sweeper_cancel
+    global _retention_task, _retention_cancel
+    for cancel in (_aisstream_cancel, _gap_sweeper_cancel, _retention_cancel):
         if cancel is not None:
             cancel.set()
-    for task in (_aisstream_task, _gap_sweeper_task):
+    for task in (_aisstream_task, _gap_sweeper_task, _retention_task):
         if task is not None:
             task.cancel()
             try:

@@ -400,6 +400,45 @@ def bulk_seed_state(
     }
 
 
+# --- Retention --------------------------------------------------------
+
+def purge_old_observations(*, older_than_hours: int) -> int:
+    """Delete observations whose t is older than the cutoff. CASCADE on
+    entity_observations + recommendation_evidence cleans up FK links
+    automatically (set in the initial migration).
+
+    Audit log is intentionally NOT touched — it's the load-bearing
+    inspectability surface per docs/blueprint.md, and audit entries
+    that reference deleted observations are still meaningful (you can
+    see WHEN something happened even if the raw obs row is gone).
+
+    Returns the number of observations deleted.
+
+    Background: at ~9 AIS events/sec the observations + audit + link
+    tables together fill Neon's 0.5 GB free tier in ~15 hours. A
+    24-hour TTL keeps tracks meaningful (vessels' recent paths) while
+    bounding storage at ~1 day's worth of raw data.
+    """
+    if not is_persistent():
+        return 0
+    if older_than_hours <= 0:
+        raise ValueError("older_than_hours must be positive")
+
+    from sqlalchemy import text
+
+    from db.session import session_scope
+
+    with session_scope() as s:
+        result = s.execute(
+            text(
+                "DELETE FROM observations "
+                "WHERE t < (NOW() AT TIME ZONE 'UTC') - (:hours || ' hours')::interval"
+            ),
+            {"hours": older_than_hours},
+        )
+    return result.rowcount or 0
+
+
 # Heuristic guard: shapely is needed for from_shape/to_shape; ensure import
 # fails loudly at module load rather than at first call.
 def _import_check() -> None:
