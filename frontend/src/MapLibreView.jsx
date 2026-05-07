@@ -28,6 +28,18 @@ const DEFAULT_ZOOM = 5.5;
 
 const FIT_PADDING = 60;
 
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
+
+const TRACK_SOURCE_ID = "ss-selected-track";
+const TRACK_LAYER_ID = "ss-selected-track-line";
+const TRACK_HEAD_LAYER_ID = "ss-selected-track-head";
+
+async function fetchTrack(apiPath, eid, signal) {
+  const r = await fetch(`${API_BASE}${apiPath}/entities/${eid}/track?limit=200`, { signal });
+  if (!r.ok) throw new Error(`track ${r.status}`);
+  return r.json();
+}
+
 function entityRadius(type) {
   if (type === "vessel" || type === "false_positive") return 4;
   if (type === "fire_event") return 7;
@@ -61,7 +73,49 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
     map.addControl(new maplibregl.ScaleControl({ unit: "nautical" }), "bottom-left");
 
-    map.on("load", () => setReady(true));
+    map.on("load", () => {
+      // Pre-create the track source + layers so the selection-change effect
+      // just calls setData(). Empty FeatureCollection until something is
+      // selected and its track lands.
+      if (!map.getSource(TRACK_SOURCE_ID)) {
+        map.addSource(TRACK_SOURCE_ID, {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+        // Track polyline. Color is set per-render via setPaintProperty.
+        map.addLayer({
+          id: TRACK_LAYER_ID,
+          type: "line",
+          source: TRACK_SOURCE_ID,
+          filter: ["==", "$type", "LineString"],
+          paint: {
+            "line-color": "#5fd093",
+            "line-width": 2,
+            "line-opacity": 0.85,
+          },
+          layout: {
+            "line-cap": "round",
+            "line-join": "round",
+          },
+        });
+        // Small dot at every observation along the track. Helps operators
+        // see how recently the vessel reported (denser dots = chattier AIS).
+        map.addLayer({
+          id: TRACK_HEAD_LAYER_ID,
+          type: "circle",
+          source: TRACK_SOURCE_ID,
+          filter: ["==", "$type", "Point"],
+          paint: {
+            "circle-color": "#5fd093",
+            "circle-radius": 2.5,
+            "circle-opacity": 0.7,
+            "circle-stroke-color": "#040810",
+            "circle-stroke-width": 0.5,
+          },
+        });
+      }
+      setReady(true);
+    });
     map.on("error", (e) => {
       // OpenFreeMap occasionally returns 503 during deploys; degrade silently.
       // eslint-disable-next-line no-console
@@ -189,6 +243,69 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
       }
     }
   }, [entities, entitiesById, selectedId, cfg, ready, onSelect]);
+
+  // ------------------------------------------------------------------
+  // Selection change → fetch the track and render it as a polyline.
+  // Cancel any in-flight request when the selection changes again.
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+
+    const src = map.getSource(TRACK_SOURCE_ID);
+    if (!src) return;
+
+    if (!selectedId) {
+      src.setData({ type: "FeatureCollection", features: [] });
+      return;
+    }
+
+    const ent = entitiesById.get(selectedId);
+    const meta = ent ? cfg.typeMeta[ent.type] : null;
+    if (meta?.color) {
+      map.setPaintProperty(TRACK_LAYER_ID, "line-color", meta.color);
+      map.setPaintProperty(TRACK_HEAD_LAYER_ID, "circle-color", meta.color);
+      // Dashed line for ais_gap to mirror the SVG version's convention.
+      map.setPaintProperty(
+        TRACK_LAYER_ID,
+        "line-dasharray",
+        ent.type === "ais_gap" ? [2, 2] : [1, 0],
+      );
+    }
+
+    const ctrl = new AbortController();
+    fetchTrack(cfg.apiPath, selectedId, ctrl.signal)
+      .then((data) => {
+        if (ctrl.signal.aborted) return;
+        const coords = (data.track || [])
+          .filter((p) => typeof p.lon === "number" && typeof p.lat === "number")
+          .map((p) => [p.lon, p.lat]);
+        const features = [];
+        if (coords.length >= 2) {
+          features.push({
+            type: "Feature",
+            geometry: { type: "LineString", coordinates: coords },
+            properties: {},
+          });
+        }
+        for (const c of coords) {
+          features.push({
+            type: "Feature",
+            geometry: { type: "Point", coordinates: c },
+            properties: {},
+          });
+        }
+        src.setData({ type: "FeatureCollection", features });
+      })
+      .catch((err) => {
+        if (err.name === "AbortError") return;
+        // eslint-disable-next-line no-console
+        console.warn("track fetch failed:", err);
+        src.setData({ type: "FeatureCollection", features: [] });
+      });
+
+    return () => ctrl.abort();
+  }, [selectedId, ready, entitiesById, cfg]);
 
   return (
     <div

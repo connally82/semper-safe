@@ -261,6 +261,44 @@ def maritime_entities():
     return {"entities": [e.model_dump() for e in rows]}
 
 
+def _entity_track(engine, eid: str, limit: int):
+    """Shared track logic for both maritime + wildfire endpoints.
+
+    Returns the most-recent `limit` observation positions in time order.
+    Lightweight (no recommendation/audit payload) so the frontend can
+    poll it cheaply on selection change.
+    """
+    ent = engine.entities.get(eid)
+    if ent is None:
+        raise HTTPException(404, "entity not found")
+    obs = [
+        engine.observations[o]
+        for o in ent.observation_ids
+        if o in engine.observations
+    ]
+    obs.sort(key=lambda o: o.t)
+    if limit > 0:
+        obs = obs[-limit:]
+    return {
+        "entity_id": eid,
+        "type": ent.type.value,
+        "track": [
+            {
+                "lon": o.geom.lon,
+                "lat": o.geom.lat,
+                "t": o.t.isoformat(),
+                "source": o.source.value,
+            }
+            for o in obs
+        ],
+    }
+
+
+@app.get("/maritime/entities/{eid}/track")
+def maritime_track(eid: str, limit: int = 200):
+    return _entity_track(maritime, eid, limit)
+
+
 @app.get("/maritime/entities/{eid}/lineage")
 def maritime_lineage(eid: str):
     data = maritime.lineage(eid)
@@ -293,6 +331,11 @@ def wildfire_entities():
     rows = sorted(wildfire.entities.values(),
                   key=lambda e: (-e.priority_score, -e.last_seen.timestamp()))
     return {"entities": [e.model_dump() for e in rows]}
+
+
+@app.get("/wildfire/entities/{eid}/track")
+def wildfire_track(eid: str, limit: int = 200):
+    return _entity_track(wildfire, eid, limit)
 
 
 @app.get("/wildfire/entities/{eid}/lineage")
