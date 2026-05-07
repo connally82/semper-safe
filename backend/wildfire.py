@@ -19,10 +19,8 @@ Operational pattern:
 """
 
 from __future__ import annotations
-import math
 import uuid
 from datetime import datetime, timedelta
-from typing import Iterable
 
 from models import (
     Observation, Entity, EntityType, SourceType,
@@ -274,13 +272,15 @@ class WildfireFusion:
 
     def _nearest_active_fire(self, geom: Geom, max_km: float,
                               max_window: timedelta) -> str | None:
+        # TODO(phase 1): filter by max_window using observation timestamp.
+        # The current call sites apply time filtering before calling this,
+        # so the parameter is accepted for API stability but unused here.
+        _ = max_window
         best, best_d = None, max_km + 1
         for eid, ent in self.entities.items():
             if ent.type not in (EntityType.HOTSPOT, EntityType.FIRE_EVENT,
                                 EntityType.SMOKE_PLUME):
                 continue
-            dt = abs((ent.last_seen - geom_t_helper(geom)).total_seconds()) \
-                if False else 0   # we don't have obs.t here; caller filters
             d = haversine_km(geom, ent.geom)
             if d < best_d:
                 best, best_d = eid, d

@@ -15,9 +15,7 @@ learned association model. The interfaces don't change.
 from __future__ import annotations
 import math
 import uuid
-from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Iterable
 
 from models import (
     Observation, Entity, EntityType, SourceType,

@@ -12,7 +12,6 @@ Run:  uvicorn main:app --reload --port 8000
 """
 
 from __future__ import annotations
-from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -22,7 +21,7 @@ from fusion import FusionEngine
 from wildfire import WildfireFusion
 from audit import audit_log
 from seed_data import build_scenario, SCENARIO_START as MARITIME_START
-from wildfire_seed import build_wildfire_scenario, SCENARIO_START as WILDFIRE_START
+from wildfire_seed import build_wildfire_scenario
 
 
 app = FastAPI(title="Semper Safe — Multi-Domain")

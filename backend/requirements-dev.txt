@@ -1,0 +1,6 @@
+# Dev / CI dependencies. Production image (Dockerfile) does NOT install these.
+-r requirements.txt
+
+pytest>=8.3
+httpx>=0.27        # required by fastapi.testclient
+ruff>=0.7

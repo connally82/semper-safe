@@ -122,7 +122,7 @@ def build_scenario() -> list[Observation]:
     iuu_dark_positions: list[tuple[str, float, float, datetime]] = []
     for spec in iuu_specs:
         lon0, lat0, heading, speed = spec["approach_from"]
-        last_lon, last_lat, last_t = lon0, lat0, SCENARIO_START
+        last_lon, last_lat = lon0, lat0
         for t, lon, lat in _track(lon0, lat0, heading, speed,
                                    SCENARIO_START,
                                    spec["go_dark_at"],
@@ -130,7 +130,9 @@ def build_scenario() -> list[Observation]:
             obs.append(_obs(SourceType.AIS, spec["mmsi"], lon, lat, t,
                             attrs={"name": spec["name"], "type": "fishing",
                                    "heading": heading, "speed_kn": speed}))
-            last_lon, last_lat, last_t = lon, lat, t
+            last_lon, last_lat = lon, lat
+            # Note: last_t was tracked here in earlier iterations but is unused
+            # downstream — go-dark drift uses spec["go_dark_at"] directly.
         # Estimate where they actually went after going dark
         # (drifting toward MPA at reduced speed)
         for minutes_after in range(15, 180, 30):

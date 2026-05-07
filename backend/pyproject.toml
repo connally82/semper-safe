@@ -1,0 +1,36 @@
+# Backend tooling config. The app itself is run via the Dockerfile (uvicorn +
+# requirements.txt); this file is just for ruff and pytest behavior in CI/dev.
+#
+# Kept under backend/ rather than the repo root so frontend tooling stays clean.
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [".venv", "venv", "__pycache__"]
+
+[tool.ruff.lint]
+# Phase 0: catch correctness bugs only.
+#   E, W   — pycodestyle errors + warnings
+#   F      — pyflakes (unused imports, undefined names, etc.)
+#   B      — flake8-bugbear (likely bugs)
+# Style/modernization rules (I, UP) deliberately deferred to Phase 5 polish —
+# the goal here is "CI catches regressions," not "rewrite the MVP."
+select = ["E", "W", "F", "B"]
+# Allow long lines in scenario data + URLs in comments.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Seed files contain large literal scenario data — relax the bugbear rules.
+"seed_data.py" = ["B"]
+"wildfire_seed.py" = ["B"]
+# Test fixtures often need the unused-arg pattern.
+"tests/*.py" = ["B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
+filterwarnings = [
+    # FastAPI 0.136 still ships @app.on_event; backend uses it. Suppress until refactor.
+    "ignore:.*on_event is deprecated.*:DeprecationWarning",
+]
