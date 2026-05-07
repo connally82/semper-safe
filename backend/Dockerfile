@@ -11,12 +11,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install build deps only if a wheel can't be found. requirements.txt is
-# pure-Python today, so this is a thin layer; kept here for future deps
-# (psycopg, rasterio, etc. per docs/roadmap.md).
-RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential \
- && rm -rf /var/lib/apt/lists/*
+# No build-essential needed today — fastapi / uvicorn / pydantic all
+# ship prebuilt wheels for python:3.12-slim on amd64+arm64. Add it back
+# (RUN apt-get install ... build-essential libpq-dev ...) when Phase 1
+# pulls in psycopg/rasterio/etc. per docs/roadmap.md.
 
 COPY requirements.txt .
 RUN python -m venv /opt/venv \
