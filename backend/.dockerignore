@@ -1,0 +1,47 @@
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.venv
+venv
+env
+*.egg-info
+.eggs
+
+# Tests / dev tooling
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+.tox
+
+# Editors / OS
+.vscode
+.idea
+*.swp
+.DS_Store
+
+# Local data — per docs/blueprint.md, real data never lives in the image
+data
+*.sqlite
+*.db
+*.log
+.env
+.env.*
+!.env.example
+
+# Docker artifacts
+Dockerfile
+.dockerignore
+
+# Repo-level files that don't belong in the backend image
+../README.md
+../LICENSE
+../docs
+../frontend
