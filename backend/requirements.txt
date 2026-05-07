@@ -1,3 +1,9 @@
 fastapi>=0.115
 uvicorn[standard]>=0.30
 pydantic>=2.7
+
+# Phase 1 — Postgres persistence
+sqlalchemy>=2.0
+psycopg[binary]>=3.2     # Postgres driver (binary wheel, no libpq required at runtime)
+geoalchemy2>=0.15        # PostGIS column types for SQLAlchemy
+alembic>=1.13            # migrations

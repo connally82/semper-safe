@@ -1,0 +1,15 @@
+Alembic migrations for Semper Safe.
+
+Run from the backend/ directory:
+
+  # Create new migration after editing db/models.py:
+  alembic revision --autogenerate -m "short description"
+
+  # Apply pending migrations to the DB:
+  alembic upgrade head
+
+  # Roll back one migration:
+  alembic downgrade -1
+
+DATABASE_URL must be set in the environment. env.py reuses
+db.session._normalize_db_url so any provider's URL works.

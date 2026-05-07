@@ -12,9 +12,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # No build-essential needed today — fastapi / uvicorn / pydantic all
-# ship prebuilt wheels for python:3.12-slim on amd64+arm64. Add it back
-# (RUN apt-get install ... build-essential libpq-dev ...) when Phase 1
-# pulls in psycopg/rasterio/etc. per docs/roadmap.md.
+# ship prebuilt wheels for python:3.12-slim. Phase 1 added sqlalchemy,
+# alembic, geoalchemy2 (pure-Python) and psycopg[binary] (which bundles
+# libpq in the wheel). Add the apt layer back if/when rasterio lands.
 
 COPY requirements.txt .
 RUN python -m venv /opt/venv \
