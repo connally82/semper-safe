@@ -32,9 +32,12 @@ primary_region = "dfw"
 [http_service]
   internal_port = 8000
   force_https = true
-  auto_stop_machines = "stop"
+  # Phase 2: machine must stay alive so the AISStream WebSocket stays
+  # connected. min_machines_running = 1 keeps one always up; one
+  # shared-cpu-1x is well within Fly's hobby allowance.
+  auto_stop_machines = "off"
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
   processes = ["app"]
 
   # 180s grace covers the cold-start case where DB is empty and the

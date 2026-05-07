@@ -8,3 +8,7 @@ psycopg[binary]>=3.2     # Postgres driver (binary wheel, no libpq required at r
 geoalchemy2>=0.15        # PostGIS column types for SQLAlchemy
 shapely>=2.0             # geometry shape conversions used by geoalchemy2
 alembic>=1.13            # migrations
+
+# Phase 2 — real AIS ingestion (AISStream.io)
+websockets>=12.0         # AISStream WebSocket client
+h3>=4.0                  # H3 cell index used by Observation.h3_cell

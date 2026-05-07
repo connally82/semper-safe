@@ -12,6 +12,8 @@ Run:  uvicorn main:app --reload --port 8000
 """
 
 from __future__ import annotations
+import asyncio
+import logging
 import os
 
 from fastapi import FastAPI, HTTPException
@@ -26,6 +28,12 @@ from db import store
 from seed_data import build_scenario, SCENARIO_START as MARITIME_START
 from wildfire_seed import build_wildfire_scenario
 
+# Phase 2: real-time AIS ingestion (optional — only runs if API key is set)
+import aisstream
+
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+log = logging.getLogger("semper_safe")
+
 
 app = FastAPI(title="Semper Safe — Multi-Domain")
 app.add_middleware(
@@ -35,6 +43,10 @@ app.add_middleware(
 
 maritime = FusionEngine()
 wildfire = WildfireFusion()
+
+# Background task handle so we can cancel cleanly on shutdown.
+_aisstream_task: asyncio.Task[None] | None = None
+_aisstream_cancel: asyncio.Event | None = None
 
 
 def _seed_maritime() -> None:
@@ -118,6 +130,58 @@ def _bootstrap():
                                   [d for d, e in
                                    [("maritime", maritime), ("wildfire", wildfire)]
                                    if e.entities]})
+
+    # Phase 2: kick off the AISStream background task if a key is set.
+    api_key = os.environ.get("AISSTREAM_API_KEY", "").strip()
+    if api_key:
+        global _aisstream_task, _aisstream_cancel
+        _aisstream_cancel = asyncio.Event()
+
+        async def _on_observation(obs):
+            # Run the (sync) engine.ingest in a thread so we don't block the
+            # WebSocket loop on Postgres round-trips during write-through.
+            await asyncio.to_thread(maritime.ingest, obs)
+
+        async def _on_static(mmsi: str, attrs: dict):
+            # Merge static data into the existing AIS-derived entity if any.
+            eid = maritime._mmsi_index.get(mmsi)
+            if not eid:
+                return
+            ent = maritime.entities.get(eid)
+            if not ent:
+                return
+            ent.attrs.update(attrs)
+            await asyncio.to_thread(store.put_entity, ent, domain="maritime")
+
+        loop = asyncio.get_event_loop()
+        _aisstream_task = loop.create_task(
+            aisstream.run_worker(
+                api_key=api_key,
+                on_observation=_on_observation,
+                on_static=_on_static,
+                cancel=_aisstream_cancel,
+            )
+        )
+        audit_log.append(
+            actor="system", event_type="aisstream_started",
+            payload={"bbox": aisstream.TEXAS_SHORELINE_BBOX},
+        )
+        log.info("aisstream worker started")
+    else:
+        log.info("AISSTREAM_API_KEY not set; skipping AIS ingestion")
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    global _aisstream_task, _aisstream_cancel
+    if _aisstream_cancel is not None:
+        _aisstream_cancel.set()
+    if _aisstream_task is not None:
+        _aisstream_task.cancel()
+        try:
+            await _aisstream_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
 
 
 class DecisionRequest(BaseModel):
