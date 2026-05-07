@@ -1,0 +1,314 @@
+"""
+Fusion engine.
+
+Three responsibilities:
+  1. Detect AIS gaps (vessels that go dark)
+  2. Correlate SAR detections to known AIS tracks (or flag as dark vessel)
+  3. Maintain Entity records as observations stream in
+
+The math here is intentionally simple. The point of the MVP is to prove the
+plumbing — observation lineage, audit log, and the human-in-the-loop pattern.
+Production swaps in proper Bayesian track fusion (IMM Kalman, JPDA) and a
+learned association model. The interfaces don't change.
+"""
+
+from __future__ import annotations
+import math
+import uuid
+from collections import defaultdict
+from datetime import datetime, timedelta
+from typing import Iterable
+
+from models import (
+    Observation, Entity, EntityType, SourceType,
+    Recommendation, ActionType, Decision, Geom,
+)
+from audit import audit_log
+
+
+# ----------------------------------------------------------------------
+# Tunables — would be config in production
+# ----------------------------------------------------------------------
+AIS_GAP_THRESHOLD = timedelta(minutes=15)   # AIS reports normally every 2-10 min
+SAR_AIS_MATCH_RADIUS_KM = 1.5               # how close a SAR blob must be to an AIS report
+SAR_AIS_MATCH_WINDOW = timedelta(minutes=20)
+
+
+# ----------------------------------------------------------------------
+# Geo helpers
+# ----------------------------------------------------------------------
+def haversine_km(a: Geom, b: Geom) -> float:
+    R = 6371.0
+    la1, la2 = math.radians(a.lat), math.radians(b.lat)
+    dla = math.radians(b.lat - a.lat)
+    dlo = math.radians(b.lon - a.lon)
+    h = math.sin(dla / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin(dlo / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(h))
+
+
+# ----------------------------------------------------------------------
+# Engine
+# ----------------------------------------------------------------------
+class FusionEngine:
+    def __init__(self) -> None:
+        self.observations: dict[str, Observation] = {}
+        self.entities: dict[str, Entity] = {}
+        self.recommendations: dict[str, Recommendation] = {}
+        # AIS source_id (MMSI) → entity_id  (each MMSI is one vessel)
+        self._mmsi_index: dict[str, str] = {}
+
+    # --- ingest -------------------------------------------------------
+    def ingest(self, obs: Observation) -> Entity:
+        """Take an observation, fold it into the right entity."""
+        self.observations[obs.obs_id] = obs
+        audit_log.append(
+            actor="system",
+            event_type="observation_added",
+            payload={"obs_id": obs.obs_id, "source": obs.source.value,
+                     "source_id": obs.source_id},
+        )
+
+        if obs.source == SourceType.AIS:
+            return self._ingest_ais(obs)
+        if obs.source == SourceType.SAR:
+            return self._ingest_sar(obs)
+        # weather / others go to entity attrs in production; ignore for MVP
+        raise ValueError(f"Unhandled source: {obs.source}")
+
+    def _ingest_ais(self, obs: Observation) -> Entity:
+        mmsi = obs.source_id
+        eid = self._mmsi_index.get(mmsi)
+        if eid is None:
+            eid = f"ent_{uuid.uuid4().hex[:10]}"
+            self._mmsi_index[mmsi] = eid
+            ent = Entity(
+                entity_id=eid,
+                type=EntityType.VESSEL,
+                geom=obs.geom,
+                last_seen=obs.t,
+                first_seen=obs.t,
+                confidence=0.99,                # cooperative target
+                priority_score=0.05,
+                observation_ids=[obs.obs_id],
+                attrs={"mmsi": mmsi, **obs.attrs},
+            )
+            self.entities[eid] = ent
+            audit_log.append(
+                actor="system",
+                event_type="entity_created",
+                payload={"entity_id": eid, "type": ent.type.value, "via": "ais"},
+            )
+            return ent
+
+        ent = self.entities[eid]
+        ent.geom = obs.geom
+        ent.last_seen = obs.t
+        ent.observation_ids.append(obs.obs_id)
+        # If a previously-dark vessel reappears on AIS, downgrade priority
+        if ent.type == EntityType.AIS_GAP:
+            ent.type = EntityType.VESSEL
+            ent.priority_score = 0.05
+            audit_log.append(
+                actor="system",
+                event_type="entity_reclassified",
+                payload={"entity_id": eid, "to": "vessel", "reason": "ais_resumed"},
+            )
+        return ent
+
+    def _ingest_sar(self, obs: Observation) -> Entity:
+        # Try to match this SAR detection to a known vessel that was nearby
+        # within the time window.
+        candidate = self._best_ais_match(obs)
+        if candidate is not None:
+            ent = self.entities[candidate]
+            ent.observation_ids.append(obs.obs_id)
+            ent.last_seen = max(ent.last_seen, obs.t)
+            ent.confidence = min(1.0, ent.confidence + 0.005)
+            audit_log.append(
+                actor="system",
+                event_type="observation_associated",
+                payload={"obs_id": obs.obs_id, "entity_id": candidate,
+                         "method": "sar_to_ais_spatial_temporal"},
+            )
+            return ent
+
+        # Also try to match to an existing dark vessel (track continuity
+        # across consecutive SAR passes). Wider window since the vessel
+        # may have moved between passes.
+        candidate = self._best_dark_vessel_match(obs)
+        if candidate is not None:
+            ent = self.entities[candidate]
+            ent.observation_ids.append(obs.obs_id)
+            ent.geom = obs.geom
+            ent.last_seen = obs.t
+            # Repeated SAR detections with no AIS = stronger dark-vessel signal
+            ent.confidence = min(0.95, ent.confidence + 0.05)
+            ent.priority_score = min(1.0, ent.priority_score + 0.05)
+            audit_log.append(
+                actor="system",
+                event_type="observation_associated",
+                payload={"obs_id": obs.obs_id, "entity_id": candidate,
+                         "method": "sar_track_continuity"},
+            )
+            return ent
+
+        # No match → DARK VESSEL. New entity, high priority.
+        eid = f"ent_{uuid.uuid4().hex[:10]}"
+        ent = Entity(
+            entity_id=eid,
+            type=EntityType.DARK_VESSEL,
+            geom=obs.geom,
+            last_seen=obs.t,
+            first_seen=obs.t,
+            confidence=0.72,                  # SAR-only ID is uncertain
+            priority_score=0.85,              # high — non-cooperative target
+            observation_ids=[obs.obs_id],
+            attrs=dict(obs.attrs),
+            notes="SAR detection with no matching AIS report in window.",
+        )
+        self.entities[eid] = ent
+        audit_log.append(
+            actor="system",
+            event_type="entity_created",
+            payload={"entity_id": eid, "type": "dark_vessel", "via": "sar_unmatched"},
+        )
+        self._make_recommendation(ent)
+        return ent
+
+    def _best_ais_match(self, sar_obs: Observation) -> str | None:
+        best_eid, best_score = None, 0.0
+        for eid, ent in self.entities.items():
+            if ent.type not in (EntityType.VESSEL, EntityType.AIS_GAP):
+                continue
+            dt = abs((ent.last_seen - sar_obs.t).total_seconds())
+            if dt > SAR_AIS_MATCH_WINDOW.total_seconds():
+                continue
+            d = haversine_km(ent.geom, sar_obs.geom)
+            if d > SAR_AIS_MATCH_RADIUS_KM:
+                continue
+            score = (1 - d / SAR_AIS_MATCH_RADIUS_KM) * \
+                    (1 - dt / SAR_AIS_MATCH_WINDOW.total_seconds())
+            if score > best_score:
+                best_score, best_eid = score, eid
+        return best_eid
+
+    def _best_dark_vessel_match(self, sar_obs: Observation) -> str | None:
+        """Match a SAR detection to an existing dark-vessel track.
+
+        Wider radius and longer window than AIS matching: a non-cooperative
+        vessel between SAR passes may have moved several km, but should
+        still be in the rough vicinity of its last detection.
+        """
+        TRACK_RADIUS_KM = 12.0
+        TRACK_WINDOW_S = 90 * 60   # 90 minutes between passes is plausible
+        best_eid, best_score = None, 0.0
+        for eid, ent in self.entities.items():
+            if ent.type != EntityType.DARK_VESSEL:
+                continue
+            dt = abs((ent.last_seen - sar_obs.t).total_seconds())
+            if dt == 0 or dt > TRACK_WINDOW_S:
+                continue
+            d = haversine_km(ent.geom, sar_obs.geom)
+            if d > TRACK_RADIUS_KM:
+                continue
+            score = (1 - d / TRACK_RADIUS_KM) * (1 - dt / TRACK_WINDOW_S)
+            if score > best_score:
+                best_score, best_eid = score, eid
+        return best_eid
+
+    # --- gap detection -----------------------------------------------
+    def detect_gaps(self, now: datetime) -> list[Entity]:
+        """Sweep entities; mark vessels that have gone silent past threshold."""
+        flagged: list[Entity] = []
+        for ent in self.entities.values():
+            if ent.type != EntityType.VESSEL:
+                continue
+            if (now - ent.last_seen) > AIS_GAP_THRESHOLD:
+                ent.type = EntityType.AIS_GAP
+                ent.priority_score = 0.55     # medium — could be benign or IUU
+                ent.notes = (f"AIS dropout. Last report "
+                             f"{ent.last_seen.isoformat()}.")
+                audit_log.append(
+                    actor="system",
+                    event_type="entity_reclassified",
+                    payload={"entity_id": ent.entity_id, "to": "ais_gap",
+                             "last_seen": ent.last_seen.isoformat()},
+                )
+                self._make_recommendation(ent)
+                flagged.append(ent)
+        return flagged
+
+    # --- recommendations ---------------------------------------------
+    def _make_recommendation(self, ent: Entity) -> Recommendation:
+        if ent.type == EntityType.DARK_VESSEL:
+            action = ActionType.TASK_SAR_SAT
+            rationale = ("SAR detection unmatched to any cooperative AIS target. "
+                         "Recommend tasking next satellite pass for confirmation "
+                         "before alerting surface assets.")
+        elif ent.type == EntityType.AIS_GAP:
+            action = ActionType.LOG_ONLY
+            rationale = ("AIS dropout exceeds threshold. Watch for resumption "
+                         "or correlate with next SAR pass. No surface dispatch "
+                         "without corroboration.")
+        else:
+            action = ActionType.LOG_ONLY
+            rationale = "Routine."
+
+        rec = Recommendation(
+            rec_id=f"rec_{uuid.uuid4().hex[:10]}",
+            entity_id=ent.entity_id,
+            action=action,
+            rationale=rationale,
+            evidence_obs_ids=list(ent.observation_ids),
+            suggested_at=ent.last_seen,
+        )
+        self.recommendations[rec.rec_id] = rec
+        audit_log.append(
+            actor="system",
+            event_type="recommendation_made",
+            payload={"rec_id": rec.rec_id, "entity_id": ent.entity_id,
+                     "action": action.value, "evidence_count": len(rec.evidence_obs_ids)},
+        )
+        return rec
+
+    # --- decisions ----------------------------------------------------
+    def decide(self, entity_id: str, *, decision: Decision,
+               operator: str, reason: str | None = None) -> list[Recommendation]:
+        """Operator approves/rejects all pending recs for an entity."""
+        affected: list[Recommendation] = []
+        now = datetime.utcnow()
+        for rec in self.recommendations.values():
+            if rec.entity_id != entity_id or rec.decision != Decision.PENDING:
+                continue
+            rec.decision = decision
+            rec.decided_by = operator
+            rec.decided_at = now
+            rec.decision_reason = reason
+            audit_log.append(
+                actor=operator,
+                event_type="decision",
+                payload={"rec_id": rec.rec_id, "entity_id": entity_id,
+                         "decision": decision.value, "reason": reason or ""},
+            )
+            affected.append(rec)
+        return affected
+
+    # --- queries ------------------------------------------------------
+    def lineage(self, entity_id: str) -> dict:
+        """Full provenance chain for an entity — every observation, every audit row."""
+        ent = self.entities.get(entity_id)
+        if ent is None:
+            return {}
+        obs = [self.observations[o] for o in ent.observation_ids
+               if o in self.observations]
+        related_audit = [a for a in audit_log.all()
+                         if a.payload.get("entity_id") == entity_id
+                         or a.payload.get("obs_id") in ent.observation_ids]
+        related_recs = [r for r in self.recommendations.values()
+                        if r.entity_id == entity_id]
+        return {
+            "entity": ent.model_dump(),
+            "observations": [o.model_dump() for o in obs],
+            "recommendations": [r.model_dump() for r in related_recs],
+            "audit_chain": [a.model_dump() for a in related_audit],
+        }

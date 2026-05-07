@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# mypy / ruff
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+
+# Node
+node_modules/
+.pnp
+.pnp.js
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Vite / Next / React build outputs
+dist/
+build/
+.next/
+out/
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+secrets/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local data — never commit real sensor data, especially anything with PII
+data/
+*.sqlite
+*.db
+scenarios/local/
+downloads/
+
+# Deployment
+.fly/
+
+# OS
+.DS_Store
+.directory
