@@ -25,6 +25,7 @@ from fusion import FusionEngine
 from wildfire import WildfireFusion
 from audit import audit_log
 from db import store
+from db import archive as audit_archive
 from seed_data import build_scenario, SCENARIO_START as MARITIME_START
 from wildfire_seed import build_wildfire_scenario
 
@@ -51,6 +52,8 @@ _gap_sweeper_task: asyncio.Task[None] | None = None
 _gap_sweeper_cancel: asyncio.Event | None = None
 _retention_task: asyncio.Task[None] | None = None
 _retention_cancel: asyncio.Event | None = None
+_audit_archive_task: asyncio.Task[None] | None = None
+_audit_archive_cancel: asyncio.Event | None = None
 
 # How often to scan maritime entities for AIS dropouts. The sweep is cheap
 # (in-memory iteration over self.entities); the real cost is the audit/store
@@ -64,6 +67,12 @@ GAP_SWEEP_INTERVAL_S = 60
 # free tier.
 OBSERVATION_TTL_HOURS = int(os.environ.get("OBSERVATION_TTL_HOURS", "24"))
 RETENTION_INTERVAL_S = 3600   # purge once per hour
+
+# Audit cold archive: copy new audit_log rows to R2 every hour.
+# At ~9 events/sec we generate ~32k rows/hour; drain mode within a single
+# tick keeps us caught up.
+AUDIT_ARCHIVE_INTERVAL_S = int(os.environ.get("AUDIT_ARCHIVE_INTERVAL_S", "3600"))
+AUDIT_ARCHIVE_DRAIN_CAP = 50  # max archive_audit_chain() calls per tick (safety)
 
 # In-memory cache window: keep only recent observations in
 # engine.observations to bound RAM. Evicted obs still live in Postgres
@@ -117,6 +126,36 @@ async def _gap_sweeper_loop(cancel: asyncio.Event) -> None:
                     log.debug("evicted %d stale in-memory observations", evicted)
             except Exception as exc:  # noqa: BLE001
                 log.exception("in-memory eviction crashed: %s", exc)
+
+
+async def _audit_archive_loop(cancel: asyncio.Event) -> None:
+    """Drain new audit_log rows to R2 every AUDIT_ARCHIVE_INTERVAL_S seconds.
+
+    Each tick keeps calling archive_audit_chain until it reports no new
+    rows OR we hit the safety cap. Skips entirely if R2 isn't configured.
+    """
+    while not cancel.is_set():
+        try:
+            await asyncio.wait_for(cancel.wait(), timeout=AUDIT_ARCHIVE_INTERVAL_S)
+        except asyncio.TimeoutError:
+            if not audit_archive.is_configured():
+                continue
+            try:
+                total = 0
+                for _ in range(AUDIT_ARCHIVE_DRAIN_CAP):
+                    result = await asyncio.to_thread(audit_archive.archive_audit_chain)
+                    n = result.get("new_rows", 0)
+                    if not n:
+                        break
+                    total += n
+                if total:
+                    audit_log.append(
+                        actor="system", event_type="audit_archived",
+                        payload={"rows": total},
+                    )
+                    log.info("audit archive: drained %d rows to R2", total)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("audit archive crashed: %s", exc)
 
 
 async def _retention_loop(cancel: asyncio.Event) -> None:
@@ -229,6 +268,7 @@ def _bootstrap():
         global _aisstream_task, _aisstream_cancel
         global _gap_sweeper_task, _gap_sweeper_cancel
         global _retention_task, _retention_cancel
+        global _audit_archive_task, _audit_archive_cancel
         _aisstream_cancel = asyncio.Event()
 
         async def _on_observation(obs):
@@ -276,6 +316,17 @@ def _bootstrap():
             _retention_task = loop.create_task(_retention_loop(_retention_cancel))
             log.info("retention sweeper started (every %ds, ttl=%dh)",
                      RETENTION_INTERVAL_S, OBSERVATION_TTL_HOURS)
+
+            # Audit cold archive — only meaningful with persistent + R2 configured.
+            if audit_archive.is_configured():
+                _audit_archive_cancel = asyncio.Event()
+                _audit_archive_task = loop.create_task(
+                    _audit_archive_loop(_audit_archive_cancel)
+                )
+                log.info("audit archive task started (every %ds)",
+                         AUDIT_ARCHIVE_INTERVAL_S)
+            else:
+                log.info("R2 not configured; audit archive task skipped")
     else:
         log.info("AISSTREAM_API_KEY not set; skipping AIS ingestion + gap sweep + retention")
 
@@ -285,10 +336,13 @@ async def _shutdown():
     global _aisstream_task, _aisstream_cancel
     global _gap_sweeper_task, _gap_sweeper_cancel
     global _retention_task, _retention_cancel
-    for cancel in (_aisstream_cancel, _gap_sweeper_cancel, _retention_cancel):
+    global _audit_archive_task, _audit_archive_cancel
+    for cancel in (_aisstream_cancel, _gap_sweeper_cancel,
+                   _retention_cancel, _audit_archive_cancel):
         if cancel is not None:
             cancel.set()
-    for task in (_aisstream_task, _gap_sweeper_task, _retention_task):
+    for task in (_aisstream_task, _gap_sweeper_task,
+                 _retention_task, _audit_archive_task):
         if task is not None:
             task.cancel()
             try:

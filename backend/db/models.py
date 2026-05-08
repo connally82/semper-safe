@@ -149,6 +149,23 @@ class RecommendationRow(Base):
     entity: Mapped["EntityRow"] = relationship(lazy="joined")
 
 
+class ArchiveStateRow(Base):
+    """Tiny key/value table for the audit cold-archive job.
+
+    Single row keyed by `name='audit'` tracks the highest seq we've copied
+    to R2 so the next run is a delta-only push. Schema-versioned in case
+    we add other archives later (observations? recommendations?).
+    """
+
+    __tablename__ = "archive_state"
+
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=-1)
+    last_archived_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+
+
 class AuditEntryRow(Base):
     """Hash-chained audit log.
 
