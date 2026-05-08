@@ -204,3 +204,147 @@ def record_scenes(scenes: list[dict[str, Any]]) -> dict[str, int]:
 
 def _gen_detection_id() -> str:
     return f"sard_{uuid.uuid4().hex[:12]}"
+
+
+# --- Copernicus auth -------------------------------------------------
+
+CDSE_TOKEN_URL = (
+    "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/"
+    "protocol/openid-connect/token"
+)
+
+
+class CopernicusAuth:
+    """Simple OAuth client for Copernicus Data Space.
+
+    Caches an access_token in memory, refreshes via refresh_token
+    before expiry. Falls back to password grant when refresh fails.
+
+    Reads credentials from env vars CDSE_USERNAME and CDSE_PASSWORD
+    (set as Fly secrets). Returns None from token() if either is unset
+    so callers can short-circuit.
+    """
+
+    def __init__(self) -> None:
+        self._access_token: str | None = None
+        self._access_expires_at: float = 0.0
+        self._refresh_token: str | None = None
+        self._refresh_expires_at: float = 0.0
+
+    @staticmethod
+    def is_configured() -> bool:
+        import os
+        return bool(os.environ.get("CDSE_USERNAME")) and bool(os.environ.get("CDSE_PASSWORD"))
+
+    def token(self, *, leeway_s: int = 30) -> str | None:
+        """Return a valid access_token. Re-fetch via refresh or password
+        grant as needed. Returns None if unconfigured."""
+        import os
+        import time
+
+        if not self.is_configured():
+            return None
+
+        now = time.time()
+        if self._access_token and now < (self._access_expires_at - leeway_s):
+            return self._access_token
+
+        # Try refresh first if we have one with time left.
+        if self._refresh_token and now < (self._refresh_expires_at - leeway_s):
+            data = self._post_token({
+                "grant_type": "refresh_token",
+                "refresh_token": self._refresh_token,
+                "client_id": "cdse-public",
+            })
+            if data:
+                self._consume(data, now)
+                return self._access_token
+
+        # Fallback: full password grant.
+        data = self._post_token({
+            "grant_type": "password",
+            "username": os.environ["CDSE_USERNAME"],
+            "password": os.environ["CDSE_PASSWORD"],
+            "client_id": "cdse-public",
+        })
+        if not data:
+            log.warning("Copernicus password grant failed")
+            return None
+        self._consume(data, now)
+        return self._access_token
+
+    def _post_token(self, form: dict[str, str]) -> dict | None:
+        try:
+            r = httpx.post(CDSE_TOKEN_URL, data=form, timeout=20)
+        except httpx.HTTPError as e:
+            log.warning("Copernicus token request failed: %s", e)
+            return None
+        if r.status_code != 200:
+            log.warning("Copernicus token %d: %s", r.status_code, r.text[:200])
+            return None
+        return r.json()
+
+    def _consume(self, data: dict, now: float) -> None:
+        self._access_token = data["access_token"]
+        self._access_expires_at = now + int(data.get("expires_in", 1800))
+        self._refresh_token = data.get("refresh_token")
+        self._refresh_expires_at = now + int(data.get("refresh_expires_in", 3600))
+
+
+_auth_singleton: CopernicusAuth | None = None
+
+
+def auth() -> CopernicusAuth:
+    """Process-wide CopernicusAuth singleton. Caches the token in memory."""
+    global _auth_singleton
+    if _auth_singleton is None:
+        _auth_singleton = CopernicusAuth()
+    return _auth_singleton
+
+
+# --- Download --------------------------------------------------------
+
+PRODUCT_DOWNLOAD_URL_TPL = (
+    "https://zipper.dataspace.copernicus.eu/odata/v1/Products({scene_id})/$value"
+)
+
+
+def download_scene(scene_id: str, *, dest_path: str,
+                   chunk_size: int = 1 << 20,
+                   timeout_s: float = 600.0) -> dict:
+    """Stream-download a Sentinel-1 product .SAFE.zip to a local path.
+
+    Sized for the Fly free tier: chunked HTTP streaming so memory stays
+    O(chunk_size) ≈ 1 MB regardless of the 1-2 GB scene size.
+
+    Returns metadata dict {scene_id, dest_path, bytes, content_type}.
+
+    Note: this writes to local disk. Phase 4.2-next swaps the local
+    write for a multipart upload to R2 so we don't need a Fly volume.
+    """
+    tok = auth().token()
+    if not tok:
+        raise RuntimeError("Copernicus auth not configured (CDSE_USERNAME/CDSE_PASSWORD)")
+
+    url = PRODUCT_DOWNLOAD_URL_TPL.format(scene_id=scene_id)
+    headers = {"Authorization": f"Bearer {tok}"}
+    total_bytes = 0
+    content_type = None
+
+    with httpx.stream("GET", url, headers=headers,
+                      timeout=timeout_s, follow_redirects=True) as r:
+        r.raise_for_status()
+        content_type = r.headers.get("Content-Type")
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_bytes(chunk_size):
+                f.write(chunk)
+                total_bytes += len(chunk)
+
+    log.info("downloaded scene %s → %s (%d bytes)", scene_id, dest_path, total_bytes)
+    return {
+        "scene_id": scene_id,
+        "dest_path": dest_path,
+        "bytes": total_bytes,
+        "content_type": content_type,
+    }
+

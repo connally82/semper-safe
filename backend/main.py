@@ -31,6 +31,8 @@ from wildfire_seed import build_wildfire_scenario
 
 # Phase 2: real-time AIS ingestion (optional — only runs if API key is set)
 import aisstream
+# Phase 4: Sentinel-1 SAR discovery + (eventually) download/detect
+import sar
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger("semper_safe")
@@ -54,6 +56,8 @@ _retention_task: asyncio.Task[None] | None = None
 _retention_cancel: asyncio.Event | None = None
 _audit_archive_task: asyncio.Task[None] | None = None
 _audit_archive_cancel: asyncio.Event | None = None
+_sar_discover_task: asyncio.Task[None] | None = None
+_sar_discover_cancel: asyncio.Event | None = None
 
 # How often to scan maritime entities for AIS dropouts. The sweep is cheap
 # (in-memory iteration over self.entities); the real cost is the audit/store
@@ -73,6 +77,13 @@ RETENTION_INTERVAL_S = 3600   # purge once per hour
 # tick keeps us caught up.
 AUDIT_ARCHIVE_INTERVAL_S = int(os.environ.get("AUDIT_ARCHIVE_INTERVAL_S", "3600"))
 AUDIT_ARCHIVE_DRAIN_CAP = 50  # max archive_audit_chain() calls per tick (safety)
+
+# Sentinel-1 SAR discovery: every 6 hours, query Copernicus OData for new
+# scenes intersecting the AOI and record them in sar_scenes. Catalog
+# browsing is public (no auth), so this runs even before download
+# credentials are configured. Sentinel-1 has 6-day repeat over a given
+# area, so a 6-hour cadence comfortably catches every pass.
+SAR_DISCOVERY_INTERVAL_S = int(os.environ.get("SAR_DISCOVERY_INTERVAL_S", "21600"))
 
 # In-memory cache window: keep only recent observations in
 # engine.observations to bound RAM. Evicted obs still live in Postgres
@@ -126,6 +137,38 @@ async def _gap_sweeper_loop(cancel: asyncio.Event) -> None:
                     log.debug("evicted %d stale in-memory observations", evicted)
             except Exception as exc:  # noqa: BLE001
                 log.exception("in-memory eviction crashed: %s", exc)
+
+
+async def _sar_discover_loop(cancel: asyncio.Event) -> None:
+    """Periodic Sentinel-1 catalog discovery for the Texas AOI.
+
+    Public-catalog only — no Copernicus auth needed. New scenes get
+    inserted into sar_scenes with state='discovered' for downstream
+    download + CFAR. Run on boot too, then every SAR_DISCOVERY_INTERVAL_S.
+    """
+    # First run shortly after boot (give the app 60s to settle).
+    first_delay = 60
+    while not cancel.is_set():
+        try:
+            await asyncio.wait_for(cancel.wait(), timeout=first_delay)
+        except asyncio.TimeoutError:
+            try:
+                scenes = await asyncio.to_thread(sar.discover_scenes, limit=50)
+                if scenes:
+                    result = await asyncio.to_thread(sar.record_scenes, scenes)
+                    if result["inserted"]:
+                        audit_log.append(
+                            actor="system", event_type="sar_scenes_discovered",
+                            payload={
+                                "inserted": result["inserted"],
+                                "total_seen": len(scenes),
+                            },
+                        )
+                        log.info("SAR discovery: +%d new scenes", result["inserted"])
+            except Exception as exc:  # noqa: BLE001
+                log.exception("SAR discovery crashed: %s", exc)
+        # Subsequent runs: every SAR_DISCOVERY_INTERVAL_S.
+        first_delay = SAR_DISCOVERY_INTERVAL_S
 
 
 async def _audit_archive_loop(cancel: asyncio.Event) -> None:
@@ -269,6 +312,7 @@ def _bootstrap():
         global _gap_sweeper_task, _gap_sweeper_cancel
         global _retention_task, _retention_cancel
         global _audit_archive_task, _audit_archive_cancel
+        global _sar_discover_task, _sar_discover_cancel
         _aisstream_cancel = asyncio.Event()
 
         async def _on_observation(obs):
@@ -327,6 +371,14 @@ def _bootstrap():
                          AUDIT_ARCHIVE_INTERVAL_S)
             else:
                 log.info("R2 not configured; audit archive task skipped")
+
+            # Sentinel-1 SAR catalog discovery — public, no auth needed.
+            _sar_discover_cancel = asyncio.Event()
+            _sar_discover_task = loop.create_task(
+                _sar_discover_loop(_sar_discover_cancel)
+            )
+            log.info("SAR discovery task started (every %ds)",
+                     SAR_DISCOVERY_INTERVAL_S)
     else:
         log.info("AISSTREAM_API_KEY not set; skipping AIS ingestion + gap sweep + retention")
 
@@ -337,12 +389,15 @@ async def _shutdown():
     global _gap_sweeper_task, _gap_sweeper_cancel
     global _retention_task, _retention_cancel
     global _audit_archive_task, _audit_archive_cancel
+    global _sar_discover_task, _sar_discover_cancel
     for cancel in (_aisstream_cancel, _gap_sweeper_cancel,
-                   _retention_cancel, _audit_archive_cancel):
+                   _retention_cancel, _audit_archive_cancel,
+                   _sar_discover_cancel):
         if cancel is not None:
             cancel.set()
     for task in (_aisstream_task, _gap_sweeper_task,
-                 _retention_task, _audit_archive_task):
+                 _retention_task, _audit_archive_task,
+                 _sar_discover_task):
         if task is not None:
             task.cancel()
             try:
