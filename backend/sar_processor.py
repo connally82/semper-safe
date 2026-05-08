@@ -587,10 +587,15 @@ def fuse_detections(engine, scene_id: str) -> dict:
         scene = s.get(dbm.SarSceneRow, scene_id)
         if scene is None:
             raise RuntimeError(f"sar_scenes row not found: {scene_id}")
+        # Pull unfused rows: those with neither a match nor a fallback
+        # entity_id assigned yet. After this commit fuse_detections
+        # always sets entity_id, so a row with entity_id IS NOT NULL
+        # has already been fused — re-runs are no-ops on it.
         rows = s.execute(
             sa_select(dbm.SarDetectionRow)
             .where(dbm.SarDetectionRow.scene_id == scene_id)
             .where(dbm.SarDetectionRow.matched_entity_id.is_(None))
+            .where(dbm.SarDetectionRow.entity_id.is_(None))
         ).scalars().all()
         # Snapshot the data we need outside the session — the rows objects
         # detach when the session closes.
@@ -611,7 +616,8 @@ def fuse_detections(engine, scene_id: str) -> dict:
     n_ais_matched = 0
     n_dark_continued = 0
     n_dark_new = 0
-    matched: dict[str, str] = {}    # detection_id → entity_id
+    matched: dict[str, str] = {}        # detection_id → AIS-matched entity_id
+    entity_links: dict[str, str] = {}   # detection_id → any entity_id (always)
 
     import h3
     from models import Geom
@@ -642,6 +648,9 @@ def fuse_detections(engine, scene_id: str) -> dict:
             raw_lineage=f"sar:{scene_id}",
         )
         ent = engine.ingest(obs)
+        # Always record the entity link so the frontend can fetch a
+        # multi-pass track regardless of AIS-match status.
+        entity_links[d["detection_id"]] = ent.entity_id
 
         if ent.type in (EntityType.VESSEL, EntityType.AIS_GAP):
             n_ais_matched += 1
@@ -651,16 +660,21 @@ def fuse_detections(engine, scene_id: str) -> dict:
                 n_dark_continued += 1
             else:
                 n_dark_new += 1
-        # other types are unexpected — leave unset
+        # other types are unexpected — leave matched unset, entity_link
+        # still records the engine's internal id for traceability.
 
-    # Persist matched_entity_id back to the detections.
-    if matched:
+    # Persist entity_id (always) + matched_entity_id (AIS only) back to
+    # the detections in a single transaction.
+    if entity_links:
         with session_scope() as s:
-            for det_id, eid in matched.items():
+            for det_id, eid in entity_links.items():
+                update_vals = {"entity_id": eid}
+                if det_id in matched:
+                    update_vals["matched_entity_id"] = matched[det_id]
                 s.execute(
                     dbm.SarDetectionRow.__table__.update()
                     .where(dbm.SarDetectionRow.detection_id == det_id)
-                    .values(matched_entity_id=eid)
+                    .values(**update_vals)
                 )
 
     summary = {

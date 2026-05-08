@@ -226,7 +226,15 @@ class SarDetectionRow(Base):
     # Nullable for back-compat with detections from single-pol scenes
     # or scenes processed before VH discrimination was wired.
     vv_vh_ratio_db: Mapped[float | None] = mapped_column(Float, nullable=True)
-    # Set by the fusion engine after match. Null = no match (dark vessel candidate).
+    # Always set after fusion runs: whatever entity the engine ended up
+    # creating / linking for this detection (could be VESSEL, AIS_GAP,
+    # or DARK_VESSEL). Used by the frontend to fetch a track polyline
+    # for dark vessels seen across multiple SAR passes.
+    entity_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("entities.entity_id", ondelete="SET NULL"), nullable=True,
+    )
+    # Set by the fusion engine after match. Null = no AIS match (dark
+    # vessel candidate). Frontend uses this to color dots red vs green.
     matched_entity_id: Mapped[str | None] = mapped_column(
         String, ForeignKey("entities.entity_id", ondelete="SET NULL"), nullable=True,
     )

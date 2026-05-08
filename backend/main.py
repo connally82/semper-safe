@@ -974,6 +974,7 @@ def maritime_sar_detections(
                     "length_m": r.length_m,
                     "confidence": r.confidence,
                     "vv_vh_ratio_db": r.vv_vh_ratio_db,
+                    "entity_id": r.entity_id,
                     "matched_entity_id": r.matched_entity_id,
                     "detected_at": r.detected_at.isoformat(),
                     "is_dark_vessel": r.matched_entity_id is None,
@@ -1487,6 +1488,43 @@ def admin_s2_download(
     background_tasks.add_task(_do_s2_download, scene_id)
     return {"scene_id": scene_id, "status": "queued",
             "tip": "poll s2_scenes.state for completion"}
+
+
+@app.get("/maritime/sar/entities/{entity_id}/track")
+def maritime_sar_entity_track(entity_id: str, limit: int = 50):
+    """Return the SAR-only track for an entity — every sar_detections
+    row linked to this entity (across scenes), ordered by detected_at.
+
+    Used by the frontend to draw a polyline through multi-pass dark
+    vessel detections (track continuity within fusion._best_dark_vessel_match's
+    12 km / 90 min window). For AIS-matched vessels the existing
+    /maritime/entities/{eid}/track endpoint returns the AIS-only track,
+    but cross-scene SAR confirmation is its own thing.
+    """
+    from sqlalchemy import select as sa_select
+    from geoalchemy2.shape import to_shape
+    from db import models as dbm
+    from db.session import session_scope
+
+    with session_scope() as s:
+        rows = s.execute(
+            sa_select(dbm.SarDetectionRow)
+            .where(dbm.SarDetectionRow.entity_id == entity_id)
+            .order_by(dbm.SarDetectionRow.detected_at.asc())
+            .limit(limit)
+        ).scalars().all()
+        out = []
+        for r in rows:
+            pt = to_shape(r.geom)
+            out.append({
+                "detection_id": r.detection_id,
+                "scene_id": r.scene_id,
+                "detected_at": r.detected_at.isoformat(),
+                "lat": pt.y, "lon": pt.x,
+                "rcs_db": r.rcs_db, "length_m": r.length_m,
+                "vv_vh_ratio_db": r.vv_vh_ratio_db,
+            })
+    return {"entity_id": entity_id, "track": out, "n": len(out)}
 
 
 @app.get("/maritime/sar/detections/{detection_id}/optical_chip")

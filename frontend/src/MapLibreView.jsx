@@ -103,6 +103,13 @@ const SAR_DETECTIONS_SOURCE_ID = "ss-sar-detections";
 const SAR_DETECTIONS_LAYER_ID = "ss-sar-detections-circle";
 const SAR_STORAGE_KEY = "ss-sar-overlay";
 
+// Cross-scene SAR track polyline — drawn when a dark-vessel detection
+// click reveals an entity that's been detected in 2+ scenes (engine
+// links via fusion._best_dark_vessel_match within 12 km / 90 min).
+const SAR_TRACK_SOURCE_ID = "ss-sar-track";
+const SAR_TRACK_LINE_LAYER_ID = "ss-sar-track-line";
+const SAR_TRACK_POINT_LAYER_ID = "ss-sar-track-point";
+
 const SAR_SCENES_PATH = "/maritime/sar/scenes?limit=200";
 const SAR_DETECTIONS_PATH = "/maritime/sar/detections?limit=5000";
 
@@ -460,6 +467,40 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
           layout: { "visibility": "none" },   // mode-effect makes it visible
         });
       }
+      if (!map.getSource(SAR_TRACK_SOURCE_ID)) {
+        map.addSource(SAR_TRACK_SOURCE_ID, {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+        // Dashed red line through multi-pass dark-vessel positions —
+        // matches the dark-vessel red dot color so the relationship
+        // is visually obvious.
+        map.addLayer({
+          id: SAR_TRACK_LINE_LAYER_ID,
+          type: "line",
+          source: SAR_TRACK_SOURCE_ID,
+          filter: ["==", "$type", "LineString"],
+          paint: {
+            "line-color": "#e0556e",
+            "line-width": 1.8,
+            "line-opacity": 0.9,
+            "line-dasharray": [3, 2],
+          },
+          layout: { "line-cap": "round", "line-join": "round" },
+        });
+        map.addLayer({
+          id: SAR_TRACK_POINT_LAYER_ID,
+          type: "circle",
+          source: SAR_TRACK_SOURCE_ID,
+          filter: ["==", "$type", "Point"],
+          paint: {
+            "circle-color": "#e0556e",
+            "circle-radius": 3,
+            "circle-stroke-color": "#040810",
+            "circle-stroke-width": 1,
+          },
+        });
+      }
       if (!map.getSource(VIIRS_SOURCE_ID)) {
         map.addSource(VIIRS_SOURCE_ID, {
           type: "raster",
@@ -540,6 +581,31 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
       // Cache-busting param ensures we don't see stale cached chips
       // across detection_id reuses (which shouldn't happen but is cheap).
       const chipUrl = `${API_BASE}/maritime/sar/detections/${p.detection_id}/optical_chip`;
+      // Fetch and render the SAR-only multi-scene track for this
+      // detection's entity, if one is linked. Frontend track source
+      // is reset on next detection click / popup close.
+      const trackSrc = map.getSource(SAR_TRACK_SOURCE_ID);
+      const empty = { type: "FeatureCollection", features: [] };
+      if (trackSrc) trackSrc.setData(empty);
+      if (p.entity_id) {
+        fetch(`${API_BASE}/maritime/sar/entities/${p.entity_id}/track?limit=50`)
+          .then((r) => r.ok ? r.json() : null)
+          .then((data) => {
+            if (!data || !data.track || data.track.length < 2) return;
+            const coords = data.track.map((t) => [t.lon, t.lat]);
+            const features = [
+              { type: "Feature", geometry: { type: "LineString", coordinates: coords },
+                properties: {} },
+              ...coords.map((c) => ({
+                type: "Feature", geometry: { type: "Point", coordinates: c },
+                properties: {},
+              })),
+            ];
+            const src = map.getSource(SAR_TRACK_SOURCE_ID);
+            if (src) src.setData({ type: "FeatureCollection", features });
+          })
+          .catch(() => { /* noop */ });
+      }
       const html = `
         <div style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;
                     font-size:11px;letter-spacing:0.04em;color:#040810;
