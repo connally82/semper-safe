@@ -61,10 +61,14 @@ log = logging.getLogger("sar_processor")
 # Sized to fit per-tile peak memory + the live AIS engine state under 1 GB.
 # CFAR's integral-image arrays scale O(tile_px^2 * 8 bytes), so:
 #   4096 tile → ~500 MB peak per tile (OOM on 1 GB Fly VM)
-#   2048 tile → ~130 MB peak per tile (fits comfortably; 4x more tiles)
-# At 10 m/pixel IW GRDH, each 2048 tile covers ~20 km × 20 km — plenty of
-# context for the CFAR clutter estimate.
-TILE_PX = 2048
+#   2048 tile → ~130 MB peak per tile (OOM observed on 2026-05-08 with
+#              live AIS + audit archive coexisting — total anon-rss 848 MB)
+#   1024 tile → ~35 MB peak per tile (fits comfortably; ~4x more tiles
+#              but each is ~4x faster, so net wall clock ≈ unchanged)
+# At 10 m/pixel IW GRDH, each 1024 tile covers ~10 km × 10 km — still
+# plenty of context for the CFAR clutter estimate (training annulus is
+# only ~140 m).
+TILE_PX = 1024
 
 # Buffer to drop near tile edges (CFAR's reflect padding biases the clutter
 # estimate within ~train+guard pixels of the boundary).
