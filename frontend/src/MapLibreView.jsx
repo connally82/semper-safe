@@ -1261,6 +1261,13 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
         </button>
       </div>
 
+      {/* System pulse — single-glance freshness panel, bottom-right.
+          Polls /maritime/realtime every 30 s. Each sensor row shows
+          a colored dot keyed to "how stale is this", a label, and a
+          short numeric detail. Lets the operator tell instantly
+          whether AIS / SAR / buoys / etc are alive. */}
+      <SystemPulse apiBase={API_BASE} />
+
       {/* Time-scrub slider. Bottom-center, full width. Slider value is
           minutes-into-the-past (0 = now). Operators slide back to see
           where vessels were earlier. Hidden if entities is empty so the
@@ -1352,6 +1359,163 @@ function ScrubBar({ minutes, loading, live, onChange, onLive }) {
       >
         {loading ? "loading…" : label}
       </span>
+    </div>
+  );
+}
+
+
+// ----------------------------------------------------------------------
+// SystemPulse — corner widget that polls /maritime/realtime every 30 s
+// and renders a small per-sensor freshness panel. Each row shows:
+//   colored dot  (green ≤ fresh threshold, amber ≤ stale, red beyond)
+//   label
+//   age string ("12 s", "4 m", "2 h", "—" if never seen)
+//   detail   small numeric extra (count, etc)
+// ----------------------------------------------------------------------
+
+const PULSE_THRESHOLDS_S = {
+  ais:    { fresh: 60,        stale: 60 * 5 },         // AIS arrives every 1-2s
+  buoys:  { fresh: 60 * 35,   stale: 60 * 60 * 2 },    // 30-min cadence
+  sar:    { fresh: 60 * 60 * 24,    stale: 60 * 60 * 24 * 7 },  // 6-day repeat
+  s2:     { fresh: 60 * 60 * 24,    stale: 60 * 60 * 24 * 7 },  // 5-day repeat
+};
+
+function _ageFmt(seconds) {
+  if (seconds == null) return "—";
+  if (seconds < 60) return `${seconds} s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)} m`;
+  if (seconds < 86400) return `${(seconds / 3600).toFixed(1)} h`;
+  return `${(seconds / 86400).toFixed(1)} d`;
+}
+
+function _statusColor(seconds, thresh) {
+  if (seconds == null) return "#888";
+  if (seconds <= thresh.fresh) return "#5fd093";   // green
+  if (seconds <= thresh.stale) return "#f0a830";   // amber
+  return "#e0556e";                                // red
+}
+
+function PulseRow({ label, seconds, color, detail }) {
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 8,
+      padding: "3px 0",
+    }}>
+      <span style={{
+        width: 8, height: 8, borderRadius: "50%",
+        background: color, flex: "0 0 auto",
+        boxShadow: `0 0 6px ${color}`,
+      }} />
+      <span style={{
+        width: 44, color: "rgba(255,255,255,0.78)",
+        textTransform: "uppercase", letterSpacing: "0.06em",
+        fontSize: 10,
+      }}>{label}</span>
+      <span style={{
+        width: 56, textAlign: "right", color: "rgba(255,255,255,0.92)",
+        fontVariantNumeric: "tabular-nums",
+      }}>{_ageFmt(seconds)}</span>
+      <span style={{
+        flex: 1, color: "rgba(255,255,255,0.55)",
+        textAlign: "right", fontSize: 10,
+      }}>{detail}</span>
+    </div>
+  );
+}
+
+function SystemPulse({ apiBase }) {
+  const [pulse, setPulse] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    const ctrl = new AbortController();
+    const pull = async () => {
+      try {
+        const r = await fetch(`${apiBase}/maritime/realtime`, { signal: ctrl.signal });
+        if (!r.ok) throw new Error(`http ${r.status}`);
+        const data = await r.json();
+        if (!cancelled) setPulse(data);
+      } catch (err) {
+        if (err.name === "AbortError") return;
+        // eslint-disable-next-line no-console
+        console.warn("pulse fetch failed:", err);
+      }
+    };
+    pull();
+    const interval = window.setInterval(pull, 30_000);
+    return () => { cancelled = true; ctrl.abort(); window.clearInterval(interval); };
+  }, [apiBase]);
+
+  if (!pulse) return null;
+
+  const ais = pulse.ais  || {};
+  const sar = pulse.sar  || {};
+  const s2  = pulse.s2   || {};
+  const buoys = pulse.buoys || {};
+  const audit = pulse.audit || {};
+  const sarDet = sar.detail?.n_detections ?? 0;
+  const sarDark = sar.detail?.n_dark ?? 0;
+  const sarStates = sar.detail?.scene_states || {};
+
+  return (
+    <div style={{
+      position: "absolute",
+      bottom: 12, right: 12,
+      width: 280,
+      background: "rgba(4,8,16,0.84)",
+      border: "1px solid rgba(255,255,255,0.18)",
+      borderRadius: 6,
+      padding: "8px 12px",
+      fontFamily: "'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace",
+      fontSize: 11,
+      letterSpacing: "0.04em",
+      color: "rgba(255,255,255,0.85)",
+      zIndex: 1,
+    }}>
+      <div style={{
+        fontSize: 10, textTransform: "uppercase", letterSpacing: "0.12em",
+        color: "rgba(255,255,255,0.55)", marginBottom: 4,
+      }}>
+        System pulse
+      </div>
+      <PulseRow
+        label="AIS"
+        seconds={ais.age_seconds}
+        color={_statusColor(ais.age_seconds, PULSE_THRESHOLDS_S.ais)}
+        detail={`${ais.detail?.n_vessels ?? 0} vessels`}
+      />
+      <PulseRow
+        label="Buoys"
+        seconds={buoys.age_seconds}
+        color={_statusColor(buoys.age_seconds, PULSE_THRESHOLDS_S.buoys)}
+        detail={`${buoys.detail?.n_alive ?? 0}/${buoys.detail?.n_total ?? 0} live`}
+      />
+      <PulseRow
+        label="SAR"
+        seconds={sar.age_seconds}
+        color={_statusColor(sar.age_seconds, PULSE_THRESHOLDS_S.sar)}
+        detail={`${sarDet} det · ${sarDark} dark`}
+      />
+      <PulseRow
+        label="S2"
+        seconds={s2.age_seconds}
+        color={_statusColor(s2.age_seconds, PULSE_THRESHOLDS_S.s2)}
+        detail={`${(s2.detail?.scene_states?.discovered ?? 0)} scenes`}
+      />
+      <div style={{
+        marginTop: 6, paddingTop: 6,
+        borderTop: "1px solid rgba(255,255,255,0.12)",
+        fontSize: 10,
+        color: "rgba(255,255,255,0.55)",
+        display: "flex", justifyContent: "space-between",
+      }}>
+        <span>audit</span>
+        <span style={{
+          color: "rgba(255,255,255,0.78)",
+          fontVariantNumeric: "tabular-nums",
+        }}>
+          {audit.entries?.toLocaleString() ?? "—"} entries
+        </span>
+      </div>
     </div>
   );
 }

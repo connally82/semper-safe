@@ -1014,6 +1014,133 @@ def _require_admin(x_admin_token: str | None) -> None:
         raise HTTPException(401, "missing or invalid X-Admin-Token")
 
 
+@app.get("/maritime/realtime")
+def maritime_realtime():
+    """Single-call freshness summary for every sensor in the platform.
+
+    Operator-grade "system pulse" — the panel that goes in the corner of
+    the map and lets you tell at a glance whether each layer is alive
+    and current. Each sensor returns:
+      latest_t          ISO-8601 of the most recent observation/event
+      age_seconds       now - latest_t, for client-side rendering
+      detail            small free-form blob with sensor-specific extras
+
+    Designed to be cheap — pure DB aggregates + a couple of in-memory
+    reads. Polled every 30 s on the frontend.
+    """
+    from datetime import datetime, timezone
+    from sqlalchemy import select as sa_select, func
+    from db import models as dbm
+    from db.session import session_scope
+
+    now = datetime.now(timezone.utc)
+
+    def _delta(t):
+        if t is None:
+            return None, None
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return t.isoformat(), int((now - t).total_seconds())
+
+    out = {"now": now.isoformat()}
+
+    if not store.is_persistent():
+        out["persistent"] = False
+        return out
+
+    with session_scope() as s:
+        # AIS: most recent entity update (vessels + ais_gap entities)
+        ais_t = s.execute(
+            sa_select(func.max(dbm.EntityRow.last_seen))
+            .where(dbm.EntityRow.domain == "maritime")
+            .where(dbm.EntityRow.type.in_(["vessel", "ais_gap"]))
+        ).scalar_one()
+        ais_iso, ais_age = _delta(ais_t)
+        n_vessels = s.execute(
+            sa_select(func.count())
+            .select_from(dbm.EntityRow)
+            .where(dbm.EntityRow.domain == "maritime")
+            .where(dbm.EntityRow.type == "vessel")
+        ).scalar_one()
+        out["ais"] = {
+            "latest_t": ais_iso,
+            "age_seconds": ais_age,
+            "detail": {"n_vessels": int(n_vessels or 0)},
+        }
+
+        # SAR: latest detection
+        sar_det_t, n_det, n_dark = s.execute(
+            sa_select(
+                func.max(dbm.SarDetectionRow.detected_at),
+                func.count(),
+                func.count().filter(dbm.SarDetectionRow.matched_entity_id.is_(None)),
+            )
+        ).one()
+        # SAR scene state histogram
+        scene_state_rows = s.execute(
+            sa_select(dbm.SarSceneRow.state, func.count())
+            .group_by(dbm.SarSceneRow.state)
+        ).all()
+        sar_iso, sar_age = _delta(sar_det_t)
+        out["sar"] = {
+            "latest_t": sar_iso,
+            "age_seconds": sar_age,
+            "detail": {
+                "n_detections": int(n_det or 0),
+                "n_dark": int(n_dark or 0),
+                "scene_states": {st: int(c) for st, c in scene_state_rows},
+            },
+        }
+
+        # S2: latest catalogued scene (any state)
+        s2_t = s.execute(
+            sa_select(func.max(dbm.S2SceneRow.acquired_at))
+        ).scalar_one()
+        s2_states = {
+            st: int(c) for st, c in s.execute(
+                sa_select(dbm.S2SceneRow.state, func.count())
+                .group_by(dbm.S2SceneRow.state)
+            ).all()
+        }
+        s2_iso, s2_age = _delta(s2_t)
+        out["s2"] = {
+            "latest_t": s2_iso,
+            "age_seconds": s2_age,
+            "detail": {"scene_states": s2_states},
+        }
+
+    # Buoys — single import, network-bound. Skip if anything goes wrong;
+    # the realtime endpoint shouldn't 500 because NDBC is unhappy.
+    try:
+        import ndbc
+        rows = ndbc.fetch_all()
+        latest_t = None
+        n_alive = 0
+        for r in rows:
+            obs = r.get("observation")
+            if obs and obs.get("t"):
+                t = datetime.fromisoformat(obs["t"])
+                if latest_t is None or t > latest_t:
+                    latest_t = t
+                n_alive += 1
+        b_iso, b_age = _delta(latest_t)
+        out["buoys"] = {
+            "latest_t": b_iso,
+            "age_seconds": b_age,
+            "detail": {"n_total": len(rows), "n_alive": n_alive},
+        }
+    except Exception as exc:  # noqa: BLE001
+        out["buoys"] = {"error": str(exc)}
+
+    # Audit chain — head + count
+    out["audit"] = {
+        "head": audit_log.head(),
+        "entries": len(audit_log.all()),
+    }
+
+    return out
+
+
 @app.get("/maritime/buoys")
 def maritime_buoys():
     """Latest observation from each NDBC buoy in / near the Texas AOI.
