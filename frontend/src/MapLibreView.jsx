@@ -152,30 +152,24 @@ const GOES_REFRESH_MS = 10 * 60 * 1000;
 const GOES_OPACITY = 0.55;
 const GOES_CYCLE = ["off", "geocolor", "firetemp"];
 
-// VIIRS — polar-orbiter products via GIBS, ~12 h revisit per satellite.
-// Two modes:
-//   dnb   — Day/Night Band, "Enhanced Near Constant Contrast" recipe.
-//           Spots lit ships at night against dark ocean — same imagery
-//           NOAA EOG runs their VIIRS Boat Detection (VBD) algorithm
-//           against. We don't get point detections here (those need EOG
-//           registration), but the visual is the smoking gun.
-//   therm — Thermal Anomalies (combined SNPP + NOAA-20 + NOAA-21).
-//           Renders 375 m active-fire pixels as red dots on transparent
-//           tiles. Catches vessel fires + flares + onshore wildfires.
+// VIIRS — polar-orbiter day/night band via GIBS, ~12 h revisit per
+// satellite. The "Enhanced Near Constant Contrast" recipe stretches
+// nighttime radiance so lit ships pop against dark ocean — same
+// imagery NOAA EOG runs their VIIRS Boat Detection (VBD) algorithm
+// against. Operator gets the visual; point-level VBD detections
+// require EOG registration and would land in a separate vbd_detections
+// table fed via Observation(source=VIIRS) — Phase 5.
 const VIIRS_SOURCE_ID = "ss-viirs";
 const VIIRS_LAYER_ID = "ss-viirs-raster";
-const VIIRS_STORAGE_KEY = "ss-viirs-mode";   // "off" | "dnb" | "therm"
+const VIIRS_STORAGE_KEY = "ss-viirs-mode";   // "off" | "dnb"
 const VIIRS_TILE_URLS = {
   dnb: "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/" +
        "VIIRS_SNPP_DayNightBand_ENCC/default/default/" +
        "GoogleMapsCompatible_Level8/{z}/{y}/{x}.png",
-  therm: "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/" +
-         "VIIRS_NOAA20_Thermal_Anomalies_375m_All/default/default/" +
-         "GoogleMapsCompatible_Level7/{z}/{y}/{x}.png",
 };
 const VIIRS_REFRESH_MS = 30 * 60 * 1000;     // 12 h cadence; poll cheap
 const VIIRS_OPACITY = 0.7;
-const VIIRS_CYCLE = ["off", "dnb", "therm"];
+const VIIRS_CYCLE = ["off", "dnb"];
 
 async function fetchTrack(apiPath, eid, signal) {
   const r = await fetch(`${API_BASE}${apiPath}/entities/${eid}/track?limit=200`, { signal });
@@ -1241,8 +1235,7 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
         <button
           type="button"
           title={
-            "Cycle VIIRS layers (NASA GIBS, ~12 h revisit):  " +
-            "off → DNB (lit ships at night) → THERM (active fire pixels)"
+            "Toggle VIIRS Day/Night Band (NASA GIBS): lit ships at night."
           }
           onClick={() => {
             const i = VIIRS_CYCLE.indexOf(viirsMode);
@@ -1256,19 +1249,15 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
             padding: "6px 10px",
             background:
               viirsMode === "off" ? "transparent" :
-              viirsMode === "therm" ? "rgba(220,80,60,0.30)" :
               "rgba(160,120,200,0.28)",
             color:
               viirsMode === "off" ? "rgba(255,255,255,0.7)" :
-              viirsMode === "therm" ? "#ffd0c8" :
               "#dcc8ee",
             textTransform: "uppercase",
             minWidth: 56,
           }}
         >
-          {viirsMode === "off" ? "VIIRS"
-           : viirsMode === "therm" ? "THERM"
-           : "DNB"}
+          {viirsMode === "off" ? "VIIRS" : "DNB"}
         </button>
       </div>
 
