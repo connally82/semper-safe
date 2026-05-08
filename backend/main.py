@@ -642,6 +642,54 @@ def _do_sar_download(scene_id: str) -> None:
         log.exception("admin SAR download failed: %s", exc)
 
 
+@app.get("/admin/sar/scenes")
+def admin_sar_scenes(
+    state: str | None = None,
+    limit: int = 50,
+    x_admin_token: str | None = Header(default=None),
+):
+    """List Sentinel-1 scenes by state for ops triage. No coords/footprints
+    in the response — those would dwarf the JSON. Sorted: smallest scenes
+    first within state to make picking a test target easy.
+    """
+    _require_admin(x_admin_token)
+    from sqlalchemy import select as sa_select
+    from db import models as dbm
+    from db.session import session_scope
+
+    q = sa_select(
+        dbm.SarSceneRow.scene_id,
+        dbm.SarSceneRow.platform,
+        dbm.SarSceneRow.acquired_at,
+        dbm.SarSceneRow.state,
+        dbm.SarSceneRow.raw_url,
+        dbm.SarSceneRow.failure_reason,
+        dbm.SarSceneRow.attrs,
+    )
+    if state:
+        q = q.where(dbm.SarSceneRow.state == state)
+    q = q.order_by(dbm.SarSceneRow.acquired_at.desc()).limit(limit)
+
+    with session_scope() as s:
+        rows = s.execute(q).all()
+
+    out = []
+    for r in rows:
+        attrs = r.attrs or {}
+        out.append({
+            "scene_id": r.scene_id,
+            "platform": r.platform,
+            "acquired_at": r.acquired_at.isoformat() if r.acquired_at else None,
+            "state": r.state,
+            "raw_url": r.raw_url,
+            "failure_reason": r.failure_reason,
+            "content_length_bytes": attrs.get("content_length_bytes"),
+            "name": attrs.get("name"),
+        })
+    out.sort(key=lambda x: (x["state"] != "discovered", x["content_length_bytes"] or 0))
+    return {"count": len(out), "scenes": out}
+
+
 @app.post("/admin/sar/download/{scene_id}", status_code=202)
 def admin_sar_download(
     scene_id: str,
