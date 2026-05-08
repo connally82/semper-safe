@@ -345,18 +345,29 @@ def _entity_track(engine, eid: str, limit: int):
     Returns the most-recent `limit` observation positions in time order.
     Lightweight (no recommendation/audit payload) so the frontend can
     poll it cheaply on selection change.
+
+    Data source priority:
+      1. Postgres (full history up to retention TTL) — when DATABASE_URL is set
+      2. engine.observations in-memory dict — fallback for local/CI runs
+         without a DB. Note: the in-memory cache is bounded to a ~30min
+         window so this fallback shows truncated tracks for older entities.
     """
     ent = engine.entities.get(eid)
     if ent is None:
         raise HTTPException(404, "entity not found")
-    obs = [
-        engine.observations[o]
-        for o in ent.observation_ids
-        if o in engine.observations
-    ]
-    obs.sort(key=lambda o: o.t)
-    if limit > 0:
-        obs = obs[-limit:]
+
+    if store.is_persistent():
+        obs = store.load_track(eid, limit=limit)
+    else:
+        obs = [
+            engine.observations[o]
+            for o in ent.observation_ids
+            if o in engine.observations
+        ]
+        obs.sort(key=lambda o: o.t)
+        if limit > 0:
+            obs = obs[-limit:]
+
     return {
         "entity_id": eid,
         "type": ent.type.value,

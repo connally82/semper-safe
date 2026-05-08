@@ -400,6 +400,52 @@ def bulk_seed_state(
     }
 
 
+# --- Track query ------------------------------------------------------
+
+def load_track(eid: str, *, limit: int = 200) -> list[Observation]:
+    """Return the most-recent `limit` observations for an entity, in time
+    order (oldest first). Used by the /track endpoint so older entities
+    that have been evicted from the in-memory cache still show their
+    full Postgres-stored history.
+
+    Returns [] when DATABASE_URL is unset (caller falls back to in-memory).
+    """
+    if not is_persistent():
+        return []
+    from sqlalchemy import select
+
+    from db import models as dbm
+    from db.session import session_scope
+
+    with session_scope() as s:
+        rows = s.execute(
+            select(dbm.ObservationRow)
+            .join(
+                dbm.entity_observations,
+                dbm.ObservationRow.obs_id == dbm.entity_observations.c.obs_id,
+            )
+            .where(dbm.entity_observations.c.entity_id == eid)
+            .order_by(dbm.ObservationRow.t.desc())
+            .limit(limit)
+        ).scalars().all()
+        # Pull data into Pydantic objects while the session is live —
+        # session_scope closes on exit and detaches the ORM rows.
+        return list(reversed([
+            Observation(
+                obs_id=r.obs_id,
+                source=SourceType(r.source),
+                source_id=r.source_id,
+                geom=_geom_from_orm(r.geom),
+                h3_cell=r.h3_cell,
+                t=r.t,
+                attrs=r.attrs,
+                confidence=r.confidence,
+                raw_lineage=r.raw_lineage,
+            )
+            for r in rows
+        ]))
+
+
 # --- Retention --------------------------------------------------------
 
 def purge_old_observations(*, older_than_hours: int) -> int:
