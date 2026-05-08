@@ -744,6 +744,79 @@ def maritime_lineage(eid: str):
 # GeoJSON FeatureCollections so the frontend can hand them straight to
 # maplibre-gl source.setData(). All geometry already in WGS84 (srid=4326).
 
+@app.get("/maritime/sar/stats")
+def maritime_sar_stats():
+    """Aggregate SAR pipeline counters for status / demo header.
+
+    Returns:
+      scenes_by_state         — discovered / downloaded / detected / failed counts
+      scenes_total
+      detections_total        — all detections across all scenes
+      detections_dark         — matched_entity_id IS NULL (dark vessel candidates)
+      detections_matched      — AIS-matched
+      latest_detected_scene   — most recent scene that finished CFAR (acquired_at + completed_at)
+      latest_detection_at     — wall-clock time of newest detection row
+    """
+    from datetime import datetime, timezone
+    from sqlalchemy import select as sa_select, func, case
+    from db import models as dbm
+    from db.session import session_scope
+
+    if not store.is_persistent():
+        return {"persistent": False}
+
+    with session_scope() as s:
+        rows = s.execute(
+            sa_select(dbm.SarSceneRow.state, func.count())
+            .group_by(dbm.SarSceneRow.state)
+        ).all()
+        scenes_by_state = {state: int(n) for state, n in rows}
+        scenes_total = sum(scenes_by_state.values())
+
+        # Detection counts split by AIS-matched vs dark.
+        det_total, det_matched, det_dark, det_max_t = s.execute(
+            sa_select(
+                func.count(),
+                func.count(dbm.SarDetectionRow.matched_entity_id),
+                func.sum(case(
+                    (dbm.SarDetectionRow.matched_entity_id.is_(None), 1),
+                    else_=0,
+                )),
+                func.max(dbm.SarDetectionRow.detected_at),
+            )
+        ).one()
+
+        # Latest detected scene: pull the row, surface key fields.
+        latest = s.execute(
+            sa_select(dbm.SarSceneRow)
+            .where(dbm.SarSceneRow.state == "detected")
+            .order_by(dbm.SarSceneRow.acquired_at.desc())
+            .limit(1)
+        ).scalars().first()
+        latest_scene = None
+        if latest is not None:
+            attrs = latest.attrs or {}
+            latest_scene = {
+                "scene_id": latest.scene_id,
+                "name": attrs.get("name"),
+                "acquired_at": latest.acquired_at.isoformat(),
+                "n_detections": (attrs.get("detection_summary") or {}).get("n_kept"),
+                "completed_at": (attrs.get("detection_summary") or {}).get("detected_at"),
+            }
+
+    return {
+        "persistent": True,
+        "scenes_total": scenes_total,
+        "scenes_by_state": scenes_by_state,
+        "detections_total": int(det_total or 0),
+        "detections_matched": int(det_matched or 0),
+        "detections_dark": int(det_dark or 0),
+        "latest_detected_scene": latest_scene,
+        "latest_detection_at": det_max_t.isoformat() if det_max_t else None,
+        "now": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @app.get("/maritime/sar/scenes")
 def maritime_sar_scenes(
     state: str | None = None,
