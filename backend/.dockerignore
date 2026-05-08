@@ -27,8 +27,13 @@ htmlcov
 *.swp
 .DS_Store
 
-# Local data — per docs/blueprint.md, real data never lives in the image
+# Local data — per docs/blueprint.md, real *user/sensor* data never
+# lives in the image. Static reference assets bundled with the code
+# (offshore-platform registry, AOI land polygon) are explicitly opted
+# back in below.
 data
+!data/gulf_offshore_platforms.json
+!data/aoi_land.geojson
 *.sqlite
 *.db
 *.log
