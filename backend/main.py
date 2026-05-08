@@ -1120,40 +1120,69 @@ def admin_s2_scenes(
     return {"count": len(out), "scenes": out}
 
 
-@app.post("/admin/ais/backfill")
-def admin_ais_backfill(
-    start: str,                      # ISO-8601 start time
-    end: str,                        # ISO-8601 end time
-    ingest: bool = False,            # if true, ingest into the live maritime engine
-    x_admin_token: str | None = Header(default=None),
-):
-    """Backfill historical AIS from NOAA Marine Cadastre into the engine.
-
-    Pulls the daily AIS_*.zip file(s) covering [start, end] (UTC),
-    filters to the Texas-shoreline AOI bbox + the requested time
-    window, and reports counts. With ?ingest=true, also feeds each
-    record through engine.ingest as Observation(source=AIS) so the
-    SAR-AIS fusion can match against historical positions.
-
-    Use case: a SAR scene acquired more than 24 h ago has no AIS in our
-    DB to fuse against. POST /admin/sar/fuse/{scene_id} alone will
-    produce all-dark detections. Run this first to populate history,
-    then re-run fuse.
-
-    Coverage caveat: NOAA's archive lags real-time by 3-6 months.
-    Daily files for very recent dates return 404 — this endpoint
-    surfaces the missing days in the response.
-    """
-    _require_admin(x_admin_token)
+def _do_ais_backfill(start_iso: str, end_iso: str, ingest: bool) -> None:
+    """Background-task body for /admin/ais/backfill — runs the long
+    daily-file download + filter without blocking the HTTP request."""
     from datetime import datetime, timezone
     import noaa_ais
-
     def _parse(s: str) -> datetime:
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
         dt = datetime.fromisoformat(s)
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    try:
+        time_lo = _parse(start_iso)
+        time_hi = _parse(end_iso)
+        result = noaa_ais.fetch_window(time_lo, time_hi)
+        payload = {
+            "window": {"start": time_lo.isoformat(), "end": time_hi.isoformat()},
+            "total_kept": result["total_kept"],
+            "n_unique_mmsi": result["n_unique_mmsi"],
+            "missing_days": result["missing_days"],
+        }
+        if ingest and result["rows"]:
+            ing = noaa_ais.ingest_into_engine(result["rows"], engine=maritime)
+            payload["ingest_counts"] = ing
+        audit_log.append(
+            actor="admin", event_type="noaa_ais_backfill",
+            payload=payload,
+        )
+        log.info("AIS backfill done: %s", payload)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("AIS backfill failed: %s", exc)
 
+
+@app.post("/admin/ais/backfill", status_code=202)
+def admin_ais_backfill(
+    start: str,                      # ISO-8601 start time
+    end: str,                        # ISO-8601 end time
+    background_tasks: BackgroundTasks,
+    ingest: bool = False,            # if true, ingest into the live maritime engine
+    x_admin_token: str | None = Header(default=None),
+):
+    """Backfill historical AIS from NOAA Marine Cadastre into the engine.
+
+    Returns 202 immediately; the actual download (300-500 MB per daily
+    file, often 1-3 minutes wall clock) runs as a FastAPI BackgroundTask
+    and audit-logs noaa_ais_backfill on completion.
+
+    Use case: a SAR scene acquired more than 24 h ago has no AIS in our
+    DB to fuse against. /admin/sar/fuse/{scene_id} alone produces
+    all-dark detections. Run this first to populate history, then
+    re-run fuse — or use /admin/ais/backfill-for-sar/{scene_id} which
+    chains both steps automatically.
+
+    Coverage caveat: NOAA's archive lags real-time by 3-6 months.
+    Daily files for very recent dates return 404; missing_days appears
+    in the audit_log payload.
+    """
+    _require_admin(x_admin_token)
+    from datetime import datetime, timezone
+    def _parse(s: str) -> datetime:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     try:
         time_lo = _parse(start)
         time_hi = _parse(end)
@@ -1165,96 +1194,89 @@ def admin_ais_backfill(
     if span_h > 24:
         raise HTTPException(400,
             "max 24-hour window per call (each daily file is ~400 MB)")
+    background_tasks.add_task(_do_ais_backfill, start, end, ingest)
+    return {"status": "queued",
+            "window": {"start": time_lo.isoformat(),
+                        "end": time_hi.isoformat()},
+            "tip": "watch audit log for event_type=noaa_ais_backfill"}
 
-    log.info("AIS backfill: %s → %s (%.1f h, ingest=%s)",
-             time_lo.isoformat(), time_hi.isoformat(), span_h, ingest)
-    result = noaa_ais.fetch_window(time_lo, time_hi)
 
-    out = {
-        "window": {"start": time_lo.isoformat(), "end": time_hi.isoformat()},
-        "total_kept": result["total_kept"],
-        "n_unique_mmsi": result["n_unique_mmsi"],
-        "per_day_counts": result["per_day_counts"],
-        "missing_days": result["missing_days"],
-        "ingested": False,
-    }
-
-    if ingest and result["rows"]:
-        ing = noaa_ais.ingest_into_engine(result["rows"], engine=maritime)
-        out["ingested"] = True
-        out["ingest_counts"] = ing
+def _do_ais_backfill_for_sar(scene_id: str, window_minutes: int,
+                              ingest: bool, rerun_fusion: bool) -> None:
+    from datetime import timedelta
+    from db import models as dbm
+    from db.session import session_scope
+    import noaa_ais
+    try:
+        with session_scope() as s:
+            scene = s.get(dbm.SarSceneRow, scene_id)
+            if scene is None:
+                log.warning("backfill-for-sar: scene not found %s", scene_id)
+                return
+            sar_t = scene.acquired_at
+        time_lo = sar_t - timedelta(minutes=window_minutes)
+        time_hi = sar_t + timedelta(minutes=window_minutes)
+        result = noaa_ais.fetch_window(time_lo, time_hi)
+        payload = {
+            "scene_id": scene_id,
+            "scene_acquired_at": sar_t.isoformat(),
+            "window_minutes": window_minutes,
+            "total_kept": result["total_kept"],
+            "n_unique_mmsi": result["n_unique_mmsi"],
+            "missing_days": result["missing_days"],
+        }
+        if result["missing_days"]:
+            payload["status"] = "noaa_archive_not_yet_available"
+        if ingest and result["rows"]:
+            ing = noaa_ais.ingest_into_engine(result["rows"], engine=maritime)
+            payload["ingest_counts"] = ing
+            if rerun_fusion:
+                import sar_processor
+                payload["fusion"] = sar_processor.fuse_detections(
+                    maritime, scene_id)
         audit_log.append(
-            actor="admin", event_type="noaa_ais_backfill",
-            payload={"window": out["window"], **ing,
-                     "total_kept": result["total_kept"]},
+            actor="admin", event_type="noaa_ais_backfill_for_sar",
+            payload=payload,
         )
-        log.info("AIS backfill ingested: %s", ing)
+        log.info("AIS backfill-for-sar done: %s", payload)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("AIS backfill-for-sar failed: %s", exc)
 
-    return out
 
-
-@app.post("/admin/ais/backfill-for-sar/{scene_id}")
+@app.post("/admin/ais/backfill-for-sar/{scene_id}", status_code=202)
 def admin_ais_backfill_for_sar(
     scene_id: str,
+    background_tasks: BackgroundTasks,
     window_minutes: int = 30,
     ingest: bool = True,
     rerun_fusion: bool = True,
     x_admin_token: str | None = Header(default=None),
 ):
-    """One-shot helper: pull NOAA AIS around a SAR scene's acquisition
-    time, ingest into the engine, then re-run SAR-AIS fusion on the
-    same scene. Returns combined counts.
+    """Returns 202 immediately. BackgroundTask:
+       fetch ± window_minutes around the SAR scene's acquired_at →
+       ingest if requested → re-fuse on the same scene if requested.
 
-    For our 2026 demo data NOAA won't have the archive yet (typical
-    3-6 month lag). The response surfaces the missing daily file so
-    the operator knows when to retry.
+    For our 2026 SAR scenes the NOAA archive isn't published yet, so
+    the audit-log entry will include status=noaa_archive_not_yet_available
+    rather than match counts. Re-run after NOAA catches up (typically
+    3-6 months post-acquisition).
     """
     _require_admin(x_admin_token)
-    import noaa_ais
-    from datetime import timedelta
     from sqlalchemy import select as sa_select
     from db import models as dbm
     from db.session import session_scope
-
     with session_scope() as s:
         scene = s.get(dbm.SarSceneRow, scene_id)
         if scene is None:
             raise HTTPException(404, f"sar scene not found: {scene_id}")
-        sar_t = scene.acquired_at
-
-    time_lo = sar_t - timedelta(minutes=window_minutes)
-    time_hi = sar_t + timedelta(minutes=window_minutes)
-    log.info("AIS backfill-for-sar: scene=%s acq=%s window=±%dmin",
-             scene_id, sar_t.isoformat(), window_minutes)
-    result = noaa_ais.fetch_window(time_lo, time_hi)
-
-    out = {
-        "scene_id": scene_id,
-        "scene_acquired_at": sar_t.isoformat(),
-        "window_minutes": window_minutes,
-        "total_kept": result["total_kept"],
-        "n_unique_mmsi": result["n_unique_mmsi"],
-        "missing_days": result["missing_days"],
-    }
-
-    if result["missing_days"]:
-        out["status"] = ("noaa_archive_not_yet_available — retry later "
-                         "(NOAA typically lags real-time by 3–6 months)")
-    if not result["rows"]:
-        return out
-
-    if ingest:
-        ing = noaa_ais.ingest_into_engine(result["rows"], engine=maritime)
-        out["ingest_counts"] = ing
-        if rerun_fusion:
-            import sar_processor
-            fusion = sar_processor.fuse_detections(maritime, scene_id)
-            out["fusion"] = fusion
-        audit_log.append(
-            actor="admin", event_type="noaa_ais_backfill_for_sar",
-            payload=out,
-        )
-    return out
+        scene_t = scene.acquired_at.isoformat()
+    background_tasks.add_task(
+        _do_ais_backfill_for_sar, scene_id, window_minutes, ingest, rerun_fusion,
+    )
+    return {"status": "queued", "scene_id": scene_id,
+            "scene_acquired_at": scene_t,
+            "window_minutes": window_minutes,
+            "tip": "watch audit log for event_type=noaa_ais_backfill_for_sar"}
 
 
 def _do_s2_download(scene_id: str) -> None:
