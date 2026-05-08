@@ -91,10 +91,18 @@ class FusionEngine:
         self._mmsi_index: dict[str, str] = {}
 
     def load_persisted_state(self) -> None:
-        """Pull existing entities/observations/recommendations from Postgres
-        into in-memory state. Called once on startup if DB has data."""
-        loaded = store.load_state(DOMAIN)
-        self.observations.update(loaded.observations)
+        """Pull entities + recommendations from Postgres into in-memory state.
+
+        Uses the fast-path load_entities_only — observations are NOT
+        preloaded. The full load_state's eager join across the
+        entity↔observation many-to-many would walk 100k+ rows on a
+        populated DB and time out the FastAPI startup handler. Engine
+        doesn't actually need preloaded observations:
+          - AIS ingest dedupes via _mmsi_index built from entities below
+          - /track and /timeline endpoints already query the DB directly
+          - SAR engine ingest is fed observations one at a time
+        """
+        loaded = store.load_entities_only(DOMAIN)
         self.entities.update(loaded.entities)
         self.recommendations.update(loaded.recommendations)
         # Rebuild MMSI index from loaded entities

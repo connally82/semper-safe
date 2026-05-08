@@ -191,6 +191,85 @@ def is_empty(domain: str) -> bool:
         return n == 0
 
 
+def load_entities_only(domain: str) -> LoadedState:
+    """Fast-path startup load: entities only, no observations/recommendations.
+
+    The full load_state walks the entity↔observation many-to-many association
+    eagerly. After ~24h of AIS ingest the join blows up to 100k+ rows and
+    times out FastAPI's startup handler before uvicorn declares itself ready.
+
+    The engine doesn't actually need observations preloaded:
+      - AIS ingest only consults _mmsi_index (built from entities) to dedup
+      - /maritime/entities/{eid}/track and /maritime/timeline already query DB
+      - Lineage endpoints can fall back to DB lookups (or be lazified)
+
+    So at boot we load only the entities + recommendations (small) and let
+    observations grow incrementally as they're ingested. This drops startup
+    from ~80s+ (timing out) to ~3s on a populated DB.
+    """
+    if not is_persistent():
+        return LoadedState({}, {}, {})
+
+    from db import models as dbm
+    from db.session import session_scope
+    from sqlalchemy import select
+    from sqlalchemy.orm import noload
+
+    with session_scope() as s:
+        # noload() on the observations relationship: don't even fire the
+        # selectin query for the join. observation_ids on Entity stays empty
+        # (gets repopulated as observations land via ingest paths).
+        ent_rows = s.execute(
+            select(dbm.EntityRow)
+            .where(dbm.EntityRow.domain == domain)
+            .options(noload(dbm.EntityRow.observations))
+        ).scalars().all()
+        entities: dict[str, Entity] = {}
+        for r in ent_rows:
+            entities[r.entity_id] = Entity(
+                entity_id=r.entity_id,
+                type=EntityType(r.type),
+                geom=_geom_from_orm(r.geom),
+                last_seen=r.last_seen,
+                first_seen=r.first_seen,
+                confidence=r.confidence,
+                priority_score=r.priority_score,
+                observation_ids=[],     # populated incrementally on ingest
+                attrs=r.attrs,
+                notes=r.notes,
+            )
+
+        # Recommendations are still small — load them so /decisions endpoints
+        # work without an extra round-trip.
+        rec_rows = s.execute(
+            select(dbm.RecommendationRow)
+            .join(dbm.EntityRow, dbm.RecommendationRow.entity_id == dbm.EntityRow.entity_id)
+            .where(dbm.EntityRow.domain == domain)
+            .options(noload(dbm.RecommendationRow.evidence))
+        ).scalars().all()
+        recommendations: dict[str, Recommendation] = {}
+        for r in rec_rows:
+            from models import ActionType
+            recommendations[r.rec_id] = Recommendation(
+                rec_id=r.rec_id,
+                entity_id=r.entity_id,
+                action=ActionType(r.action),
+                rationale=r.rationale,
+                evidence_obs_ids=[],   # lazy, /lineage queries DB on demand
+                suggested_at=r.suggested_at,
+                decision=Decision(r.decision),
+                decided_by=r.decided_by,
+                decided_at=r.decided_at,
+                decision_reason=r.decision_reason,
+            )
+
+        return LoadedState(
+            observations={},   # incrementally populated via ingest
+            entities=entities,
+            recommendations=recommendations,
+        )
+
+
 def load_state(domain: str) -> LoadedState:
     """Load full in-memory state for a domain. Empty if no DB or no rows."""
     if not is_persistent():

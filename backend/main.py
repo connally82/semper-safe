@@ -259,16 +259,26 @@ def _bootstrap():
     The first deploy used to take ~5 min (per-call commits over Neon).
     This pipeline collapses it to ~5s — fits well inside Fly's 60s grace.
     """
+    import time as _time
+    _t0 = _time.time()
     skip_seed = os.environ.get("SKIP_SEED") == "1"
     persistent = store.is_persistent()
 
     maritime_empty = persistent and store.is_empty("maritime")
     wildfire_empty = persistent and store.is_empty("wildfire")
+    log.info("[bootstrap] persistent=%s maritime_empty=%s wildfire_empty=%s (in %.1fs)",
+             persistent, maritime_empty, wildfire_empty, _time.time() - _t0)
 
+    _t1 = _time.time()
     if persistent and not maritime_empty:
         maritime.load_persisted_state()
+        log.info("[bootstrap] maritime loaded: %d entities, %d recommendations (%.1fs)",
+                 len(maritime.entities), len(maritime.recommendations), _time.time() - _t1)
+    _t2 = _time.time()
     if persistent and not wildfire_empty:
         wildfire.load_persisted_state()
+        log.info("[bootstrap] wildfire loaded: %d entities, %d recommendations (%.1fs)",
+                 len(wildfire.entities), len(wildfire.recommendations), _time.time() - _t2)
 
     if (not skip_seed) and (maritime_empty or not persistent) and \
             (wildfire_empty or not persistent):

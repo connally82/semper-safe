@@ -68,9 +68,10 @@ class WildfireFusion:
         self.recommendations: dict[str, Recommendation] = {}
 
     def load_persisted_state(self) -> None:
-        """Pull existing wildfire entities from Postgres into in-memory dicts."""
-        loaded = store.load_state(DOMAIN)
-        self.observations.update(loaded.observations)
+        """Pull entities + recommendations from Postgres. Fast-path; see
+        fusion.FusionEngine.load_persisted_state for the rationale on why
+        observations are NOT preloaded."""
+        loaded = store.load_entities_only(DOMAIN)
         self.entities.update(loaded.entities)
         self.recommendations.update(loaded.recommendations)
 
