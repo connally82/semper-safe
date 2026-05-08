@@ -310,24 +310,35 @@ PRODUCT_DOWNLOAD_URL_TPL = (
 
 
 def download_scene_to_r2(scene_id: str, *,
-                          chunk_size: int = 1 << 20,
+                          http_chunk_size: int = 1 << 20,        # 1 MB read from httpx
+                          part_size: int = 16 * 1024 * 1024,     # 16 MB S3 part
                           timeout_s: float = 600.0) -> dict:
-    """Stream-download a Sentinel-1 product directly into Cloudflare R2.
+    """True-stream Sentinel-1 product → Cloudflare R2 via S3 multipart upload.
 
-    Uses tempfile.SpooledTemporaryFile (auto-rolls from RAM to disk above
-    16 MB) so memory footprint is bounded regardless of the 1-2 GB scene
-    size. boto3.upload_fileobj does the multipart upload from there.
+    Memory profile (vs the old SpooledTemporaryFile path that fully
+    materialized the scene before uploading):
+      - httpx read buffer:      http_chunk_size  (1 MB)
+      - accumulating part buf:  ≤ part_size      (16 MB)
+      - upload_part body:       ≤ part_size      (16 MB, in flight)
+
+    Total peak ≈ 32-48 MB regardless of scene size. Critical on the
+    512 MB Fly VM: with AIS ingest, audit archive, gap sweeper, DB pool,
+    and CFAR/numpy in the same process, we can't afford to spool 1-2 GB
+    of GRDH product to disk *or* RAM.
+
+    S3 multipart constraints:
+      - parts must be ≥ 5 MB except the last
+      - max 10000 parts → at 16 MB/part we cap at ~160 GB scenes (fine)
+      - ETags and part numbers must be in order at complete-time
 
     Updates sar_scenes:
-      - raw_url   = R2 URL for the .SAFE.zip
-      - state     = 'downloaded' on success, 'failed' on error
-      - failure_reason populated on failure
+      raw_url    = r2://bucket/key on success
+      state      = 'downloaded' / 'failed'
+      failure_reason populated on error
 
-    Requires both Copernicus auth (CDSE_USERNAME/CDSE_PASSWORD) AND R2
-    credentials (R2_*) to be set. Raises RuntimeError if either is missing.
+    Aborts the multipart upload on any exception so we don't leak
+    half-uploaded objects (R2 bills you for incomplete multipart parts).
     """
-    import tempfile
-
     from db import models as dbm
     from db import archive
     from db.session import session_scope
@@ -354,26 +365,73 @@ def download_scene_to_r2(scene_id: str, *,
             return {"scene_id": scene_id, "skipped": "already downloaded",
                     "raw_url": scene.raw_url}
 
-    spool_threshold = 16 * 1024 * 1024  # roll to disk above 16 MB
-    bytes_seen = 0
-    try:
-        with tempfile.SpooledTemporaryFile(max_size=spool_threshold) as buf:
-            with httpx.stream(
-                "GET", url, headers={"Authorization": f"Bearer {tok}"},
-                timeout=timeout_s, follow_redirects=True,
-            ) as r:
-                r.raise_for_status()
-                for chunk in r.iter_bytes(chunk_size):
-                    buf.write(chunk)
-                    bytes_seen += len(chunk)
+    if part_size < 5 * 1024 * 1024:
+        raise ValueError("S3 part_size must be ≥ 5 MB")
 
-            buf.seek(0)
-            client = archive._r2_client(cfg)  # noqa: SLF001
-            client.upload_fileobj(
-                buf, cfg["bucket"], key,
-                ExtraArgs={"ContentType": "application/zip"},
-            )
+    client = archive._r2_client(cfg)  # noqa: SLF001
+    bucket = cfg["bucket"]
+
+    log.info("starting multipart upload for scene %s → %s", scene_id, raw_url)
+    create = client.create_multipart_upload(
+        Bucket=bucket, Key=key, ContentType="application/zip",
+    )
+    upload_id = create["UploadId"]
+
+    parts: list[dict] = []
+    bytes_seen = 0
+    part_buf = bytearray()
+    part_number = 1
+
+    def _flush_part(buf: bytearray, n: int) -> None:
+        # Hand the bytes to upload_part; reset caller's buffer afterwards.
+        if not buf:
+            return
+        resp = client.upload_part(
+            Bucket=bucket, Key=key, UploadId=upload_id,
+            PartNumber=n, Body=bytes(buf),
+        )
+        parts.append({"PartNumber": n, "ETag": resp["ETag"]})
+        log.info("uploaded part %d (%d bytes) for scene %s",
+                 n, len(buf), scene_id)
+
+    try:
+        with httpx.stream(
+            "GET", url, headers={"Authorization": f"Bearer {tok}"},
+            timeout=timeout_s, follow_redirects=True,
+        ) as r:
+            r.raise_for_status()
+            for chunk in r.iter_bytes(http_chunk_size):
+                if not chunk:
+                    continue
+                part_buf.extend(chunk)
+                bytes_seen += len(chunk)
+                while len(part_buf) >= part_size:
+                    head = part_buf[:part_size]
+                    del part_buf[:part_size]
+                    _flush_part(head, part_number)
+                    part_number += 1
+        # Final part (any size, including > 0 and < part_size; S3 allows
+        # the last part to be < 5 MB).
+        if part_buf:
+            _flush_part(part_buf, part_number)
+            part_number += 1
+
+        if not parts:
+            # Edge case: zero-byte response. Abort and bail.
+            raise RuntimeError("download produced 0 bytes")
+
+        client.complete_multipart_upload(
+            Bucket=bucket, Key=key, UploadId=upload_id,
+            MultipartUpload={"Parts": parts},
+        )
     except Exception as exc:  # noqa: BLE001
+        try:
+            client.abort_multipart_upload(
+                Bucket=bucket, Key=key, UploadId=upload_id,
+            )
+        except Exception as abort_exc:  # noqa: BLE001
+            log.warning("abort_multipart_upload also failed for %s: %s",
+                        scene_id, abort_exc)
         with session_scope() as s:
             scene = s.get(dbm.SarSceneRow, scene_id)
             if scene is not None:
@@ -388,12 +446,16 @@ def download_scene_to_r2(scene_id: str, *,
             scene.raw_url = raw_url
             scene.state = "downloaded"
             scene.failure_reason = None
+            scene.attrs = {**(scene.attrs or {}), "bytes_uploaded": bytes_seen,
+                           "parts": len(parts)}
 
-    log.info("downloaded scene %s → %s (%d bytes)", scene_id, raw_url, bytes_seen)
+    log.info("downloaded scene %s → %s (%d bytes, %d parts)",
+             scene_id, raw_url, bytes_seen, len(parts))
     return {
         "scene_id": scene_id,
         "raw_url": raw_url,
         "bytes": bytes_seen,
+        "parts": len(parts),
         "key": key,
     }
 
