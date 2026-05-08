@@ -106,6 +106,17 @@ const SAR_STORAGE_KEY = "ss-sar-overlay";
 const SAR_SCENES_PATH = "/maritime/sar/scenes?limit=200";
 const SAR_DETECTIONS_PATH = "/maritime/sar/detections?limit=5000";
 
+// Sentinel-2 optical overlay — Phase 4.x sensor-stack expansion.
+// Catalog only for now (Phase 4.y will add per-detection RGB chips).
+// Footprints are rendered separate from SAR with a cyan tint so the
+// operator can quickly tell whether there is a recent daylight pass
+// over the area being inspected.
+const S2_SCENES_SOURCE_ID = "ss-s2-scenes";
+const S2_SCENES_FILL_LAYER_ID = "ss-s2-scenes-fill";
+const S2_SCENES_LINE_LAYER_ID = "ss-s2-scenes-line";
+const S2_STORAGE_KEY = "ss-s2-overlay";
+const S2_SCENES_PATH = "/maritime/s2/scenes?limit=200&since_hours=168&max_cloud=40";
+
 async function fetchTrack(apiPath, eid, signal) {
   const r = await fetch(`${API_BASE}${apiPath}/entities/${eid}/track?limit=200`, { signal });
   if (!r.ok) throw new Error(`track ${r.status}`);
@@ -123,6 +134,12 @@ async function fetchSarOverlay(signal) {
   if (!detectionsR.ok) throw new Error(`sar detections ${detectionsR.status}`);
   const [scenes, detections] = await Promise.all([scenesR.json(), detectionsR.json()]);
   return { scenes, detections };
+}
+
+async function fetchS2Overlay(signal) {
+  const r = await fetch(`${API_BASE}${S2_SCENES_PATH}`, { signal });
+  if (!r.ok) throw new Error(`s2 scenes ${r.status}`);
+  return r.json();
 }
 
 async function fetchTimeline(apiPath, atIso, signal) {
@@ -203,6 +220,12 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
     }
   });
   const [sarData, setSarData] = useState(null);   // { scenes, detections } or null
+  const [showS2, setShowS2] = useState(() => {
+    if (typeof window === "undefined") return false;
+    try { return window.localStorage.getItem(S2_STORAGE_KEY) === "1"; }
+    catch { return false; }
+  });
+  const [s2Data, setS2Data] = useState(null);     // FeatureCollection or null
 
   // ------------------------------------------------------------------
   // Initialize the map exactly once.
@@ -307,6 +330,34 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
           },
         });
       }
+      if (!map.getSource(S2_SCENES_SOURCE_ID)) {
+        map.addSource(S2_SCENES_SOURCE_ID, {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+        // S2 scenes: cyan tint, semi-transparent, lower opacity than
+        // SAR so the two can stack visibly when both layers are on.
+        map.addLayer({
+          id: S2_SCENES_FILL_LAYER_ID,
+          type: "fill",
+          source: S2_SCENES_SOURCE_ID,
+          paint: {
+            "fill-color": "#5fbed0",
+            "fill-opacity": 0.07,
+          },
+        });
+        map.addLayer({
+          id: S2_SCENES_LINE_LAYER_ID,
+          type: "line",
+          source: S2_SCENES_SOURCE_ID,
+          paint: {
+            "line-color": "#5fbed0",
+            "line-width": 1.0,
+            "line-opacity": 0.55,
+            "line-dasharray": [3, 2],
+          },
+        });
+      }
       if (!map.getSource(SAR_DETECTIONS_SOURCE_ID)) {
         map.addSource(SAR_DETECTIONS_SOURCE_ID, {
           type: "geojson",
@@ -391,8 +442,33 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
         .setHTML(html)
         .addTo(map);
     };
+    const popupForS2Scene = (e) => {
+      const f = e.features?.[0];
+      if (!f) return;
+      const p = f.properties || {};
+      const cc = p.cloud_cover_pct == null ? "—" : `${Number(p.cloud_cover_pct).toFixed(0)}%`;
+      const html = `
+        <div style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;
+                    font-size:11px;letter-spacing:0.04em;color:#040810;
+                    min-width:240px;">
+          <div style="font-weight:bold;text-transform:uppercase;margin-bottom:4px;
+                      color:#1a5f6e;">
+            Sentinel-2 ${p.platform || ""} · ${p.product_type || ""}
+          </div>
+          <div>${p.acquired_at?.replace("T", " ").slice(0, 16)} UTC</div>
+          <div>Cloud cover: ${cc}</div>
+          <div>State: ${p.state}</div>
+          <div style="margin-top:4px;color:#666;">scene ${(p.scene_id || "").slice(0, 8)}…</div>
+        </div>
+      `;
+      new maplibregl.Popup({ closeButton: true, maxWidth: "320px" })
+        .setLngLat(e.lngLat)
+        .setHTML(html)
+        .addTo(map);
+    };
     map.on("click", SAR_DETECTIONS_LAYER_ID, popupForDetection);
     map.on("click", SAR_SCENES_FILL_LAYER_ID, popupForScene);
+    map.on("click", S2_SCENES_FILL_LAYER_ID, popupForS2Scene);
     map.on("mouseenter", SAR_DETECTIONS_LAYER_ID, () => {
       map.getCanvas().style.cursor = "pointer";
     });
@@ -687,6 +763,36 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
     }
   }, [sarData, showSar, ready]);
 
+  // S2 fetch + persist toggle. Same shape as SAR; one less layer
+  // because we have no per-detection point data yet.
+  useEffect(() => {
+    if (!showS2) { setS2Data(null); return; }
+    const ctrl = new AbortController();
+    fetchS2Overlay(ctrl.signal)
+      .then((data) => { if (!ctrl.signal.aborted) setS2Data(data); })
+      .catch((err) => {
+        if (err.name === "AbortError") return;
+        // eslint-disable-next-line no-console
+        console.warn("s2 overlay fetch failed:", err);
+        setS2Data({ type: "FeatureCollection", features: [] });
+      });
+    try { window.localStorage.setItem(S2_STORAGE_KEY, "1"); } catch { /* ignore */ }
+    return () => ctrl.abort();
+  }, [showS2]);
+  useEffect(() => {
+    if (showS2) return;
+    try { window.localStorage.setItem(S2_STORAGE_KEY, "0"); } catch { /* ignore */ }
+  }, [showS2]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const src = map.getSource(S2_SCENES_SOURCE_ID);
+    if (!src) return;
+    const empty = { type: "FeatureCollection", features: [] };
+    src.setData(showS2 && s2Data ? s2Data : empty);
+  }, [s2Data, showS2, ready]);
+
   // Render the (cached) track points into the GeoJSON source, clipped at
   // the scrubbed-to time. Cheap effect: just a filter+map over an array.
   useEffect(() => {
@@ -787,6 +893,23 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
           }}
         >
           SAR
+        </button>
+        <button
+          type="button"
+          title="Toggle Sentinel-2 optical scene footprints (≤40% cloud)"
+          onClick={() => setShowS2((v) => !v)}
+          style={{
+            appearance: "none",
+            border: "none",
+            borderLeft: "1px solid rgba(255,255,255,0.18)",
+            cursor: "pointer",
+            padding: "6px 10px",
+            background: showS2 ? "rgba(95,190,208,0.22)" : "transparent",
+            color: showS2 ? "#bfe6ee" : "rgba(255,255,255,0.7)",
+            textTransform: "uppercase",
+          }}
+        >
+          S2
         </button>
       </div>
 

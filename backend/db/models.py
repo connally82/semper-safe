@@ -227,6 +227,47 @@ class SarDetectionRow(Base):
     )
 
 
+class S2SceneRow(Base):
+    """Sentinel-2 MSI L2A optical scene catalog row.
+
+    Phase 4.x — second sensor in the platform. Same Copernicus account
+    as Sentinel-1; we discover scenes via the OData API and (Phase 4.y)
+    download / extract chips for visual confirmation of SAR detections.
+
+    State machine mirrors sar_scenes:
+      discovered  → catalog row recorded, raster not yet pulled
+      downloaded  → raster in raw_url
+      processed   → thumbnail / chips extracted (Phase 4.y)
+      failed      → see failure_reason
+    """
+
+    __tablename__ = "s2_scenes"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('discovered','downloaded','processed','failed')",
+            name="s2_scenes_state_check",
+        ),
+        Index("ix_s2_scenes_acquired_at", "acquired_at"),
+        Index("ix_s2_scenes_state", "state"),
+        # GeoAlchemy2 auto-creates the GIST index on footprint.
+    )
+
+    scene_id: Mapped[str] = mapped_column(String, primary_key=True)
+    platform: Mapped[str] = mapped_column(String(8), nullable=False)   # S2A, S2B, S2C
+    product_type: Mapped[str] = mapped_column(String(16), nullable=False)  # MSIL2A
+    acquired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    footprint = mapped_column(
+        Geometry(geometry_type="POLYGON", srid=4326), nullable=False,
+    )
+    cloud_cover_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    raw_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_url: Mapped[str] = mapped_column(String, nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="discovered")
+    failure_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    attrs: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+
 class ArchiveStateRow(Base):
     """Tiny key/value table for the audit cold-archive job.
 

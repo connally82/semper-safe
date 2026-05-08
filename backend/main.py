@@ -33,6 +33,8 @@ from wildfire_seed import build_wildfire_scenario
 import aisstream
 # Phase 4: Sentinel-1 SAR discovery + (eventually) download/detect
 import sar
+# Phase 4.x: Sentinel-2 optical catalog discovery (companion to SAR)
+import s2
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger("semper_safe")
@@ -60,6 +62,8 @@ _sar_discover_task: asyncio.Task[None] | None = None
 _sar_discover_cancel: asyncio.Event | None = None
 _sar_auto_process_task: asyncio.Task[None] | None = None
 _sar_auto_process_cancel: asyncio.Event | None = None
+_s2_discover_task: asyncio.Task[None] | None = None
+_s2_discover_cancel: asyncio.Event | None = None
 
 # How often to scan maritime entities for AIS dropouts. The sweep is cheap
 # (in-memory iteration over self.entities); the real cost is the audit/store
@@ -86,6 +90,13 @@ AUDIT_ARCHIVE_DRAIN_CAP = 50  # max archive_audit_chain() calls per tick (safety
 # credentials are configured. Sentinel-1 has 6-day repeat over a given
 # area, so a 6-hour cadence comfortably catches every pass.
 SAR_DISCOVERY_INTERVAL_S = int(os.environ.get("SAR_DISCOVERY_INTERVAL_S", "21600"))
+
+# Sentinel-2 catalog discovery: same cadence as Sentinel-1 (6h). Same
+# Copernicus account; the OData query is just a different Collection
+# filter. Phase 4.x — discovery only for now; download / chip extraction
+# is Phase 4.y.
+S2_DISCOVERY_INTERVAL_S = int(os.environ.get("S2_DISCOVERY_INTERVAL_S", "21600"))
+
 
 # Sentinel-1 auto-process loop: every 30 min, pick the freshest discovered
 # scene that fits our memory budget and run it through download → CFAR →
@@ -192,6 +203,38 @@ async def _sar_discover_loop(cancel: asyncio.Event) -> None:
                 log.exception("SAR discovery crashed: %s", exc)
         # Subsequent runs: every SAR_DISCOVERY_INTERVAL_S.
         first_delay = SAR_DISCOVERY_INTERVAL_S
+
+
+async def _s2_discover_loop(cancel: asyncio.Event) -> None:
+    """Periodic Sentinel-2 L2A catalog discovery for the Texas AOI.
+
+    Public-catalog only — no Copernicus auth needed. New scenes get
+    inserted into s2_scenes with state='discovered'. Mirrors
+    _sar_discover_loop in cadence and shape; the only deltas are the
+    target collection (SENTINEL-2 vs SENTINEL-1) and the storage
+    table.
+    """
+    first_delay = 75   # offset slightly from SAR discovery (60s) so
+                       # the two OData queries don't fire simultaneously
+                       # and double-block the event loop.
+    while not cancel.is_set():
+        try:
+            await asyncio.wait_for(cancel.wait(), timeout=first_delay)
+        except asyncio.TimeoutError:
+            try:
+                scenes = await asyncio.to_thread(s2.discover_scenes, limit=50)
+                if scenes:
+                    result = await asyncio.to_thread(s2.record_scenes, scenes)
+                    if result["inserted"]:
+                        audit_log.append(
+                            actor="system", event_type="s2_scenes_discovered",
+                            payload={"inserted": result["inserted"],
+                                     "total_seen": len(scenes)},
+                        )
+                        log.info("S2 discovery: +%d new scenes", result["inserted"])
+            except Exception as exc:  # noqa: BLE001
+                log.exception("S2 discovery crashed: %s", exc)
+        first_delay = S2_DISCOVERY_INTERVAL_S
 
 
 async def _sar_auto_process_loop(cancel: asyncio.Event) -> None:
@@ -477,6 +520,7 @@ def _bootstrap():
         global _audit_archive_task, _audit_archive_cancel
         global _sar_discover_task, _sar_discover_cancel
         global _sar_auto_process_task, _sar_auto_process_cancel
+        global _s2_discover_task, _s2_discover_cancel
         _aisstream_cancel = asyncio.Event()
 
         async def _on_observation(obs):
@@ -544,6 +588,15 @@ def _bootstrap():
             log.info("SAR discovery task started (every %ds)",
                      SAR_DISCOVERY_INTERVAL_S)
 
+            # Sentinel-2 optical catalog discovery — same Copernicus
+            # endpoint, no auth needed for the catalog query.
+            _s2_discover_cancel = asyncio.Event()
+            _s2_discover_task = loop.create_task(
+                _s2_discover_loop(_s2_discover_cancel)
+            )
+            log.info("S2 discovery task started (every %ds)",
+                     S2_DISCOVERY_INTERVAL_S)
+
             # Sentinel-1 auto-process pipeline — opt-in, requires
             # Copernicus auth + R2 to actually do anything. Runs the
             # discover→download→CFAR→fuse sequence on a 30-min cadence.
@@ -571,14 +624,17 @@ async def _shutdown():
     global _audit_archive_task, _audit_archive_cancel
     global _sar_discover_task, _sar_discover_cancel
     global _sar_auto_process_task, _sar_auto_process_cancel
+    global _s2_discover_task, _s2_discover_cancel
     for cancel in (_aisstream_cancel, _gap_sweeper_cancel,
                    _retention_cancel, _audit_archive_cancel,
-                   _sar_discover_cancel, _sar_auto_process_cancel):
+                   _sar_discover_cancel, _sar_auto_process_cancel,
+                   _s2_discover_cancel):
         if cancel is not None:
             cancel.set()
     for task in (_aisstream_task, _gap_sweeper_task,
                  _retention_task, _audit_archive_task,
-                 _sar_discover_task, _sar_auto_process_task):
+                 _sar_discover_task, _sar_auto_process_task,
+                 _s2_discover_task):
         if task is not None:
             task.cancel()
             try:
@@ -956,6 +1012,112 @@ def _require_admin(x_admin_token: str | None) -> None:
         raise HTTPException(503, "ADMIN_TOKEN not configured")
     if x_admin_token != ADMIN_TOKEN:
         raise HTTPException(401, "missing or invalid X-Admin-Token")
+
+
+@app.get("/maritime/s2/scenes")
+def maritime_s2_scenes(
+    state: str | None = None,
+    since_hours: int = 168,
+    max_cloud: float | None = None,
+    limit: int = 50,
+):
+    """Sentinel-2 L2A scene footprints (Polygon GeoJSON) for the AOI.
+
+    Default = last 7 days, all states. max_cloud filters server-side
+    when cloud_cover_pct is populated; scenes with NULL cloud_cover are
+    always returned (operator can re-filter client-side).
+    """
+    from datetime import datetime, timezone, timedelta
+    from sqlalchemy import select as sa_select, or_
+    from geoalchemy2.shape import to_shape
+    from db import models as dbm
+    from db.session import session_scope
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+    q = sa_select(dbm.S2SceneRow).where(dbm.S2SceneRow.acquired_at >= cutoff)
+    if state:
+        q = q.where(dbm.S2SceneRow.state == state)
+    if max_cloud is not None:
+        q = q.where(or_(
+            dbm.S2SceneRow.cloud_cover_pct.is_(None),
+            dbm.S2SceneRow.cloud_cover_pct <= max_cloud,
+        ))
+    q = q.order_by(dbm.S2SceneRow.acquired_at.desc()).limit(limit)
+
+    features = []
+    with session_scope() as s:
+        rows = s.execute(q).scalars().all()
+        for r in rows:
+            poly = to_shape(r.footprint)
+            attrs = r.attrs or {}
+            features.append({
+                "type": "Feature",
+                "geometry": poly.__geo_interface__,
+                "properties": {
+                    "scene_id": r.scene_id,
+                    "platform": r.platform,
+                    "product_type": r.product_type,
+                    "acquired_at": r.acquired_at.isoformat(),
+                    "state": r.state,
+                    "cloud_cover_pct": r.cloud_cover_pct,
+                    "name": attrs.get("name"),
+                },
+            })
+    return {"type": "FeatureCollection", "features": features}
+
+
+@app.post("/admin/s2/discover")
+def admin_s2_discover(x_admin_token: str | None = Header(default=None)):
+    """Manually trigger a Sentinel-2 catalog discovery sweep."""
+    _require_admin(x_admin_token)
+    scenes = s2.discover_scenes(limit=50)
+    result = s2.record_scenes(scenes)
+    audit_log.append(
+        actor="admin", event_type="s2_discover_manual",
+        payload={"discovered": len(scenes), **result},
+    )
+    return {"discovered": len(scenes), **result}
+
+
+@app.get("/admin/s2/scenes")
+def admin_s2_scenes(
+    state: str | None = None,
+    limit: int = 50,
+    x_admin_token: str | None = Header(default=None),
+):
+    """Operational listing of S2 scenes — same shape as /admin/sar/scenes
+    but with cloud_cover_pct surfaced."""
+    _require_admin(x_admin_token)
+    from sqlalchemy import select as sa_select
+    from db import models as dbm
+    from db.session import session_scope
+
+    q = sa_select(
+        dbm.S2SceneRow.scene_id, dbm.S2SceneRow.platform,
+        dbm.S2SceneRow.acquired_at, dbm.S2SceneRow.state,
+        dbm.S2SceneRow.raw_url, dbm.S2SceneRow.failure_reason,
+        dbm.S2SceneRow.cloud_cover_pct, dbm.S2SceneRow.attrs,
+    )
+    if state:
+        q = q.where(dbm.S2SceneRow.state == state)
+    q = q.order_by(dbm.S2SceneRow.acquired_at.desc()).limit(limit)
+    with session_scope() as s:
+        rows = s.execute(q).all()
+    out = []
+    for r in rows:
+        attrs = r.attrs or {}
+        out.append({
+            "scene_id": r.scene_id,
+            "platform": r.platform,
+            "acquired_at": r.acquired_at.isoformat() if r.acquired_at else None,
+            "state": r.state,
+            "raw_url": r.raw_url,
+            "failure_reason": r.failure_reason,
+            "cloud_cover_pct": r.cloud_cover_pct,
+            "content_length_bytes": attrs.get("content_length_bytes"),
+            "name": attrs.get("name"),
+        })
+    return {"count": len(out), "scenes": out}
 
 
 @app.post("/admin/sar/discover")
