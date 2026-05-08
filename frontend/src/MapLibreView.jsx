@@ -71,10 +71,39 @@ const TRACK_SOURCE_ID = "ss-selected-track";
 const TRACK_LAYER_ID = "ss-selected-track-line";
 const TRACK_HEAD_LAYER_ID = "ss-selected-track-head";
 
+// Sentinel-1 SAR overlay — Phase 4.x.
+// Scenes = footprint polygons (semi-transparent fill, color by state).
+// Detections = vessel returns from the CFAR detector. Red ≈ dark-vessel
+// candidate (no AIS within fusion window when scene was processed),
+// green ≈ AIS-matched. matched_entity_id is set by the fusion engine
+// post-detection.
+const SAR_SCENES_SOURCE_ID = "ss-sar-scenes";
+const SAR_SCENES_FILL_LAYER_ID = "ss-sar-scenes-fill";
+const SAR_SCENES_LINE_LAYER_ID = "ss-sar-scenes-line";
+const SAR_DETECTIONS_SOURCE_ID = "ss-sar-detections";
+const SAR_DETECTIONS_LAYER_ID = "ss-sar-detections-circle";
+const SAR_STORAGE_KEY = "ss-sar-overlay";
+
+const SAR_SCENES_PATH = "/maritime/sar/scenes?limit=200";
+const SAR_DETECTIONS_PATH = "/maritime/sar/detections?limit=5000";
+
 async function fetchTrack(apiPath, eid, signal) {
   const r = await fetch(`${API_BASE}${apiPath}/entities/${eid}/track?limit=200`, { signal });
   if (!r.ok) throw new Error(`track ${r.status}`);
   return r.json();
+}
+
+async function fetchSarOverlay(signal) {
+  // /maritime is hard-coded — SAR is maritime-only for now (wildfire
+  // would have its own scene catalog if/when we add VIIRS/GOES tiling).
+  const [scenesR, detectionsR] = await Promise.all([
+    fetch(`${API_BASE}${SAR_SCENES_PATH}`, { signal }),
+    fetch(`${API_BASE}${SAR_DETECTIONS_PATH}`, { signal }),
+  ]);
+  if (!scenesR.ok) throw new Error(`sar scenes ${scenesR.status}`);
+  if (!detectionsR.ok) throw new Error(`sar detections ${detectionsR.status}`);
+  const [scenes, detections] = await Promise.all([scenesR.json(), detectionsR.json()]);
+  return { scenes, detections };
 }
 
 async function fetchTimeline(apiPath, atIso, signal) {
@@ -143,6 +172,19 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
   // clips correctly to the scrubbed-to instant.
   const [trackPoints, setTrackPoints] = useState([]);
 
+  // SAR overlay toggle — persisted across sessions. Default off so first-load
+  // operators see the AIS map clean; flip on to overlay scene footprints +
+  // detections.
+  const [showSar, setShowSar] = useState(() => {
+    if (typeof window === "undefined") return false;
+    try {
+      return window.localStorage.getItem(SAR_STORAGE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const [sarData, setSarData] = useState(null);   // { scenes, detections } or null
+
   // ------------------------------------------------------------------
   // Initialize the map exactly once.
   // ------------------------------------------------------------------
@@ -197,7 +239,148 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
         },
       });
     };
+
+    // SAR scene footprints + detections. Same lifecycle as the track
+    // layers — re-attached on every style.load (including basemap swaps).
+    const ensureSarLayers = () => {
+      if (!map.getSource(SAR_SCENES_SOURCE_ID)) {
+        map.addSource(SAR_SCENES_SOURCE_ID, {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+        // Fill is colored by scene state. 'detected' (CFAR ran) is muted
+        // amber so it stands out against the dark/satellite basemap;
+        // 'discovered' is a colder blue to telegraph "catalog only";
+        // 'failed' goes red so ops can spot busted scenes at a glance.
+        map.addLayer({
+          id: SAR_SCENES_FILL_LAYER_ID,
+          type: "fill",
+          source: SAR_SCENES_SOURCE_ID,
+          paint: {
+            "fill-color": [
+              "match",
+              ["get", "state"],
+              "detected", "#f0a830",
+              "downloaded", "#5fd093",
+              "discovered", "#5fa8d0",
+              "failed", "#e0556e",
+              "#888888",
+            ],
+            "fill-opacity": 0.10,
+          },
+        });
+        map.addLayer({
+          id: SAR_SCENES_LINE_LAYER_ID,
+          type: "line",
+          source: SAR_SCENES_SOURCE_ID,
+          paint: {
+            "line-color": [
+              "match",
+              ["get", "state"],
+              "detected", "#f0a830",
+              "downloaded", "#5fd093",
+              "discovered", "#5fa8d0",
+              "failed", "#e0556e",
+              "#888888",
+            ],
+            "line-width": 1.3,
+            "line-opacity": 0.65,
+          },
+        });
+      }
+      if (!map.getSource(SAR_DETECTIONS_SOURCE_ID)) {
+        map.addSource(SAR_DETECTIONS_SOURCE_ID, {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+        // Detection points: red square-ish marker for dark-vessel
+        // candidates (matched_entity_id is null), green diamond-ish for
+        // AIS-matched. Sized small (4 px) so a few hundred per scene
+        // don't cover the AIS markers.
+        map.addLayer({
+          id: SAR_DETECTIONS_LAYER_ID,
+          type: "circle",
+          source: SAR_DETECTIONS_SOURCE_ID,
+          paint: {
+            "circle-color": [
+              "case",
+              ["==", ["get", "matched_entity_id"], null], "#e0556e",
+              "#5fd093",
+            ],
+            "circle-radius": 4,
+            "circle-stroke-color": "#040810",
+            "circle-stroke-width": 1,
+            "circle-opacity": 0.85,
+          },
+        });
+      }
+    };
     map.on("style.load", ensureTrackLayers);
+    map.on("style.load", ensureSarLayers);
+
+    // Click → popup. Detections are densely packed so attach to the
+    // detection layer specifically (otherwise the scene-fill layer
+    // intercepts at low zoom and pops up the scene instead).
+    const popupForDetection = (e) => {
+      const f = e.features?.[0];
+      if (!f) return;
+      const p = f.properties || {};
+      const dark = p.matched_entity_id == null;
+      const html = `
+        <div style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;
+                    font-size:11px;letter-spacing:0.04em;color:#040810;
+                    min-width:200px;">
+          <div style="font-weight:bold;color:${dark ? "#a02030" : "#1a6a3a"};
+                      text-transform:uppercase;margin-bottom:4px;">
+            ${dark ? "Dark vessel candidate" : "AIS-matched detection"}
+          </div>
+          <div>RCS: ${Number(p.rcs_db).toFixed(1)} dB</div>
+          <div>Length: ${Number(p.length_m).toFixed(0)} m</div>
+          <div>Confidence: ${Number(p.confidence).toFixed(2)}</div>
+          ${p.matched_entity_id
+            ? `<div>Match: <code>${p.matched_entity_id}</code></div>`
+            : ""}
+          <div style="margin-top:4px;color:#666;">scene ${(p.scene_id || "").slice(0, 8)}…</div>
+        </div>
+      `;
+      new maplibregl.Popup({ closeButton: true, maxWidth: "260px" })
+        .setLngLat(f.geometry.coordinates)
+        .setHTML(html)
+        .addTo(map);
+    };
+    const popupForScene = (e) => {
+      const f = e.features?.[0];
+      if (!f) return;
+      const p = f.properties || {};
+      const html = `
+        <div style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;
+                    font-size:11px;letter-spacing:0.04em;color:#040810;
+                    min-width:220px;">
+          <div style="font-weight:bold;text-transform:uppercase;margin-bottom:4px;">
+            Sentinel-1 ${p.platform || ""} · ${p.state || ""}
+          </div>
+          <div>${p.acquired_at?.replace("T", " ").slice(0, 16)} UTC</div>
+          <div>Polarization: ${p.polarization || "—"}</div>
+          ${p.n_detections != null
+            ? `<div>Detections: ${p.n_detections}</div>`
+            : ""}
+          <div style="margin-top:4px;color:#666;">scene ${(p.scene_id || "").slice(0, 8)}…</div>
+        </div>
+      `;
+      new maplibregl.Popup({ closeButton: true, maxWidth: "300px" })
+        .setLngLat(e.lngLat)
+        .setHTML(html)
+        .addTo(map);
+    };
+    map.on("click", SAR_DETECTIONS_LAYER_ID, popupForDetection);
+    map.on("click", SAR_SCENES_FILL_LAYER_ID, popupForScene);
+    map.on("mouseenter", SAR_DETECTIONS_LAYER_ID, () => {
+      map.getCanvas().style.cursor = "pointer";
+    });
+    map.on("mouseleave", SAR_DETECTIONS_LAYER_ID, () => {
+      map.getCanvas().style.cursor = "";
+    });
+
     map.on("load", () => setReady(true));
     map.on("error", (e) => {
       // OpenFreeMap occasionally returns 503 during deploys; degrade silently.
@@ -426,6 +609,64 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
     return () => ctrl.abort();
   }, [selectedId, ready, entitiesById, cfg]);
 
+  // ------------------------------------------------------------------
+  // SAR overlay: fetch when toggled on (or never if off). Cheap to
+  // refetch — scenes are <50 features, detections grow ~200-1000/scene.
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    if (!showSar) {
+      setSarData(null);
+      return;
+    }
+    const ctrl = new AbortController();
+    fetchSarOverlay(ctrl.signal)
+      .then((data) => {
+        if (ctrl.signal.aborted) return;
+        setSarData(data);
+      })
+      .catch((err) => {
+        if (err.name === "AbortError") return;
+        // eslint-disable-next-line no-console
+        console.warn("sar overlay fetch failed:", err);
+        setSarData({ scenes: { type: "FeatureCollection", features: [] },
+                     detections: { type: "FeatureCollection", features: [] } });
+      });
+    try {
+      window.localStorage.setItem(SAR_STORAGE_KEY, "1");
+    } catch {
+      // ignore — same rationale as basemap persistence
+    }
+    return () => ctrl.abort();
+  }, [showSar]);
+
+  // Persist the off state too so a deliberate flip-off survives reload.
+  useEffect(() => {
+    if (showSar) return;
+    try {
+      window.localStorage.setItem(SAR_STORAGE_KEY, "0");
+    } catch {
+      // ignore
+    }
+  }, [showSar]);
+
+  // Push fetched SAR data into the layer sources. Empty FeatureCollections
+  // when toggled off so the layers go invisible without re-fetching.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const scenesSrc = map.getSource(SAR_SCENES_SOURCE_ID);
+    const detSrc = map.getSource(SAR_DETECTIONS_SOURCE_ID);
+    if (!scenesSrc || !detSrc) return;
+    const empty = { type: "FeatureCollection", features: [] };
+    if (showSar && sarData) {
+      scenesSrc.setData(sarData.scenes || empty);
+      detSrc.setData(sarData.detections || empty);
+    } else {
+      scenesSrc.setData(empty);
+      detSrc.setData(empty);
+    }
+  }, [sarData, showSar, ready]);
+
   // Render the (cached) track points into the GeoJSON source, clipped at
   // the scrubbed-to time. Cheap effect: just a filter+map over an array.
   useEffect(() => {
@@ -510,6 +751,23 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
             </button>
           );
         })}
+        <button
+          type="button"
+          title="Toggle Sentinel-1 SAR scenes + detections"
+          onClick={() => setShowSar((v) => !v)}
+          style={{
+            appearance: "none",
+            border: "none",
+            borderLeft: "1px solid rgba(255,255,255,0.18)",
+            cursor: "pointer",
+            padding: "6px 10px",
+            background: showSar ? "rgba(240,168,48,0.22)" : "transparent",
+            color: showSar ? "#ffd897" : "rgba(255,255,255,0.7)",
+            textTransform: "uppercase",
+          }}
+        >
+          SAR
+        </button>
       </div>
 
       {/* Time-scrub slider. Bottom-center, full width. Slider value is
