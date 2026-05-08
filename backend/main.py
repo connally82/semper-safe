@@ -283,6 +283,11 @@ async def _sar_auto_process_loop(cancel: asyncio.Event) -> None:
 def _sar_auto_pick_next() -> str | None:
     """Return the scene_id of the next eligible scene, or None.
 
+    Picks (in order of preference):
+      1. state='downloaded' scenes — already in R2, just need CFAR.
+         Surfaces stuck-after-deploy-interrupt cases automatically.
+      2. state='discovered' scenes — full pipeline run.
+
     Sync helper — call from a thread via asyncio.to_thread.
     """
     from datetime import datetime, timedelta, timezone
@@ -292,9 +297,23 @@ def _sar_auto_pick_next() -> str | None:
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=SAR_AUTO_MAX_AGE_HOURS)
     with session_scope() as s:
-        # We can't filter by content_length_bytes in SQL because it's
-        # nested in attrs JSONB. Pull a small candidate set and filter
-        # in Python — eligible scenes are usually <10 per tick.
+        # Half-processed scenes first — they're already paid-for in R2,
+        # so prioritize finishing them before starting a new download.
+        downloaded = s.execute(
+            sa_select(dbm.SarSceneRow)
+            .where(and_(
+                dbm.SarSceneRow.state == "downloaded",
+                dbm.SarSceneRow.failure_reason.is_(None),
+                dbm.SarSceneRow.acquired_at >= cutoff,
+            ))
+            .order_by(dbm.SarSceneRow.acquired_at.desc())
+            .limit(5)
+        ).scalars().all()
+        for r in downloaded:
+            sz = (r.attrs or {}).get("content_length_bytes") or 0
+            if 0 < sz <= SAR_AUTO_MAX_BYTES:
+                return r.scene_id
+        # No downloads pending → pick a fresh discovery to run end-to-end.
         rows = s.execute(
             sa_select(dbm.SarSceneRow)
             .where(and_(
