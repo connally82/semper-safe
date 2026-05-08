@@ -1,0 +1,411 @@
+"""
+Sentinel-1 SAR processing pipeline (Phase 4.3 of docs/roadmap.md).
+
+Reads a downloaded scene from R2, runs the CFAR detector tile-by-tile,
+geocodes detections via the GCPs in the SAFE annotation XML, and
+persists results to sar_detections.
+
+Why this lives separate from sar.py / cfar.py:
+  - sar.py    = catalog discovery + download orchestration + Copernicus auth
+  - cfar.py   = pure-numpy CFAR algorithm (no I/O, easy to unit-test)
+  - this     = bridge between them: reads SAFE.zip from R2, applies CFAR
+               to the VV-polarization GRDH amplitude, persists detections.
+
+Design choices:
+  - Read VV (HH for HH-only modes, but we use IW which is dual-pol VV+VH).
+    VV is the standard channel for vessel detection — VH brings noise
+    suppression but adds complexity; Phase 4.x can pick that up.
+  - Open via /vsizip+/vsis3/ so the .SAFE.zip never lands on local disk.
+    GDAL handles HTTP range reads through R2's S3-compatible API.
+  - Process in 4096×4096 tiles to keep peak memory bounded (~250 MB per
+    tile float32 + integral images). Fits comfortably under 1 GB Fly VM.
+  - Geocode via the geolocationGridPoint elements in the SAFE annotation
+    XML (210 GCPs on a regular grid for IW GRDH). Use bilinear
+    interpolation rather than the GeoTIFF's CRS — the COG TIFFs Copernicus
+    ships have crs=None and pixel-space bounds.
+  - Edge-buffer: skip detections within `EDGE_GUARD_PX` of the tile edge
+    to avoid CFAR boundary artefacts where the reflection-padded clutter
+    estimate is biased.
+
+Memory at runtime:
+  - 4096×4096 uint16 tile read:           32 MB
+  - float32 conversion:                   64 MB
+  - Two integral images (mu + threshold): 128 MB
+  - Total peak per tile:                  ~225 MB
+  - Plus rasterio's GDAL block cache (64 MB cap by env)
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+import time
+import uuid
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from urllib.request import Request, urlopen
+
+import numpy as np
+
+from cfar import CfarConfig, detect_vessels
+
+log = logging.getLogger("sar_processor")
+
+
+# ---------------------------------------------------------------------- knobs
+
+# Tile size — bigger tiles waste memory; smaller tiles add HTTP round-trips.
+# 4096 hits the sweet spot for IW GRDH (~10m pixel, so each tile is ~40 km²).
+TILE_PX = 4096
+
+# Buffer to drop near tile edges (CFAR's reflect padding biases the clutter
+# estimate within ~train+guard pixels of the boundary).
+EDGE_GUARD_PX = 100
+
+# Sentinel-1 IW GRDH ground-range pixel spacing.
+S1_GRDH_PIXEL_M = 10.0
+
+# Texas-shoreline AOI per memory/semper_safe_aoi.md. Re-filter detections
+# against this so we don't persist hits in adjacent scenes that drift north.
+AOI_LAT_MIN, AOI_LAT_MAX = 25.5, 30.5
+AOI_LON_MIN, AOI_LON_MAX = -98.0, -93.5
+
+# CFAR PFA — 1e-7 over the tile gives a few false alarms per scene that
+# the cluster filters then knock down to plausible vessel candidates.
+DEFAULT_PFA = 1e-7
+
+
+# ---------------------------------------------------------------------- helpers
+
+
+def _r2_presigned_url(scene_id: str, expires_in: int = 3600) -> str:
+    """Generate a presigned GET URL for the scene zip in R2.
+
+    We only use this to read the SAFE annotation XML (~1.7 MB) via raw
+    HTTP range requests. The TIFF read goes through GDAL /vsis3/ which
+    uses the same R2 endpoint via env-var-based credentials — unsigned.
+    """
+    from db import archive  # reuse the same R2 config validator
+
+    cfg = archive._r2_config()  # noqa: SLF001
+    if cfg is None:
+        raise RuntimeError("R2 not configured")
+    client = archive._r2_client(cfg)  # noqa: SLF001
+    key = f"sar/scenes/{scene_id}.SAFE.zip"
+    return client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": cfg["bucket"], "Key": key},
+        ExpiresIn=expires_in,
+    )
+
+
+def _scene_zip_size(scene_id: str) -> int:
+    """Get the .SAFE.zip ContentLength in R2 — needed to range-read the EOCD."""
+    from db import archive
+
+    cfg = archive._r2_config()  # noqa: SLF001
+    if cfg is None:
+        raise RuntimeError("R2 not configured")
+    client = archive._r2_client(cfg)  # noqa: SLF001
+    key = f"sar/scenes/{scene_id}.SAFE.zip"
+    h = client.head_object(Bucket=cfg["bucket"], Key=key)
+    return int(h["ContentLength"])
+
+
+def _read_zip_entry(url: str, total_size: int, name_substr: str,
+                    name_endswith: str, exclude: str | None = None) -> tuple[str, bytes]:
+    """Read a STORED-method entry out of a remote .zip via HTTP range reads.
+
+    Sentinel-1 SAFE .zip uses STORED (uncompressed) for all internal
+    files so we can compute the data byte range from the central-directory
+    record + local file header without ever decompressing.
+
+    Returns (entry_name, raw_bytes). Raises if not found.
+    """
+    import struct
+
+    # 1) Read trailer (last 64 KB) to find the End-of-Central-Directory record.
+    tail = urlopen(
+        Request(url, headers={"Range": f"bytes={max(0, total_size - 65536)}-{total_size - 1}"}),
+        timeout=30,
+    ).read()
+    i = tail.rfind(b"PK\x05\x06")
+    if i < 0:
+        raise RuntimeError("EOCD record not found in .zip trailer")
+    cd_size = struct.unpack("<I", tail[i + 12:i + 16])[0]
+    cd_off = struct.unpack("<I", tail[i + 16:i + 20])[0]
+
+    # 2) Pull the central directory and walk it.
+    cd = urlopen(
+        Request(url, headers={"Range": f"bytes={cd_off}-{cd_off + cd_size - 1}"}),
+        timeout=30,
+    ).read()
+
+    p = 0
+    found = None
+    while p < len(cd):
+        if cd[p:p + 4] != b"PK\x01\x02":
+            break
+        name_len, extra_len, comment_len = struct.unpack("<HHH", cd[p + 28:p + 34])
+        method = struct.unpack("<H", cd[p + 10:p + 12])[0]
+        csize = struct.unpack("<I", cd[p + 20:p + 24])[0]
+        local_off = struct.unpack("<I", cd[p + 42:p + 46])[0]
+        name_b = cd[p + 46:p + 46 + name_len]
+        name = name_b.decode("utf-8", errors="replace")
+        ok = (name_substr in name) and name.endswith(name_endswith)
+        if ok and (exclude is None or exclude not in name):
+            found = (name, method, csize, local_off)
+            break
+        p += 46 + name_len + extra_len + comment_len
+
+    if found is None:
+        raise RuntimeError(f"entry not found: substr={name_substr!r} ends={name_endswith!r}")
+
+    name, method, csize, local_off = found
+
+    # 3) Read the local file header (variable size) to find the data offset.
+    lh = urlopen(
+        Request(url, headers={"Range": f"bytes={local_off}-{local_off + 30 + 4096}"}),
+        timeout=30,
+    ).read()
+    if lh[:4] != b"PK\x03\x04":
+        raise RuntimeError(f"local header sig mismatch at {local_off}")
+    lh_name_len, lh_extra_len = struct.unpack("<HH", lh[26:30])
+    data_off = local_off + 30 + lh_name_len + lh_extra_len
+    data_end = data_off + csize - 1
+
+    # 4) Pull the entry data.
+    body = urlopen(
+        Request(url, headers={"Range": f"bytes={data_off}-{data_end}"}),
+        timeout=120,
+    ).read()
+    if method == 8:  # DEFLATE — annotation XMLs are usually STORED but tolerate it
+        import zlib
+        body = zlib.decompress(body, -15)
+    elif method != 0:
+        raise RuntimeError(f"unsupported zip compression method {method}")
+
+    return name, body
+
+
+def _build_geocoder(annotation_xml: bytes):
+    """Parse the annotation XML's geolocationGridPoints into bilinear interpolators.
+
+    Returns a function (line, pixel) → (lat, lon). Sentinel-1 IW GRDH ships
+    GCPs on a regular grid (10 lines × 21 pixels = 210 points by default).
+    """
+    from scipy.interpolate import RegularGridInterpolator
+
+    root = ET.fromstring(annotation_xml)
+    gcps = []
+    for gp in root.iter("geolocationGridPoint"):
+        gcps.append((
+            int(gp.findtext("line")),
+            int(gp.findtext("pixel")),
+            float(gp.findtext("latitude")),
+            float(gp.findtext("longitude")),
+        ))
+    if not gcps:
+        raise RuntimeError("no geolocationGridPoint elements in annotation XML")
+
+    ulines = sorted({g[0] for g in gcps})
+    upixels = sorted({g[1] for g in gcps})
+    lat_grid = np.zeros((len(ulines), len(upixels)))
+    lon_grid = np.zeros((len(ulines), len(upixels)))
+    line_idx = {l: i for i, l in enumerate(ulines)}
+    pix_idx = {p: i for i, p in enumerate(upixels)}
+    for line, pix, la, lo in gcps:
+        lat_grid[line_idx[line], pix_idx[pix]] = la
+        lon_grid[line_idx[line], pix_idx[pix]] = lo
+    lat_i = RegularGridInterpolator((ulines, upixels), lat_grid,
+                                    bounds_error=False, fill_value=None)
+    lon_i = RegularGridInterpolator((ulines, upixels), lon_grid,
+                                    bounds_error=False, fill_value=None)
+
+    def to_latlon(line: float, pixel: float) -> tuple[float, float]:
+        return float(lat_i([[line, pixel]])[0]), float(lon_i([[line, pixel]])[0])
+
+    return to_latlon, len(gcps)
+
+
+def _gen_detection_id() -> str:
+    return f"sard_{uuid.uuid4().hex[:12]}"
+
+
+# ---------------------------------------------------------------------- main
+
+
+def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
+                  tile_px: int = TILE_PX) -> dict:
+    """End-to-end detection pipeline for one downloaded SAR scene.
+
+    Steps:
+      1. Verify sar_scenes row state == 'downloaded'
+      2. Generate R2 presigned URL + read annotation XML for GCPs
+      3. Open the scene via /vsizip+/vsis3/ in rasterio
+      4. Iterate tiles, run CFAR per tile, geocode + filter to AOI
+      5. Bulk-insert into sar_detections
+      6. Update sar_scenes.state = 'detected'
+
+    Returns a summary dict for the audit log + admin response.
+    """
+    import rasterio
+    from rasterio.windows import Window
+
+    # Lazy DB imports so importing sar_processor.py doesn't pull the DB stack
+    # — useful for unit tests that mock these paths.
+    from db import archive
+    from db import models as dbm
+    from db.session import session_scope
+    from geoalchemy2.shape import from_shape
+    from shapely.geometry import Point
+
+    # 1) Look up scene + bail if not ready.
+    with session_scope() as s:
+        scene = s.get(dbm.SarSceneRow, scene_id)
+        if scene is None:
+            raise RuntimeError(f"sar_scenes row not found: {scene_id}")
+        if scene.state != "downloaded":
+            return {"scene_id": scene_id,
+                    "skipped": f"state={scene.state} (need 'downloaded')",
+                    "raw_url": scene.raw_url}
+        attrs = dict(scene.attrs or {})
+        scene_name = attrs.get("name", "")
+
+    cfg = archive._r2_config()  # noqa: SLF001
+    if cfg is None:
+        raise RuntimeError("R2 not configured")
+
+    # 2) Annotation XML → GCPs → geocoder
+    log.info("[%s] reading annotation XML from R2", scene_id)
+    url = _r2_presigned_url(scene_id)
+    size = _scene_zip_size(scene_id)
+    name, ann_bytes = _read_zip_entry(
+        url, size,
+        name_substr="/annotation/s1a-iw-grd-vv-",
+        name_endswith=".xml",
+        exclude="/calibration/",
+    )
+    if "/rfi/" in name:
+        # Defensive — should not match given the substr filter
+        raise RuntimeError(f"matched RFI XML by mistake: {name}")
+    to_latlon, n_gcps = _build_geocoder(ann_bytes)
+    log.info("[%s] geocoder ready (%d GCPs)", scene_id, n_gcps)
+
+    # 3) Set up GDAL env so /vsis3/ talks to R2 via path-style addressing.
+    os.environ.update({
+        "AWS_ACCESS_KEY_ID":     cfg["access_key_id"],
+        "AWS_SECRET_ACCESS_KEY": cfg["secret_access_key"],
+        # R2 endpoint hostname (no scheme) — GDAL prepends https.
+        "AWS_S3_ENDPOINT":       f"{cfg['account_id']}.r2.cloudflarestorage.com",
+        "AWS_VIRTUAL_HOSTING":   "FALSE",
+        "AWS_HTTPS":             "YES",
+        "AWS_REGION":            "auto",
+        "VSI_CACHE":             "TRUE",
+        "VSI_CACHE_SIZE":        str(64 << 20),
+        "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tiff,.tif,.zip",
+    })
+
+    # The TIFF entry name is parallel to the XML's, just under measurement/.
+    # e.g. /annotation/s1a-iw-grd-vv-20260507t...001-cog.xml
+    #   →  /measurement/s1a-iw-grd-vv-20260507t...001-cog.tiff
+    inner_tiff = name.replace("/annotation/", "/measurement/").rsplit(".", 1)[0] + ".tiff"
+    gdal_path = (f"/vsizip//vsis3/{cfg['bucket']}/sar/scenes/"
+                 f"{scene_id}.SAFE.zip/{inner_tiff}")
+
+    # 4) Tile + CFAR
+    cfg_cfar = CfarConfig(pfa=pfa)
+    detections: list[dict] = []
+    t0 = time.time()
+    n_tiles = 0
+    n_raw = 0
+
+    log.info("[%s] opening %s", scene_id, inner_tiff)
+    with rasterio.open(gdal_path) as src:
+        H, W = src.height, src.width
+        log.info("[%s] scene %dx%d, tiling at %d", scene_id, W, H, tile_px)
+
+        for r0 in range(0, H, tile_px):
+            for c0 in range(0, W, tile_px):
+                r1 = min(r0 + tile_px, H)
+                c1 = min(c0 + tile_px, W)
+                if (r1 - r0) < 256 or (c1 - c0) < 256:
+                    continue
+                arr = src.read(1, window=Window(c0, r0, c1 - c0, r1 - r0))
+                # No-data tiles (over-land outside swath) — skip.
+                if float(arr.mean()) < 5.0:
+                    continue
+                n_tiles += 1
+                tile_dets = detect_vessels(arr, cfg=cfg_cfar)
+                n_raw += len(tile_dets)
+                for d in tile_dets:
+                    if (d.centroid_row < EDGE_GUARD_PX or
+                            d.centroid_col < EDGE_GUARD_PX or
+                            (arr.shape[0] - d.centroid_row) < EDGE_GUARD_PX or
+                            (arr.shape[1] - d.centroid_col) < EDGE_GUARD_PX):
+                        continue
+                    sr = r0 + d.centroid_row
+                    sc = c0 + d.centroid_col
+                    lat, lon = to_latlon(sr, sc)
+                    if not (AOI_LAT_MIN <= lat <= AOI_LAT_MAX
+                            and AOI_LON_MIN <= lon <= AOI_LON_MAX):
+                        continue
+                    # Confidence heuristic: scale rcs_db with a squashing function.
+                    # rcs 60 dB → 0.5; 80 dB → 0.85; 100 dB → 0.95.
+                    conf = 1.0 / (1.0 + math.exp(-(d.rcs_db - 70.0) / 8.0))
+                    detections.append({
+                        "detection_id": _gen_detection_id(),
+                        "scene_id": scene_id,
+                        "lat": lat, "lon": lon,
+                        "rcs_db": float(d.rcs_db),
+                        "length_m": float(d.length_px) * S1_GRDH_PIXEL_M,
+                        "confidence": float(conf),
+                        "scene_row": int(sr), "scene_col": int(sc),
+                        "n_pixels": int(d.n_pixels),
+                    })
+
+    elapsed = time.time() - t0
+    log.info("[%s] CFAR done in %.1fs — %d tiles, %d raw, %d kept",
+             scene_id, elapsed, n_tiles, n_raw, len(detections))
+
+    # 5) Persist
+    detected_at = datetime.now(timezone.utc)
+    with session_scope() as s:
+        for det in detections:
+            row = dbm.SarDetectionRow(
+                detection_id=det["detection_id"],
+                scene_id=scene_id,
+                geom=from_shape(Point(det["lon"], det["lat"]), srid=4326),
+                detected_at=detected_at,
+                rcs_db=det["rcs_db"],
+                length_m=det["length_m"],
+                confidence=det["confidence"],
+                matched_entity_id=None,
+            )
+            s.add(row)
+        scene = s.get(dbm.SarSceneRow, scene_id)
+        if scene is not None:
+            scene.state = "detected"
+            scene.attrs = {
+                **(scene.attrs or {}),
+                "detection_summary": {
+                    "n_tiles": n_tiles,
+                    "n_raw": n_raw,
+                    "n_kept": len(detections),
+                    "elapsed_s": round(elapsed, 1),
+                    "pfa": pfa,
+                    "tile_px": tile_px,
+                    "detected_at": detected_at.isoformat(),
+                },
+            }
+
+    return {
+        "scene_id": scene_id,
+        "scene_name": scene_name,
+        "n_tiles": n_tiles,
+        "n_raw": n_raw,
+        "n_detections": len(detections),
+        "elapsed_s": round(elapsed, 1),
+        "pfa": pfa,
+    }

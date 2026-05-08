@@ -713,6 +713,51 @@ def admin_sar_download(
     }
 
 
+def _do_sar_process(scene_id: str) -> None:
+    """Background-task body for running CFAR on a downloaded scene."""
+    try:
+        import sar_processor  # lazy: imports rasterio (heavy native lib)
+        result = sar_processor.process_scene(scene_id)
+        audit_log.append(
+            actor="admin", event_type="sar_scene_processed",
+            payload={
+                "scene_id": scene_id,
+                "n_detections": result.get("n_detections"),
+                "n_tiles": result.get("n_tiles"),
+                "n_raw": result.get("n_raw"),
+                "elapsed_s": result.get("elapsed_s"),
+                "skipped": result.get("skipped"),
+            },
+        )
+        log.info("admin SAR process done: %s", result)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("admin SAR process failed: %s", exc)
+
+
+@app.post("/admin/sar/process/{scene_id}", status_code=202)
+def admin_sar_process(
+    scene_id: str,
+    background_tasks: BackgroundTasks,
+    x_admin_token: str | None = Header(default=None),
+):
+    """Run CFAR detection on a downloaded SAR scene + persist sar_detections.
+
+    Returns 202 immediately. Detection runs server-side in a BackgroundTask
+    (1-2 GB scene → 35 tiles × ~7s = 4-5 min wall clock; handled in a
+    threadpool worker so the AIS / health-check loops keep ticking).
+
+    Watch sar_scenes.state for completion: downloaded → detected.
+    Watch sar_scenes.attrs.detection_summary for tile/detection counts.
+    """
+    _require_admin(x_admin_token)
+    background_tasks.add_task(_do_sar_process, scene_id)
+    return {
+        "scene_id": scene_id,
+        "status": "queued",
+        "tip": "poll sar_scenes.state (→ 'detected') and sar_detections rows",
+    }
+
+
 @app.get("/wildfire/entities/{eid}/lineage")
 def wildfire_lineage(eid: str):
     data = wildfire.lineage(eid)

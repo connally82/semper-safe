@@ -19,4 +19,5 @@ boto3>=1.35              # S3-compatible client for Cloudflare R2 audit archive
 # Phase 4 — Sentinel-1 SAR ingestion
 httpx>=0.27              # Copernicus STAC client (also used by FastAPI tests)
 numpy>=1.26              # CFAR detector
-scipy>=1.13              # scipy.ndimage.label for connected-component clustering
+scipy>=1.13              # scipy.ndimage.label, RegularGridInterpolator (geocoder)
+rasterio>=1.4            # SAR scene tile reads via /vsizip+/vsis3/ (manylinux wheels include GDAL)
