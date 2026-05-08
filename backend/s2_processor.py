@@ -53,12 +53,22 @@ from typing import Any
 
 log = logging.getLogger("s2_processor")
 
-# Default chip size in meters (radius from the centroid). 1500 m gives
-# a ~3 km square — comfortably wider than even a Capesize bulk carrier
-# (~290 m) and tight enough to fit in a popup.
-DEFAULT_HALF_SIZE_M = 1500.0
+# Default chip size in meters (radius from the centroid). 3000 m gives
+# a 6 km square, wide enough to see context if a vessel drifted between
+# the SAR and S2 acquisitions (typical gap ≤72 h).
+DEFAULT_HALF_SIZE_M = 3000.0
 S2_PIXEL_M = 10.0   # B02/B03/B04/B08 are 10 m
 JPEG_QUALITY = 85
+
+# Sentinel-2 L2A is BOA reflectance × 10000.  Open water reflects ~1-3%
+# (= 100-300 raw), vessels 5-30% (500-3000), bright objects can hit
+# 4000+. A pure percentile stretch over a water-dominated chip
+# produces a near-uniform dark image because the inter-percentile
+# range is tiny. We clamp the stretch range so water-only chips show
+# up as gray-ish rather than black, and any bright object (vessel,
+# wake, cloud, sun glint) is visible against that floor.
+S2_STRETCH_MIN_FLOOR  = 150    # never compress below this — keeps water visible
+S2_STRETCH_MAX_CEIL   = 4500   # never expand above this — avoids cloud blowout
 
 
 def _r2_chip_key(detection_id: str) -> str:
@@ -194,13 +204,22 @@ def _open_band(scene_id: str, band: str):
 
 
 def _stretch_to_uint8(arr, lo_pct: float = 2.0, hi_pct: float = 98.0):
-    """Linear contrast stretch with percentile clip → uint8 (0..255)."""
+    """Linear contrast stretch with percentile clip → uint8 (0..255).
+
+    Adapted for water-dominated S2 chips: we clamp the percentile bounds
+    so the per-band range is at least [S2_STRETCH_MIN_FLOOR,
+    S2_STRETCH_MAX_CEIL]. This keeps water visible as dark gray
+    (instead of crushed-black) and vessels as bright (instead of
+    clipped-white).
+    """
     import numpy as np
     a = arr.astype("float32")
-    lo = float(np.percentile(a, lo_pct))
-    hi = float(np.percentile(a, hi_pct))
+    lo_p = float(np.percentile(a, lo_pct))
+    hi_p = float(np.percentile(a, hi_pct))
+    lo = min(lo_p, float(S2_STRETCH_MIN_FLOOR))
+    hi = max(hi_p, float(S2_STRETCH_MAX_CEIL))
     if hi <= lo:
-        return np.zeros_like(a, dtype="uint8")
+        hi = lo + 1.0
     out = np.clip((a - lo) / (hi - lo), 0.0, 1.0) * 255.0
     return out.astype("uint8")
 
