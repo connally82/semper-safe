@@ -117,6 +117,18 @@ const S2_SCENES_LINE_LAYER_ID = "ss-s2-scenes-line";
 const S2_STORAGE_KEY = "ss-s2-overlay";
 const S2_SCENES_PATH = "/maritime/s2/scenes?limit=200&since_hours=168&max_cloud=40";
 
+// NDBC buoys — real-time ocean weather observations from NOAA's
+// National Data Buoy Center. ~30-min cadence per station. Our seven
+// AOI buoys cover the Texas Gulf shelf from Brownsville to Pensacola.
+const BUOYS_SOURCE_ID = "ss-buoys";
+const BUOYS_LAYER_ID = "ss-buoys-circle";
+const BUOYS_STORAGE_KEY = "ss-buoys-overlay";
+const BUOYS_PATH = "/maritime/buoys";
+// Auto-refresh cadence — buoys only update every ~30 min so polling
+// every 5 min is plenty conservative; cuts client bandwidth without
+// losing freshness.
+const BUOYS_REFRESH_MS = 5 * 60 * 1000;
+
 async function fetchTrack(apiPath, eid, signal) {
   const r = await fetch(`${API_BASE}${apiPath}/entities/${eid}/track?limit=200`, { signal });
   if (!r.ok) throw new Error(`track ${r.status}`);
@@ -139,6 +151,12 @@ async function fetchSarOverlay(signal) {
 async function fetchS2Overlay(signal) {
   const r = await fetch(`${API_BASE}${S2_SCENES_PATH}`, { signal });
   if (!r.ok) throw new Error(`s2 scenes ${r.status}`);
+  return r.json();
+}
+
+async function fetchBuoys(signal) {
+  const r = await fetch(`${API_BASE}${BUOYS_PATH}`, { signal });
+  if (!r.ok) throw new Error(`buoys ${r.status}`);
   return r.json();
 }
 
@@ -226,6 +244,15 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
     catch { return false; }
   });
   const [s2Data, setS2Data] = useState(null);     // FeatureCollection or null
+
+  const [showBuoys, setShowBuoys] = useState(() => {
+    if (typeof window === "undefined") return true;     // default ON for the demo
+    try {
+      const raw = window.localStorage.getItem(BUOYS_STORAGE_KEY);
+      return raw == null ? true : raw === "1";
+    } catch { return true; }
+  });
+  const [buoysData, setBuoysData] = useState(null);
 
   // ------------------------------------------------------------------
   // Initialize the map exactly once.
@@ -358,6 +385,29 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
           },
         });
       }
+      if (!map.getSource(BUOYS_SOURCE_ID)) {
+        map.addSource(BUOYS_SOURCE_ID, {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+        map.addLayer({
+          id: BUOYS_LAYER_ID,
+          type: "circle",
+          source: BUOYS_SOURCE_ID,
+          paint: {
+            // Buoys with no recent observation get a desaturated color.
+            "circle-color": [
+              "case",
+              ["==", ["get", "observation"], null], "#888",
+              "#5fa8d0",
+            ],
+            "circle-radius": 6,
+            "circle-stroke-color": "#040810",
+            "circle-stroke-width": 1.2,
+            "circle-opacity": 0.9,
+          },
+        });
+      }
       if (!map.getSource(SAR_DETECTIONS_SOURCE_ID)) {
         map.addSource(SAR_DETECTIONS_SOURCE_ID, {
           type: "geojson",
@@ -482,9 +532,43 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
         .setHTML(html)
         .addTo(map);
     };
+    const popupForBuoy = (e) => {
+      const f = e.features?.[0];
+      if (!f) return;
+      const p = f.properties || {};
+      // GeoJSON properties come back stringified — re-parse the obs object.
+      let obs = p.observation;
+      if (typeof obs === "string") {
+        try { obs = JSON.parse(obs); } catch { obs = null; }
+      }
+      const fmt = (v, unit, dec=1) => v == null ? "—" : `${Number(v).toFixed(dec)} ${unit}`;
+      const html = `
+        <div style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;
+                    font-size:11px;letter-spacing:0.04em;color:#040810;
+                    min-width:240px;">
+          <div style="font-weight:bold;text-transform:uppercase;margin-bottom:4px;
+                      color:#1a5f6e;">
+            NDBC ${p.station_id} · ${p.name}
+          </div>
+          ${obs ? `
+            <div>${(obs.t || "").replace("T"," ").slice(0, 16)} UTC</div>
+            <div>Wind: ${fmt(obs.wind_speed_kn,'kn')} (gust ${fmt(obs.wind_gust_kn,'kn')}) @ ${fmt(obs.wind_dir_deg,'°',0)}</div>
+            <div>Wave: ${fmt(obs.wave_height_m,'m')} period ${fmt(obs.dom_period_s,'s',0)}</div>
+            <div>Air: ${fmt(obs.air_temp_c,'°C')} | Water: ${fmt(obs.water_temp_c,'°C')}</div>
+            <div>Pressure: ${fmt(obs.pressure_hpa,'hPa',1)}</div>
+          ` : `<div style="color:#999;">no recent observation</div>`}
+        </div>`;
+      new maplibregl.Popup({ closeButton: true, maxWidth: "300px" })
+        .setLngLat(f.geometry.coordinates)
+        .setHTML(html)
+        .addTo(map);
+    };
     map.on("click", SAR_DETECTIONS_LAYER_ID, popupForDetection);
     map.on("click", SAR_SCENES_FILL_LAYER_ID, popupForScene);
     map.on("click", S2_SCENES_FILL_LAYER_ID, popupForS2Scene);
+    map.on("click", BUOYS_LAYER_ID, popupForBuoy);
+    map.on("mouseenter", BUOYS_LAYER_ID, () => { map.getCanvas().style.cursor = "pointer"; });
+    map.on("mouseleave", BUOYS_LAYER_ID, () => { map.getCanvas().style.cursor = ""; });
     map.on("mouseenter", SAR_DETECTIONS_LAYER_ID, () => {
       map.getCanvas().style.cursor = "pointer";
     });
@@ -809,6 +893,39 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
     src.setData(showS2 && s2Data ? s2Data : empty);
   }, [s2Data, showS2, ready]);
 
+  // Buoys: fetch on toggle + auto-refresh every BUOYS_REFRESH_MS while
+  // the layer is visible (NDBC updates ~30 min/station).
+  useEffect(() => {
+    if (!showBuoys) { setBuoysData(null); return; }
+    let cancelled = false;
+    const ctrl = new AbortController();
+    const pull = () => {
+      fetchBuoys(ctrl.signal)
+        .then((data) => { if (!cancelled) setBuoysData(data); })
+        .catch((err) => {
+          if (err.name === "AbortError") return;
+          // eslint-disable-next-line no-console
+          console.warn("buoys fetch failed:", err);
+        });
+    };
+    pull();
+    const interval = window.setInterval(pull, BUOYS_REFRESH_MS);
+    try { window.localStorage.setItem(BUOYS_STORAGE_KEY, "1"); } catch { /* ignore */ }
+    return () => { cancelled = true; ctrl.abort(); window.clearInterval(interval); };
+  }, [showBuoys]);
+  useEffect(() => {
+    if (showBuoys) return;
+    try { window.localStorage.setItem(BUOYS_STORAGE_KEY, "0"); } catch { /* ignore */ }
+  }, [showBuoys]);
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const src = map.getSource(BUOYS_SOURCE_ID);
+    if (!src) return;
+    const empty = { type: "FeatureCollection", features: [] };
+    src.setData(showBuoys && buoysData ? buoysData : empty);
+  }, [buoysData, showBuoys, ready]);
+
   // Render the (cached) track points into the GeoJSON source, clipped at
   // the scrubbed-to time. Cheap effect: just a filter+map over an array.
   useEffect(() => {
@@ -926,6 +1043,23 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
           }}
         >
           S2
+        </button>
+        <button
+          type="button"
+          title="Toggle live NDBC buoys (NOAA, ~30 min cadence)"
+          onClick={() => setShowBuoys((v) => !v)}
+          style={{
+            appearance: "none",
+            border: "none",
+            borderLeft: "1px solid rgba(255,255,255,0.18)",
+            cursor: "pointer",
+            padding: "6px 10px",
+            background: showBuoys ? "rgba(95,168,208,0.22)" : "transparent",
+            color: showBuoys ? "#bfe1ee" : "rgba(255,255,255,0.7)",
+            textTransform: "uppercase",
+          }}
+        >
+          BUOY
         </button>
       </div>
 

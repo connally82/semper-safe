@@ -1014,6 +1014,35 @@ def _require_admin(x_admin_token: str | None) -> None:
         raise HTTPException(401, "missing or invalid X-Admin-Token")
 
 
+@app.get("/maritime/buoys")
+def maritime_buoys():
+    """Latest observation from each NDBC buoy in / near the Texas AOI.
+
+    Real-time-most-of-the-time: NDBC publishes new readings every
+    ~30 minutes per station. Returns a GeoJSON FeatureCollection so
+    the frontend can drop it straight into a MapLibre source.
+
+    Buoys with no observation (stations that 404'd or whose latest
+    row was unparseable) come back with properties.observation=null
+    so the operator sees a "lost telemetry" marker rather than the
+    buoy disappearing from the map.
+    """
+    import ndbc
+    rows = ndbc.fetch_all()
+    features = []
+    for r in rows:
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [r["lon"], r["lat"]]},
+            "properties": {
+                "station_id": r["station_id"],
+                "name": r["name"],
+                "observation": r["observation"],
+            },
+        })
+    return {"type": "FeatureCollection", "features": features}
+
+
 @app.get("/maritime/s2/scenes")
 def maritime_s2_scenes(
     state: str | None = None,
