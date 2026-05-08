@@ -65,11 +65,39 @@ GAP_SWEEP_INTERVAL_S = 60
 OBSERVATION_TTL_HOURS = int(os.environ.get("OBSERVATION_TTL_HOURS", "24"))
 RETENTION_INTERVAL_S = 3600   # purge once per hour
 
+# In-memory cache window: keep only recent observations in
+# engine.observations to bound RAM. Evicted obs still live in Postgres
+# (until DB TTL expires them); /track + /lineage just see shorter
+# histories for older entities. Sweep runs alongside the gap sweep
+# (every GAP_SWEEP_INTERVAL_S) so eviction is gradual rather than
+# bursty.
+IN_MEMORY_OBS_WINDOW_MINUTES = int(os.environ.get("IN_MEMORY_OBS_WINDOW_MINUTES", "30"))
+
+
+def _evict_stale_in_memory_obs() -> int:
+    """Drop observations older than IN_MEMORY_OBS_WINDOW_MINUTES from each
+    engine's in-memory dict. Returns total count evicted across both
+    engines. Safe to call from the gap-sweeper worker thread; uses a
+    list() snapshot to avoid concurrent-mutation issues."""
+    from datetime import datetime, timezone, timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=IN_MEMORY_OBS_WINDOW_MINUTES)
+    total = 0
+    for engine in (maritime, wildfire):
+        stale_ids = [
+            oid for oid, o in list(engine.observations.items())
+            if o.t < cutoff
+        ]
+        for oid in stale_ids:
+            engine.observations.pop(oid, None)
+        total += len(stale_ids)
+    return total
+
 
 async def _gap_sweeper_loop(cancel: asyncio.Event) -> None:
-    """Periodic AIS-gap detection. Replaces the per-ingest detect_gaps
-    calls that the synthetic seed used — real-time AIS arrives one
-    message at a time, so dropouts only surface from a sweep."""
+    """Periodic AIS-gap detection + in-memory observation eviction.
+    Real-time AIS arrives one message at a time, so dropouts only surface
+    from a sweep. The same loop also evicts stale obs from the in-memory
+    cache (gradual eviction beats hourly bursts that would spike memory)."""
     from datetime import datetime, timezone
     while not cancel.is_set():
         try:
@@ -83,6 +111,12 @@ async def _gap_sweeper_loop(cancel: asyncio.Event) -> None:
                 )
             except Exception as exc:  # noqa: BLE001
                 log.exception("gap sweep crashed: %s", exc)
+            try:
+                evicted = await asyncio.to_thread(_evict_stale_in_memory_obs)
+                if evicted:
+                    log.debug("evicted %d stale in-memory observations", evicted)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("in-memory eviction crashed: %s", exc)
 
 
 async def _retention_loop(cancel: asyncio.Event) -> None:
