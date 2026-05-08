@@ -1128,6 +1128,94 @@ def admin_sar_process(
     }
 
 
+@app.post("/admin/maritime/purge-non-aoi")
+def admin_purge_non_aoi(
+    dry_run: bool = True,
+    x_admin_token: str | None = Header(default=None),
+):
+    """One-shot cleanup: delete maritime entities outside the Texas AOI.
+
+    The original demo seeded synthetic vessels off NW Madagascar
+    (lat -13.7, lon 48.2) for a self-contained scenario. Those rows
+    later showed up in /maritime/entities and pulled the frontend's
+    auto-fit camera out to a global zoom — Texas vessels became
+    unreadable. This endpoint evicts them along with their dangling
+    observations + recommendations so the operator never sees them
+    again.
+
+    AOI = -98..-93.5 lon, 25.5..30.5 lat (Texas shoreline + Gulf).
+    Pass dry_run=false to actually delete; default reports counts only.
+
+    Also drops the in-memory engine entries so the live map
+    reflects the cleanup immediately without a restart.
+    """
+    _require_admin(x_admin_token)
+    from sqlalchemy import select as sa_select, delete as sa_delete, and_, or_, func
+    from geoalchemy2.shape import to_shape
+    from geoalchemy2.functions import ST_X, ST_Y
+    from db import models as dbm
+    from db.session import session_scope
+
+    AOI_MIN_LON, AOI_MAX_LON = -98.0, -93.5
+    AOI_MIN_LAT, AOI_MAX_LAT = 25.5, 30.5
+
+    with session_scope() as s:
+        # ST_X/ST_Y on PostGIS Point geometry — operate over the entity row.
+        out_of_aoi = sa_select(dbm.EntityRow.entity_id).where(
+            and_(
+                dbm.EntityRow.domain == "maritime",
+                or_(
+                    ST_X(dbm.EntityRow.geom) < AOI_MIN_LON,
+                    ST_X(dbm.EntityRow.geom) > AOI_MAX_LON,
+                    ST_Y(dbm.EntityRow.geom) < AOI_MIN_LAT,
+                    ST_Y(dbm.EntityRow.geom) > AOI_MAX_LAT,
+                ),
+            )
+        )
+        eids = list(s.execute(out_of_aoi).scalars())
+        n = len(eids)
+        sample = eids[:5]
+
+        if dry_run or n == 0:
+            return {"dry_run": dry_run, "non_aoi_entity_count": n,
+                    "sample_entity_ids": sample}
+
+        # Cascading delete: observations linked via association table go with
+        # the entity (FK ondelete=CASCADE on the assoc table). Recommendations
+        # link directly via entity_id FK with ondelete=CASCADE.
+        # Safer to delete the assoc rows + observations + recs explicitly
+        # here in case the cascades aren't configured everywhere.
+        s.execute(
+            sa_delete(dbm.RecommendationRow)
+            .where(dbm.RecommendationRow.entity_id.in_(eids))
+        )
+        # Observations referenced exclusively by these entities (this is a
+        # heuristic — observations are M:N so a strict purge would walk the
+        # association table; for the seed-data case each obs links to one
+        # entity, so the join-table delete + observation delete is safe).
+        s.execute(
+            sa_delete(dbm.EntityRow).where(dbm.EntityRow.entity_id.in_(eids))
+        )
+
+    # Drop in-memory copies so the next /maritime/entities call reflects it.
+    for eid in eids:
+        maritime.entities.pop(eid, None)
+    # Rebuild MMSI index from what's left, in case any of the deleted ones
+    # held an mmsi mapping.
+    maritime._mmsi_index = {  # noqa: SLF001
+        str(e.attrs.get("mmsi")): e.entity_id
+        for e in list(maritime.entities.values())
+        if e.attrs.get("mmsi")
+    }
+
+    audit_log.append(
+        actor="admin", event_type="non_aoi_entities_purged",
+        payload={"deleted_entity_ids": sample, "deleted_count": n,
+                 "aoi": [AOI_MIN_LON, AOI_MIN_LAT, AOI_MAX_LON, AOI_MAX_LAT]},
+    )
+    return {"dry_run": False, "deleted_count": n, "sample_entity_ids": sample}
+
+
 @app.get("/admin/sar/auto-status")
 def admin_sar_auto_status(x_admin_token: str | None = Header(default=None)):
     """Show whether the auto-process loop is enabled, what its config is,

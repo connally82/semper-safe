@@ -65,6 +65,25 @@ const DEFAULT_ZOOM = 5.5;
 
 const FIT_PADDING = 60;
 
+// Bounding box clamp for the first-data auto-fit. Backed-end entities
+// occasionally drift outside the operator's actual AOI — for example the
+// initial Madagascar demo seed left a handful of dark-vessel rows around
+// (48.2, -13.7) which would force the camera to span both continents and
+// shrink the Texas vessels to invisible specks. We only let the auto-fit
+// consider points inside this clamp; if a real entity is outside, that's
+// a data-cleanup problem, not a map UX problem.
+const FIT_CLAMP_MIN_LON = -98.5;
+const FIT_CLAMP_MAX_LON = -93.0;
+const FIT_CLAMP_MIN_LAT = 25.0;
+const FIT_CLAMP_MAX_LAT = 31.0;
+function _insideFitClamp(lon, lat) {
+  return (
+    typeof lon === "number" && typeof lat === "number"
+    && lon >= FIT_CLAMP_MIN_LON && lon <= FIT_CLAMP_MAX_LON
+    && lat >= FIT_CLAMP_MIN_LAT && lat <= FIT_CLAMP_MAX_LAT
+  );
+}
+
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
 const TRACK_SOURCE_ID = "ss-selected-track";
@@ -541,12 +560,13 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
     }
 
     // First non-empty data → auto-fit. After that, leave the user's pan/zoom
-    // alone so refreshes don't snap them out of context.
+    // alone so refreshes don't snap them out of context. We only fit to
+    // entities that fall inside the AOI clamp box — see _insideFitClamp.
     if (!fitDoneRef.current && renderEntities.length > 0) {
       const bounds = new maplibregl.LngLatBounds();
       let any = false;
       for (const e of renderEntities) {
-        if (typeof e.lon === "number" && typeof e.lat === "number") {
+        if (_insideFitClamp(e.lon, e.lat)) {
           bounds.extend([e.lon, e.lat]);
           any = true;
         }
