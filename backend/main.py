@@ -388,6 +388,58 @@ def maritime_track(eid: str, limit: int = 200):
     return _entity_track(maritime, eid, limit)
 
 
+def _timeline(domain: str, at_iso: str | None, lookback_minutes: int):
+    """Shared timeline endpoint logic. Default `at` = now if not specified."""
+    from datetime import datetime, timezone
+    if at_iso:
+        try:
+            at = datetime.fromisoformat(at_iso.replace("Z", "+00:00"))
+        except ValueError as e:
+            raise HTTPException(400, f"invalid `at` datetime: {e}") from e
+    else:
+        at = datetime.now(timezone.utc)
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+
+    if not store.is_persistent():
+        # In-memory fallback: return current entity positions only (no
+        # historical reconstruction without a DB).
+        engine = maritime if domain == "maritime" else wildfire
+        return {
+            "at": at.isoformat(),
+            "lookback_minutes": lookback_minutes,
+            "snapshot": [
+                {
+                    "entity_id": e.entity_id,
+                    "type": e.type.value,
+                    "priority_score": e.priority_score,
+                    "name": (e.attrs or {}).get("name"),
+                    "mmsi": (e.attrs or {}).get("mmsi"),
+                    "lon": e.geom.lon,
+                    "lat": e.geom.lat,
+                    "t": e.last_seen.isoformat(),
+                }
+                for e in list(engine.entities.values())
+            ],
+        }
+
+    snapshot = store.load_timeline(
+        domain, at=at, lookback_minutes=lookback_minutes,
+    )
+    return {
+        "at": at.isoformat(),
+        "lookback_minutes": lookback_minutes,
+        "snapshot": snapshot,
+    }
+
+
+@app.get("/maritime/timeline")
+def maritime_timeline(at: str | None = None, lookback_minutes: int = 60):
+    """Per-entity position at time `at` (default: now). Used by the
+    time-scrub UI to reconstruct historical map state."""
+    return _timeline("maritime", at, lookback_minutes)
+
+
 @app.get("/maritime/entities/{eid}/lineage")
 def maritime_lineage(eid: str):
     data = maritime.lineage(eid)
@@ -425,6 +477,11 @@ def wildfire_entities():
 @app.get("/wildfire/entities/{eid}/track")
 def wildfire_track(eid: str, limit: int = 200):
     return _entity_track(wildfire, eid, limit)
+
+
+@app.get("/wildfire/timeline")
+def wildfire_timeline(at: str | None = None, lookback_minutes: int = 60):
+    return _timeline("wildfire", at, lookback_minutes)
 
 
 @app.get("/wildfire/entities/{eid}/lineage")

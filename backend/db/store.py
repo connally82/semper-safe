@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import NamedTuple
 
 from geoalchemy2.shape import from_shape, to_shape
@@ -401,6 +401,68 @@ def bulk_seed_state(
 
 
 # --- Track query ------------------------------------------------------
+
+def load_timeline(domain: str, *, at: datetime, lookback_minutes: int = 60,
+                  limit: int = 1000) -> list[dict]:
+    """Return each entity's most-recent position at time `at` (latest
+    observation ≤ at), filtered to vessels that have reported within
+    `lookback_minutes` before `at` so we don't carry stale ghosts.
+
+    Used by the time-scrub UI: slide the time slider back N minutes and
+    see the world state at that instant.
+
+    Returns list of {entity_id, type, lon, lat, t, name, mmsi, priority_score}
+    suitable for direct JSON serialization. Querying observations directly
+    (rather than entities.geom) means we get the historical position, not
+    the current one.
+    """
+    if not is_persistent():
+        return []
+    from sqlalchemy import text
+
+    from db.session import session_scope
+
+    window_start = at - timedelta(minutes=lookback_minutes)
+    sql = text("""
+        SELECT DISTINCT ON (eo.entity_id)
+            eo.entity_id,
+            ent.type,
+            ent.priority_score,
+            ent.attrs,
+            o.t,
+            ST_X(o.geom::geometry) AS lon,
+            ST_Y(o.geom::geometry) AS lat
+        FROM observations o
+        JOIN entity_observations eo ON eo.obs_id = o.obs_id
+        JOIN entities ent          ON ent.entity_id = eo.entity_id
+        WHERE ent.domain = :domain
+          AND o.t <= :at
+          AND o.t >= :window_start
+        ORDER BY eo.entity_id, o.t DESC
+        LIMIT :limit
+    """)
+    with session_scope() as s:
+        rows = s.execute(sql, {
+            "domain": domain,
+            "at": at,
+            "window_start": window_start,
+            "limit": limit,
+        }).all()
+        out = []
+        for entity_id, etype, priority, attrs, t, lon, lat in rows:
+            attrs = attrs or {}
+            out.append({
+                "entity_id": entity_id,
+                "type": etype,
+                "priority_score": float(priority) if priority is not None else 0.0,
+                "name": attrs.get("name"),
+                "mmsi": attrs.get("mmsi"),
+                "lon": float(lon),
+                "lat": float(lat),
+                "t": t.isoformat(),
+            })
+        return out
+
 
 def load_track(eid: str, *, limit: int = 200) -> list[Observation]:
     """Return the most-recent `limit` observations for an entity, in time
