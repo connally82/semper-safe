@@ -551,6 +551,9 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
           <div>RCS: ${Number(p.rcs_db).toFixed(1)} dB</div>
           <div>Length: ${Number(p.length_m).toFixed(0)} m</div>
           <div>Confidence: ${Number(p.confidence).toFixed(2)}</div>
+          ${p.vv_vh_ratio_db != null
+            ? `<div>VV/VH ratio: ${Number(p.vv_vh_ratio_db).toFixed(1)} dB</div>`
+            : ""}
           ${p.matched_entity_id
             ? `<div>Match: <code>${p.matched_entity_id}</code></div>`
             : ""}

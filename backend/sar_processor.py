@@ -94,6 +94,16 @@ DEFAULT_PFA = 1e-7
 # isn't suppressed.
 FIXED_STRUCTURE_RADIUS_M = 200.0
 
+# Minimum VV/VH amplitude ratio (dB) for a detection to be kept. Sentinel-1
+# IW GRDH dual-pol scenes (1SDV) ship both bands. Real metallic vessels
+# return strongly in VV (co-pol) and weakly in VH (cross-pol) → ratio
+# typically 6-12 dB. Biological clutter (slicks, breaking waves, Bragg
+# roughness) returns similarly in both → ratio 0-3 dB. Setting the floor
+# at 4 dB drops the bulk of weather-induced false positives while keeping
+# real ship returns. Tunable per-AOI; can be relaxed for fishing fleets
+# (small wooden hulls have lower VV co-pol response).
+VV_VH_MIN_RATIO_DB = 4.0
+
 
 # ---------------------------------------------------------------------- helpers
 
@@ -332,6 +342,17 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
     inner_tiff = name.replace("/annotation/", "/measurement/").rsplit(".", 1)[0] + ".tiff"
     gdal_path = (f"/vsizip//vsis3/{cfg['bucket']}/sar/scenes/"
                  f"{scene_id}.SAFE.zip/{inner_tiff}")
+    # VH measurement TIFF for multi-pol discrimination. The product is
+    # 1SDV (dual-pol VV+VH) for our IW GRDH scenes — the VH band sits
+    # next to VV with the same naming except the polarization marker.
+    # Also bump the suffix index from -001 to -002 (Copernicus convention).
+    inner_tiff_vh = (
+        inner_tiff
+        .replace("-vv-", "-vh-")
+        .replace("-001-", "-002-")
+    )
+    gdal_path_vh = (f"/vsizip//vsis3/{cfg['bucket']}/sar/scenes/"
+                    f"{scene_id}.SAFE.zip/{inner_tiff_vh}")
 
     # 4) Tile + CFAR
     cfg_cfar = CfarConfig(pfa=pfa)
@@ -341,11 +362,23 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
     n_raw = 0
     n_platform_dropped = 0     # detections suppressed via fixed_structures
     n_land_dropped = 0         # detections suppressed via land_mask
+    n_vhratio_dropped = 0      # detections suppressed via low VV/VH (clutter)
     log.info("[%s] platform suppression: %d known structures, radius %.0f m",
              scene_id, fixed_structures.platform_count(),
              FIXED_STRUCTURE_RADIUS_M)
     log.info("[%s] land mask: %s", scene_id,
              "enabled" if land_mask.is_loaded() else "disabled (file missing)")
+
+    # Open VH alongside VV. If VH is unavailable (single-pol HH product
+    # or download anomaly) we degrade gracefully — VV-only behavior with
+    # vv_vh_ratio_db left null on each detection.
+    vh_src = None
+    try:
+        vh_src = rasterio.open(gdal_path_vh)
+        log.info("[%s] multi-pol VV+VH discrimination enabled", scene_id)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[%s] VH band unavailable (%s) — VV-only mode",
+                    scene_id, exc)
 
     log.info("[%s] opening %s", scene_id, inner_tiff)
     with rasterio.open(gdal_path) as src:
@@ -358,13 +391,25 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
                 c1 = min(c0 + tile_px, W)
                 if (r1 - r0) < 256 or (c1 - c0) < 256:
                     continue
-                arr = src.read(1, window=Window(c0, r0, c1 - c0, r1 - r0))
+                window = Window(c0, r0, c1 - c0, r1 - r0)
+                arr = src.read(1, window=window)
                 # No-data tiles (over-land outside swath) — skip.
                 if float(arr.mean()) < 5.0:
                     continue
                 n_tiles += 1
                 tile_dets = detect_vessels(arr, cfg=cfg_cfar)
                 n_raw += len(tile_dets)
+                # Read the matching VH window once per tile so we can
+                # sample at every detection centroid without re-reading.
+                # If VH is unavailable, vh_arr stays None — ratio falls
+                # through to null and we skip the discrimination filter.
+                vh_arr = None
+                if vh_src is not None and tile_dets:
+                    try:
+                        vh_arr = vh_src.read(1, window=window)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("[%s] VH read failed at %s (%s) — "
+                                    "tile in VV-only", scene_id, window, exc)
                 for d in tile_dets:
                     if (d.centroid_row < EDGE_GUARD_PX or
                             d.centroid_col < EDGE_GUARD_PX or
@@ -391,6 +436,37 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
                             lat, lon, radius_m=FIXED_STRUCTURE_RADIUS_M):
                         n_platform_dropped += 1
                         continue
+                    # VV/VH discrimination — sample VH amplitude in a 5×5
+                    # window around the centroid (matches the typical
+                    # cluster footprint at IW GRDH 10-m pixel spacing).
+                    # Vessels: VV ≫ VH (high ratio). Biological clutter
+                    # / wind-driven Bragg roughness: similar VV+VH (low
+                    # ratio). Drop candidates with ratio_db below the
+                    # threshold to suppress false alarms over rough seas.
+                    vv_vh_ratio_db: float | None = None
+                    if vh_arr is not None:
+                        rr = int(d.centroid_row)
+                        cc = int(d.centroid_col)
+                        h_h = vh_arr.shape[0]
+                        h_w = vh_arr.shape[1]
+                        ws = 2  # half-width — 5×5 window
+                        r_lo = max(0, rr - ws); r_hi = min(h_h, rr + ws + 1)
+                        c_lo = max(0, cc - ws); c_hi = min(h_w, cc + ws + 1)
+                        vh_patch = vh_arr[r_lo:r_hi, c_lo:c_hi]
+                        vv_patch = arr[r_lo:r_hi, c_lo:c_hi]
+                        if vh_patch.size:
+                            # GRDH amplitude → intensity = amp²; ratio_dB
+                            # = 10*log10(VV²/VH²) = 20*log10(VV/VH).
+                            # Use mean to suppress single-pixel outliers.
+                            vv_mean = float(vv_patch.astype("float64").mean())
+                            vh_mean = float(vh_patch.astype("float64").mean())
+                            if vh_mean > 1.0:    # avoid log(near-zero)
+                                vv_vh_ratio_db = 20.0 * math.log10(
+                                    max(vv_mean, 1.0) / vh_mean
+                                )
+                                if vv_vh_ratio_db < VV_VH_MIN_RATIO_DB:
+                                    n_vhratio_dropped += 1
+                                    continue
                     # Confidence heuristic: scale rcs_db with a squashing function.
                     # rcs 60 dB → 0.5; 80 dB → 0.85; 100 dB → 0.95.
                     conf = 1.0 / (1.0 + math.exp(-(d.rcs_db - 70.0) / 8.0))
@@ -401,15 +477,21 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
                         "rcs_db": float(d.rcs_db),
                         "length_m": float(d.length_px) * S1_GRDH_PIXEL_M,
                         "confidence": float(conf),
+                        "vv_vh_ratio_db": vv_vh_ratio_db,
                         "scene_row": int(sr), "scene_col": int(sc),
                         "n_pixels": int(d.n_pixels),
                     })
 
+    if vh_src is not None:
+        try:
+            vh_src.close()
+        except Exception:  # noqa: BLE001
+            pass
     elapsed = time.time() - t0
     log.info("[%s] CFAR done in %.1fs — %d tiles, %d raw, %d kept, "
-             "%d dropped on land, %d dropped on fixed structures",
+             "%d on land, %d on fixed structures, %d low VV/VH ratio",
              scene_id, elapsed, n_tiles, n_raw, len(detections),
-             n_land_dropped, n_platform_dropped)
+             n_land_dropped, n_platform_dropped, n_vhratio_dropped)
 
     # 5) Persist
     detected_at = datetime.now(timezone.utc)
@@ -423,6 +505,7 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
                 rcs_db=det["rcs_db"],
                 length_m=det["length_m"],
                 confidence=det["confidence"],
+                vv_vh_ratio_db=det.get("vv_vh_ratio_db"),
                 matched_entity_id=None,
             )
             s.add(row)
@@ -437,6 +520,9 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
                     "n_kept": len(detections),
                     "n_land_dropped": n_land_dropped,
                     "n_platform_dropped": n_platform_dropped,
+                    "n_vhratio_dropped": n_vhratio_dropped,
+                    "vh_enabled": vh_src is not None,
+                    "vv_vh_min_ratio_db": VV_VH_MIN_RATIO_DB,
                     "elapsed_s": round(elapsed, 1),
                     "pfa": pfa,
                     "tile_px": tile_px,

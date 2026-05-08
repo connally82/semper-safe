@@ -221,6 +221,11 @@ class SarDetectionRow(Base):
     rcs_db: Mapped[float] = mapped_column(Float, nullable=False)
     length_m: Mapped[float | None] = mapped_column(Float, nullable=True)
     confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.7)
+    # VV/VH amplitude ratio in dB (multi-pol discrimination, Phase 4.x).
+    # Vessels: > ~6 dB (high VV, low VH). Biological clutter: < ~3 dB.
+    # Nullable for back-compat with detections from single-pol scenes
+    # or scenes processed before VH discrimination was wired.
+    vv_vh_ratio_db: Mapped[float | None] = mapped_column(Float, nullable=True)
     # Set by the fusion engine after match. Null = no match (dark vessel candidate).
     matched_entity_id: Mapped[str | None] = mapped_column(
         String, ForeignKey("entities.entity_id", ondelete="SET NULL"), nullable=True,

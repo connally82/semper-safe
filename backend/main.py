@@ -973,6 +973,7 @@ def maritime_sar_detections(
                     "rcs_db": r.rcs_db,
                     "length_m": r.length_m,
                     "confidence": r.confidence,
+                    "vv_vh_ratio_db": r.vv_vh_ratio_db,
                     "matched_entity_id": r.matched_entity_id,
                     "detected_at": r.detected_at.isoformat(),
                     "is_dark_vessel": r.matched_entity_id is None,
