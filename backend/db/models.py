@@ -149,6 +149,84 @@ class RecommendationRow(Base):
     entity: Mapped["EntityRow"] = relationship(lazy="joined")
 
 
+class SarSceneRow(Base):
+    """One row per Sentinel-1 SAR acquisition the platform has discovered.
+
+    Phase 4 of docs/roadmap.md. Copernicus Data Space provides Sentinel-1
+    IW GRD scenes for free; we discover them via STAC, download raw
+    GeoTIFFs to R2 (or local), run a CFAR detector, and feed unmatched
+    detections back into the maritime FusionEngine as SAR observations.
+
+    State machine (column `state`):
+      discovered  → STAC entry recorded, GeoTIFF not yet pulled
+      downloaded  → GeoTIFF in raw_url, ready for detection
+      detected    → CFAR ran, detections in sar_detections table
+      failed      → see failure_reason
+    """
+
+    __tablename__ = "sar_scenes"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('discovered','downloaded','detected','failed')",
+            name="sar_scenes_state_check",
+        ),
+        Index("ix_sar_scenes_acquired_at", "acquired_at"),
+        Index("ix_sar_scenes_state", "state"),
+        # NOTE: GeoAlchemy2 auto-creates the GIST index on `footprint`
+        # (idx_sar_scenes_footprint). Don't add a duplicate here.
+    )
+
+    scene_id: Mapped[str] = mapped_column(String, primary_key=True)
+    platform: Mapped[str] = mapped_column(String(8), nullable=False)        # S1A, S1B, S1C
+    sensor_mode: Mapped[str] = mapped_column(String(8), nullable=False)     # IW, EW, SM
+    polarization: Mapped[str] = mapped_column(String(16), nullable=False)   # VV, VV+VH, HH+HV
+    acquired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    footprint = mapped_column(
+        Geometry(geometry_type="POLYGON", srid=4326), nullable=False,
+    )
+    # Where the raw GeoTIFF lives (R2 URL, S3 URL, local path, ...).
+    raw_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Source URL from Copernicus (for re-download / lineage).
+    source_url: Mapped[str] = mapped_column(String, nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="discovered")
+    failure_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    attrs: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class SarDetectionRow(Base):
+    """A single radar return from a CFAR detector run on a SAR scene.
+
+    Most detections are vessels (intended target). Some are false
+    positives (oil rigs, buoys, atmospheric noise) which we'll filter
+    against a known-fp layer in Phase 4.x. Each detection becomes an
+    Observation(source=SAR) fed to the FusionEngine; if it doesn't
+    match an AIS-cooperative entity within SAR_AIS_MATCH_RADIUS_KM /
+    _WINDOW the engine flags it as dark_vessel.
+    """
+
+    __tablename__ = "sar_detections"
+    __table_args__ = (
+        Index("ix_sar_detections_scene", "scene_id"),
+        Index("ix_sar_detections_matched", "matched_entity_id"),
+        # NOTE: spatial index on `geom` is auto-created by GeoAlchemy2.
+    )
+
+    detection_id: Mapped[str] = mapped_column(String, primary_key=True)
+    scene_id: Mapped[str] = mapped_column(
+        String, ForeignKey("sar_scenes.scene_id", ondelete="CASCADE"), nullable=False,
+    )
+    geom = mapped_column(Geometry(geometry_type="POINT", srid=4326), nullable=False)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    rcs_db: Mapped[float] = mapped_column(Float, nullable=False)
+    length_m: Mapped[float | None] = mapped_column(Float, nullable=True)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.7)
+    # Set by the fusion engine after match. Null = no match (dark vessel candidate).
+    matched_entity_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("entities.entity_id", ondelete="SET NULL"), nullable=True,
+    )
+
+
 class ArchiveStateRow(Base):
     """Tiny key/value table for the audit cold-archive job.
 

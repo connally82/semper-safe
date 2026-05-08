@@ -12,4 +12,9 @@ alembic>=1.13            # migrations
 # Phase 2 — real AIS ingestion (AISStream.io)
 websockets>=12.0         # AISStream WebSocket client
 h3>=4.0                  # H3 cell index used by Observation.h3_cell
-boto3>=1.35           # S3-compatible client for Cloudflare R2 audit archive
+
+# Phase 2.x — audit cold archive
+boto3>=1.35              # S3-compatible client for Cloudflare R2 audit archive
+
+# Phase 4 — Sentinel-1 SAR ingestion
+httpx>=0.27              # Copernicus STAC client (also used by FastAPI tests)
