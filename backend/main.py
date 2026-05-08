@@ -16,7 +16,7 @@ import asyncio
 import logging
 import os
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -622,17 +622,10 @@ def admin_sar_discover(x_admin_token: str | None = Header(default=None)):
     return {"discovered": len(scenes), **result}
 
 
-@app.post("/admin/sar/download/{scene_id}")
-def admin_sar_download(
-    scene_id: str,
-    x_admin_token: str | None = Header(default=None),
-):
-    """Manually download a Sentinel-1 scene from Copernicus to R2.
-
-    Runs synchronously; takes 30-90 seconds for a 1-2 GB scene over Fly's
-    network. Updates sar_scenes state machine.
-    """
-    _require_admin(x_admin_token)
+def _do_sar_download(scene_id: str) -> None:
+    """Background-task body. Logs + records audit, swallows errors so
+    they end up in sar_scenes.failure_reason rather than the FastAPI
+    background-task error handler."""
     try:
         result = sar.download_scene_to_r2(scene_id)
         audit_log.append(
@@ -644,10 +637,32 @@ def admin_sar_download(
                 "skipped": result.get("skipped"),
             },
         )
-        return result
+        log.info("admin SAR download done: %s", result)
     except Exception as exc:  # noqa: BLE001
         log.exception("admin SAR download failed: %s", exc)
-        raise HTTPException(500, f"{type(exc).__name__}: {exc}") from exc
+
+
+@app.post("/admin/sar/download/{scene_id}", status_code=202)
+def admin_sar_download(
+    scene_id: str,
+    background_tasks: BackgroundTasks,
+    x_admin_token: str | None = Header(default=None),
+):
+    """Kick off a Sentinel-1 scene download from Copernicus to R2.
+
+    Returns 202 immediately. The download runs as a FastAPI BackgroundTask
+    server-side (1-2 GB transfer, takes 30-90 seconds, doesn't block the
+    response or the client connection). Watch sar_scenes.state to see
+    progress: discovered → downloaded (success) or failed (with
+    failure_reason).
+    """
+    _require_admin(x_admin_token)
+    background_tasks.add_task(_do_sar_download, scene_id)
+    return {
+        "scene_id": scene_id,
+        "status": "queued",
+        "tip": "poll sar_scenes.state for completion",
+    }
 
 
 @app.get("/wildfire/entities/{eid}/lineage")
