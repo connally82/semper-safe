@@ -32,6 +32,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Run as non-root.
 RUN groupadd --system app && useradd --system --gid app --home /app app
 
+# rasterio's bundled GDAL needs libexpat (XML parsing in GDAL drivers).
+# python:3.12-slim doesn't ship it by default. ~140 KB add — keeps the
+# "no full GDAL apt layer" promise from Phase 4 prep.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libexpat1 \
+ && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Bring the venv from the builder; no compilers in the runtime image.
