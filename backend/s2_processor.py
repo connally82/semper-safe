@@ -60,15 +60,14 @@ DEFAULT_HALF_SIZE_M = 3000.0
 S2_PIXEL_M = 10.0   # B02/B03/B04/B08 are 10 m
 JPEG_QUALITY = 85
 
-# Sentinel-2 L2A is BOA reflectance × 10000.  Open water reflects ~1-3%
-# (= 100-300 raw), vessels 5-30% (500-3000), bright objects can hit
-# 4000+. A pure percentile stretch over a water-dominated chip
-# produces a near-uniform dark image because the inter-percentile
-# range is tiny. We clamp the stretch range so water-only chips show
-# up as gray-ish rather than black, and any bright object (vessel,
-# wake, cloud, sun glint) is visible against that floor.
-S2_STRETCH_MIN_FLOOR  = 150    # never compress below this — keeps water visible
-S2_STRETCH_MAX_CEIL   = 4500   # never expand above this — avoids cloud blowout
+# Sentinel-2 L2A is BOA reflectance × 10000. Open water reflects ~1-3%
+# (= 100-300 raw), vessels 5-30% (500-3000), clouds 3000+. The stretch
+# strategy:
+#   1. Per-band P2..P98 of the chip itself (auto-adapts to scene type)
+#   2. Then enforce a minimum range (hi - lo) so water-only chips don't
+#      get amplified into noise — but no global ceiling, so genuinely
+#      bright vessels still saturate near 255.
+S2_STRETCH_MIN_RANGE  = 200    # minimum (hi - lo) — keeps water-only chips smooth
 
 
 def _r2_chip_key(detection_id: str) -> str:
@@ -204,22 +203,20 @@ def _open_band(scene_id: str, band: str):
 
 
 def _stretch_to_uint8(arr, lo_pct: float = 2.0, hi_pct: float = 98.0):
-    """Linear contrast stretch with percentile clip → uint8 (0..255).
+    """Linear contrast stretch with per-chip percentile clip → uint8.
 
-    Adapted for water-dominated S2 chips: we clamp the percentile bounds
-    so the per-band range is at least [S2_STRETCH_MIN_FLOOR,
-    S2_STRETCH_MAX_CEIL]. This keeps water visible as dark gray
-    (instead of crushed-black) and vessels as bright (instead of
-    clipped-white).
+    For water-dominated chips the inter-percentile range can collapse
+    to near zero, which would explode noise. We enforce
+    `hi - lo >= S2_STRETCH_MIN_RANGE` to keep flat water rendered
+    smoothly. No upper clamp on `hi` — genuinely bright objects
+    (vessels, wakes, clouds) saturate near 255 as expected.
     """
     import numpy as np
     a = arr.astype("float32")
-    lo_p = float(np.percentile(a, lo_pct))
-    hi_p = float(np.percentile(a, hi_pct))
-    lo = min(lo_p, float(S2_STRETCH_MIN_FLOOR))
-    hi = max(hi_p, float(S2_STRETCH_MAX_CEIL))
-    if hi <= lo:
-        hi = lo + 1.0
+    lo = float(np.percentile(a, lo_pct))
+    hi = float(np.percentile(a, hi_pct))
+    if hi - lo < S2_STRETCH_MIN_RANGE:
+        hi = lo + float(S2_STRETCH_MIN_RANGE)
     out = np.clip((a - lo) / (hi - lo), 0.0, 1.0) * 255.0
     return out.astype("uint8")
 

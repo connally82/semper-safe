@@ -1157,7 +1157,7 @@ def admin_s2_download(
 @app.get("/maritime/sar/detections/{detection_id}/optical_chip")
 def maritime_sar_optical_chip(
     detection_id: str,
-    half_size_m: float = 1500.0,
+    half_size_m: float | None = None,
 ):
     """Serve a Sentinel-2 RGB chip centered on the SAR detection.
 
@@ -1211,9 +1211,14 @@ def maritime_sar_optical_chip(
 
     import s2_processor
     try:
+        # Falls through to s2_processor.DEFAULT_HALF_SIZE_M when client
+        # doesn't pass an explicit override.
+        chip_kwargs = {}
+        if half_size_m is not None:
+            chip_kwargs["half_size_m"] = half_size_m
         chip = s2_processor.extract_chip(
             detection_id, s2_scene_id, det_lat, det_lon,
-            half_size_m=half_size_m,
+            **chip_kwargs,
         )
     except Exception as exc:  # noqa: BLE001
         log.exception("optical_chip generation failed: %s", exc)
