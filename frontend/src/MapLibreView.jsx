@@ -138,6 +138,11 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
   const [scrubSnapshot, setScrubSnapshot] = useState(null);
   const [scrubLoading, setScrubLoading] = useState(false);
 
+  // Raw track for the selected entity (full Postgres history). Re-derived
+  // into GeoJSON features whenever scrubMinutes changes so the polyline
+  // clips correctly to the scrubbed-to instant.
+  const [trackPoints, setTrackPoints] = useState([]);
+
   // ------------------------------------------------------------------
   // Initialize the map exactly once.
   // ------------------------------------------------------------------
@@ -403,35 +408,52 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
     fetchTrack(cfg.apiPath, selectedId, ctrl.signal)
       .then((data) => {
         if (ctrl.signal.aborted) return;
-        const coords = (data.track || [])
-          .filter((p) => typeof p.lon === "number" && typeof p.lat === "number")
-          .map((p) => [p.lon, p.lat]);
-        const features = [];
-        if (coords.length >= 2) {
-          features.push({
-            type: "Feature",
-            geometry: { type: "LineString", coordinates: coords },
-            properties: {},
-          });
-        }
-        for (const c of coords) {
-          features.push({
-            type: "Feature",
-            geometry: { type: "Point", coordinates: c },
-            properties: {},
-          });
-        }
-        src.setData({ type: "FeatureCollection", features });
+        const points = (data.track || []).filter(
+          (p) => typeof p.lon === "number" && typeof p.lat === "number",
+        );
+        // Pre-parse timestamps once; the render-clip pass below uses .ts
+        // for fast filtering on every scrub change.
+        for (const p of points) p.ts = Date.parse(p.t);
+        setTrackPoints(points);
       })
       .catch((err) => {
         if (err.name === "AbortError") return;
         // eslint-disable-next-line no-console
         console.warn("track fetch failed:", err);
-        src.setData({ type: "FeatureCollection", features: [] });
+        setTrackPoints([]);
       });
 
     return () => ctrl.abort();
   }, [selectedId, ready, entitiesById, cfg]);
+
+  // Render the (cached) track points into the GeoJSON source, clipped at
+  // the scrubbed-to time. Cheap effect: just a filter+map over an array.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const src = map.getSource(TRACK_SOURCE_ID);
+    if (!src) return;
+
+    const cutoff = scrubMinutes > 0 ? Date.now() - scrubMinutes * 60_000 : Infinity;
+    const visible = trackPoints.filter((p) => p.ts <= cutoff);
+    const coords = visible.map((p) => [p.lon, p.lat]);
+    const features = [];
+    if (coords.length >= 2) {
+      features.push({
+        type: "Feature",
+        geometry: { type: "LineString", coordinates: coords },
+        properties: {},
+      });
+    }
+    for (const c of coords) {
+      features.push({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: c },
+        properties: {},
+      });
+    }
+    src.setData({ type: "FeatureCollection", features });
+  }, [trackPoints, scrubMinutes, ready]);
 
   return (
     <div
