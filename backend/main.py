@@ -1055,6 +1055,44 @@ def admin_sar_process(
     }
 
 
+@app.get("/admin/sar/auto-status")
+def admin_sar_auto_status(x_admin_token: str | None = Header(default=None)):
+    """Show whether the auto-process loop is enabled, what its config is,
+    and what the next eligible scene would be. Read-only — does not pop
+    a scene off the queue."""
+    _require_admin(x_admin_token)
+    next_scene_id = None
+    next_scene_attrs = None
+    if SAR_AUTO_PROCESS:
+        try:
+            next_scene_id = _sar_auto_pick_next()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("auto-status pick_next failed: %s", exc)
+        if next_scene_id:
+            from sqlalchemy import select as sa_select
+            from db import models as dbm
+            from db.session import session_scope
+            with session_scope() as s:
+                row = s.get(dbm.SarSceneRow, next_scene_id)
+                if row is not None:
+                    next_scene_attrs = {
+                        "scene_id": row.scene_id,
+                        "acquired_at": row.acquired_at.isoformat(),
+                        "state": row.state,
+                        "name": (row.attrs or {}).get("name"),
+                        "content_length_bytes": (row.attrs or {}).get("content_length_bytes"),
+                    }
+    return {
+        "enabled": SAR_AUTO_PROCESS,
+        "loop_running": _sar_auto_process_task is not None
+                        and not _sar_auto_process_task.done(),
+        "interval_s": SAR_AUTO_PROCESS_INTERVAL_S,
+        "max_bytes": SAR_AUTO_MAX_BYTES,
+        "max_age_hours": SAR_AUTO_MAX_AGE_HOURS,
+        "next_pick": next_scene_attrs,
+    }
+
+
 @app.post("/admin/alerts/test")
 def admin_alerts_test(x_admin_token: str | None = Header(default=None)):
     """Send a synthetic dark-vessel alert to ALERT_SUBSCRIBERS.
