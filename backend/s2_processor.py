@@ -223,11 +223,16 @@ def _stretch_to_uint8(arr, lo_pct: float = 2.0, hi_pct: float = 98.0):
 
 def extract_chip(detection_id: str, scene_id: str,
                  lat: float, lon: float, *,
-                 half_size_m: float = DEFAULT_HALF_SIZE_M) -> bytes:
+                 half_size_m: float = DEFAULT_HALF_SIZE_M,
+                 vessel_length_m: float | None = None) -> bytes:
     """Generate (or read cached) the RGB chip for one detection.
 
     Returns JPEG bytes. Caller is responsible for setting
     Content-Type: image/jpeg in the HTTP response.
+
+    Annotation: draws a red bounding box at the chip center sized to
+    `vessel_length_m` (clamped to a 60-200 m visible range) so the
+    operator's eye snaps to the suspect at the chip's coarse zoom.
     """
     cached = _read_cached_chip(detection_id)
     if cached is not None:
@@ -272,6 +277,37 @@ def extract_chip(detection_id: str, scene_id: str,
 
     rgb = np.dstack([_stretch_to_uint8(c) for c in chans])
     img = Image.fromarray(rgb, mode="RGB")
+
+    # Draw a red bounding box at the chip center sized to the
+    # detection's length (with a 60 m floor and 200 m ceiling so even
+    # tiny vessels show a visible box, and giant tankers don't get a
+    # comically huge one). Box size in pixels = length_m / 10 (1 px =
+    # 10 m at the S2 10-m bands) — but we *also* clamp to at least
+    # 12 px and at most 40 px so the box is always operator-readable
+    # at the chip's display size (~260 px wide in the popup).
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(img)
+    H, W = img.height, img.width
+    cx, cy = W // 2, H // 2
+    length = vessel_length_m if vessel_length_m and vessel_length_m > 0 else 60.0
+    length = max(60.0, min(200.0, length))
+    box_px = length / S2_PIXEL_M
+    box_px = int(max(12.0, min(40.0, box_px)))
+    half = box_px // 2
+    draw.rectangle(
+        [(cx - half, cy - half), (cx + half, cy + half)],
+        outline=(255, 70, 70),
+        width=2,
+    )
+    # Small crosshair tick marks pointing to the box from N/S/E/W so
+    # the eye finds it even when the imagery is busy.
+    tick = 4
+    line_kw = {"fill": (255, 70, 70), "width": 1}
+    draw.line([(cx, cy - half - tick - 4), (cx, cy - half - 1)], **line_kw)
+    draw.line([(cx, cy + half + 1),         (cx, cy + half + tick + 4)], **line_kw)
+    draw.line([(cx - half - tick - 4, cy),  (cx - half - 1, cy)], **line_kw)
+    draw.line([(cx + half + 1, cy),         (cx + half + tick + 4, cy)], **line_kw)
+
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
     body = buf.getvalue()

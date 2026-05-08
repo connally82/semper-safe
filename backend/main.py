@@ -1558,6 +1558,7 @@ def maritime_sar_optical_chip(
         sar_scene_id = det.scene_id
         pt = to_shape(det.geom)
         det_lat, det_lon = pt.y, pt.x
+        det_length_m = det.length_m
         # SAR scene's acquired_at is "near" for time matching.
         sar_scene = s.get(dbm.SarSceneRow, sar_scene_id)
         near_t = sar_scene.acquired_at if sar_scene else det.detected_at
@@ -1593,7 +1594,7 @@ def maritime_sar_optical_chip(
     try:
         # Falls through to s2_processor.DEFAULT_HALF_SIZE_M when client
         # doesn't pass an explicit override.
-        chip_kwargs = {}
+        chip_kwargs = {"vessel_length_m": det_length_m}
         if half_size_m is not None:
             chip_kwargs["half_size_m"] = half_size_m
         chip = s2_processor.extract_chip(
