@@ -884,6 +884,45 @@ def admin_sar_process(
     }
 
 
+@app.post("/admin/alerts/test")
+def admin_alerts_test(x_admin_token: str | None = Header(default=None)):
+    """Send a synthetic dark-vessel alert to ALERT_SUBSCRIBERS.
+
+    Useful for verifying the Resend integration + that emails actually
+    land (DKIM, spam scoring, formatting) without waiting on a real
+    Sentinel-1 pass to produce dark vessels.
+    """
+    _require_admin(x_admin_token)
+    import alerts
+    from datetime import datetime, timezone
+    if not alerts.is_configured():
+        return {"skipped": "RESEND_API_KEY not set"}
+    if not alerts.subscribers():
+        return {"skipped": "ALERT_SUBSCRIBERS empty"}
+
+    sample = [
+        {"lat": 28.4210, "lon": -97.7188, "rcs_db": 78.4,
+         "length_m": 60, "confidence": 0.82},
+        {"lat": 28.3422, "lon": -97.7104, "rcs_db": 76.0,
+         "length_m": 30, "confidence": 0.71},
+        {"lat": 28.3889, "lon": -97.6676, "rcs_db": 76.4,
+         "length_m": 30, "confidence": 0.73},
+    ]
+    result = alerts.notify_dark_vessels(
+        scene_id="test-scene-0000",
+        scene_name="S1A_IW_GRDH_TEST_SYNTHETIC",
+        scene_acquired_at=datetime.now(timezone.utc),
+        n_dark_new=len(sample),
+        n_dark_continued=0,
+        sample=sample,
+    )
+    audit_log.append(
+        actor="admin", event_type="alert_test_sent",
+        payload={"result": result, "subscribers": len(alerts.subscribers())},
+    )
+    return result
+
+
 @app.post("/admin/sar/fuse/{scene_id}", status_code=202)
 def admin_sar_fuse(
     scene_id: str,

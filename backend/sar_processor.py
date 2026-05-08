@@ -546,4 +546,51 @@ def fuse_detections(engine, scene_id: str) -> dict:
         "n_dark_new": n_dark_new,
     }
     log.info("[%s] fusion: %s", scene_id, summary)
+
+    # Dispatch dark-vessel alert. Best-effort: any failure is logged but
+    # does not break the fusion summary.
+    if n_dark_new > 0:
+        try:
+            import alerts
+            scene_attrs = {}
+            with session_scope() as s:
+                scene = s.get(dbm.SarSceneRow, scene_id)
+                scene_attrs = {
+                    "name": (scene.attrs or {}).get("name", "") if scene else "",
+                    "acquired_at": scene.acquired_at if scene else None,
+                }
+            if scene_attrs.get("acquired_at"):
+                # Sample = the detections we just classified as dark-new.
+                # We don't have a flag for that on det_payload, so re-load
+                # the recently-inserted matched_entity_id IS NULL rows.
+                with session_scope() as s:
+                    fresh_dark_rows = s.execute(
+                        sa_select(dbm.SarDetectionRow)
+                        .where(dbm.SarDetectionRow.scene_id == scene_id)
+                        .where(dbm.SarDetectionRow.matched_entity_id.is_(None))
+                        .order_by(dbm.SarDetectionRow.rcs_db.desc())
+                        .limit(alerts.MAX_DETECTIONS_IN_BODY * 2)
+                    ).scalars().all()
+                    sample = []
+                    for r in fresh_dark_rows:
+                        pt = to_shape(r.geom)
+                        sample.append({
+                            "lat": pt.y, "lon": pt.x,
+                            "rcs_db": r.rcs_db, "length_m": r.length_m,
+                            "confidence": r.confidence,
+                        })
+                alert_result = alerts.notify_dark_vessels(
+                    scene_id=scene_id,
+                    scene_name=scene_attrs.get("name", ""),
+                    scene_acquired_at=scene_attrs["acquired_at"],
+                    n_dark_new=n_dark_new,
+                    n_dark_continued=n_dark_continued,
+                    sample=sample,
+                )
+                summary["alert"] = alert_result
+        except Exception as exc:  # noqa: BLE001
+            log.exception("[%s] alert dispatch failed (non-fatal): %s",
+                          scene_id, exc)
+            summary["alert"] = {"skipped": f"dispatch error: {exc}"}
+
     return summary
