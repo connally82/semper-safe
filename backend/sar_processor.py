@@ -50,6 +50,7 @@ import numpy as np
 
 from cfar import CfarConfig, detect_vessels
 import fixed_structures
+import land_mask
 
 log = logging.getLogger("sar_processor")
 
@@ -335,9 +336,12 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
     n_tiles = 0
     n_raw = 0
     n_platform_dropped = 0     # detections suppressed via fixed_structures
+    n_land_dropped = 0         # detections suppressed via land_mask
     log.info("[%s] platform suppression: %d known structures, radius %.0f m",
              scene_id, fixed_structures.platform_count(),
              FIXED_STRUCTURE_RADIUS_M)
+    log.info("[%s] land mask: %s", scene_id,
+             "enabled" if land_mask.is_loaded() else "disabled (file missing)")
 
     log.info("[%s] opening %s", scene_id, inner_tiff)
     with rasterio.open(gdal_path) as src:
@@ -369,6 +373,13 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
                     if not (AOI_LAT_MIN <= lat <= AOI_LAT_MAX
                             and AOI_LON_MIN <= lon <= AOI_LON_MAX):
                         continue
+                    # Drop returns over dry land. Sentinel-1 IW GRDH covers
+                    # ~250×200 km, so most scenes span continent + ocean.
+                    # CFAR over land flags buildings / ag patterns / etc as
+                    # vessels — see land_mask.py docstring.
+                    if land_mask.is_on_land(lat, lon):
+                        n_land_dropped += 1
+                        continue
                     # Drop returns coincident with a known fixed structure
                     # (oil rig, production platform, light vessel, etc).
                     # See fixed_structures.py docstring for sourcing notes.
@@ -392,9 +403,9 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
 
     elapsed = time.time() - t0
     log.info("[%s] CFAR done in %.1fs — %d tiles, %d raw, %d kept, "
-             "%d dropped as fixed structures",
+             "%d dropped on land, %d dropped on fixed structures",
              scene_id, elapsed, n_tiles, n_raw, len(detections),
-             n_platform_dropped)
+             n_land_dropped, n_platform_dropped)
 
     # 5) Persist
     detected_at = datetime.now(timezone.utc)
@@ -420,6 +431,7 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
                     "n_tiles": n_tiles,
                     "n_raw": n_raw,
                     "n_kept": len(detections),
+                    "n_land_dropped": n_land_dropped,
                     "n_platform_dropped": n_platform_dropped,
                     "elapsed_s": round(elapsed, 1),
                     "pfa": pfa,

@@ -1128,6 +1128,60 @@ def admin_sar_process(
     }
 
 
+@app.post("/admin/sar/purge-on-land")
+def admin_purge_on_land(
+    dry_run: bool = True,
+    x_admin_token: str | None = Header(default=None),
+):
+    """One-shot cleanup: delete sar_detections that fall on dry land.
+
+    Scenes processed before the land-mask was wired (Phase 4.x) include
+    inland CFAR false positives — buildings, ag patterns, etc. that
+    appear bright in SAR. This endpoint applies the current land_mask
+    polygon to every existing detection and drops the on-land ones.
+
+    Pass dry_run=false to actually delete; default reports counts only.
+    """
+    _require_admin(x_admin_token)
+    import land_mask
+    from sqlalchemy import select as sa_select, delete as sa_delete
+    from geoalchemy2.shape import to_shape
+    from db import models as dbm
+    from db.session import session_scope
+
+    if not land_mask.is_loaded():
+        return {"error": "land mask not loaded; check backend/data/aoi_land.geojson"}
+
+    with session_scope() as s:
+        rows = s.execute(sa_select(dbm.SarDetectionRow)).scalars().all()
+        on_land_ids = []
+        for r in rows:
+            pt = to_shape(r.geom)
+            if land_mask.is_on_land(pt.y, pt.x):
+                on_land_ids.append(r.detection_id)
+        n = len(on_land_ids)
+        sample = on_land_ids[:5]
+
+        if dry_run or n == 0:
+            return {"dry_run": dry_run,
+                    "total_detections": len(rows),
+                    "on_land_count": n,
+                    "sample_detection_ids": sample}
+
+        s.execute(
+            sa_delete(dbm.SarDetectionRow)
+            .where(dbm.SarDetectionRow.detection_id.in_(on_land_ids))
+        )
+
+    audit_log.append(
+        actor="admin", event_type="sar_on_land_purged",
+        payload={"deleted_count": n, "sample_detection_ids": sample},
+    )
+    return {"dry_run": False, "deleted_count": n,
+            "sample_detection_ids": sample,
+            "remaining": len(rows) - n}
+
+
 @app.post("/admin/maritime/purge-non-aoi")
 def admin_purge_non_aoi(
     dry_run: bool = True,
