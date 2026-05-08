@@ -365,6 +365,51 @@ def download_scene_to_r2(scene_id: str, *,
 
 # --- Best-match lookup ----------------------------------------------
 
+def find_nearest_s2_for_point(lat: float, lon: float,
+                               near_t: datetime,
+                               *,
+                               max_days: int = 3,
+                               max_cloud_pct: float = 40.0) -> str | None:
+    """Find the S2 scene whose footprint CONTAINS (lat, lon) and whose
+    acquired_at is closest to near_t, within ±max_days, ≤max_cloud_pct.
+
+    The right matcher for per-detection chip extraction. Earlier
+    versions matched by SAR-scene footprint overlap, but a Sentinel-1
+    GRDH scene is ~250 km wide, so an S2 tile that intersects the SAR
+    bounds doesn't necessarily contain the actual detection point.
+    """
+    from datetime import timedelta
+    from sqlalchemy import select as sa_select, or_
+    from geoalchemy2 import functions as gfn
+    from geoalchemy2.shape import from_shape
+    from shapely.geometry import Point
+
+    from db import models as dbm
+    from db.session import session_scope
+
+    window_lo = near_t - timedelta(days=max_days)
+    window_hi = near_t + timedelta(days=max_days)
+    pt = from_shape(Point(lon, lat), srid=4326)
+
+    with session_scope() as s:
+        rows = s.execute(
+            sa_select(dbm.S2SceneRow.scene_id, dbm.S2SceneRow.acquired_at)
+            .where(
+                dbm.S2SceneRow.acquired_at >= window_lo,
+                dbm.S2SceneRow.acquired_at <= window_hi,
+                or_(
+                    dbm.S2SceneRow.cloud_cover_pct.is_(None),
+                    dbm.S2SceneRow.cloud_cover_pct <= max_cloud_pct,
+                ),
+                gfn.ST_Contains(dbm.S2SceneRow.footprint, pt),
+            )
+        ).all()
+    if not rows:
+        return None
+    rows.sort(key=lambda r: abs((r.acquired_at - near_t).total_seconds()))
+    return rows[0].scene_id
+
+
 def find_nearest_s2_for_sar_scene(sar_scene_id: str, *,
                                    max_days: int = 3,
                                    max_cloud_pct: float = 40.0) -> str | None:

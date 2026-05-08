@@ -1185,10 +1185,17 @@ def maritime_sar_optical_chip(
         sar_scene_id = det.scene_id
         pt = to_shape(det.geom)
         det_lat, det_lon = pt.y, pt.x
+        # SAR scene's acquired_at is "near" for time matching.
+        sar_scene = s.get(dbm.SarSceneRow, sar_scene_id)
+        near_t = sar_scene.acquired_at if sar_scene else det.detected_at
 
-    s2_scene_id = s2.find_nearest_s2_for_sar_scene(sar_scene_id,
-                                                     max_days=3,
-                                                     max_cloud_pct=40.0)
+    # Match by the DETECTION point — Sentinel-1 GRDH covers ~250 km, so an
+    # S2 tile that overlaps the SAR bounds may not contain the actual
+    # detection coordinates.
+    s2_scene_id = s2.find_nearest_s2_for_point(
+        det_lat, det_lon, near_t,
+        max_days=3, max_cloud_pct=40.0,
+    )
     if s2_scene_id is None:
         raise HTTPException(
             404,
