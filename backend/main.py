@@ -298,7 +298,9 @@ def audit_verify():
 # Maritime domain
 @app.get("/maritime/entities")
 def maritime_entities():
-    rows = sorted(maritime.entities.values(),
+    # list() snapshot prevents `dict changed size during iteration` from a
+    # concurrent AISStream ingest mutating maritime.entities.
+    rows = sorted(list(maritime.entities.values()),
                   key=lambda e: (-e.priority_score, -e.last_seen.timestamp()))
     return {"entities": [e.model_dump() for e in rows]}
 
@@ -370,7 +372,7 @@ def maritime_reject(eid: str, body: DecisionRequest):
 # Wildfire domain
 @app.get("/wildfire/entities")
 def wildfire_entities():
-    rows = sorted(wildfire.entities.values(),
+    rows = sorted(list(wildfire.entities.values()),
                   key=lambda e: (-e.priority_score, -e.last_seen.timestamp()))
     return {"entities": [e.model_dump() for e in rows]}
 

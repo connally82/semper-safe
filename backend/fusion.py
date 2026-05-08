@@ -75,7 +75,10 @@ class FusionEngine:
         self.entities.update(loaded.entities)
         self.recommendations.update(loaded.recommendations)
         # Rebuild MMSI index from loaded entities
-        for ent in self.entities.values():
+        # Snapshot to avoid `dict changed size during iteration` when the
+        # AISStream worker mutates self.entities concurrently from another
+        # thread. The list() copy is atomic under the GIL.
+        for ent in list(self.entities.values()):
             mmsi = ent.attrs.get("mmsi")
             if mmsi:
                 self._mmsi_index[str(mmsi)] = ent.entity_id
@@ -206,7 +209,7 @@ class FusionEngine:
 
     def _best_ais_match(self, sar_obs: Observation) -> str | None:
         best_eid, best_score = None, 0.0
-        for eid, ent in self.entities.items():
+        for eid, ent in list(self.entities.items()):
             if ent.type not in (EntityType.VESSEL, EntityType.AIS_GAP):
                 continue
             dt = abs((ent.last_seen - sar_obs.t).total_seconds())
@@ -231,7 +234,7 @@ class FusionEngine:
         TRACK_RADIUS_KM = 12.0
         TRACK_WINDOW_S = 90 * 60   # 90 minutes between passes is plausible
         best_eid, best_score = None, 0.0
-        for eid, ent in self.entities.items():
+        for eid, ent in list(self.entities.items()):
             if ent.type != EntityType.DARK_VESSEL:
                 continue
             dt = abs((ent.last_seen - sar_obs.t).total_seconds())
@@ -249,7 +252,10 @@ class FusionEngine:
     def detect_gaps(self, now: datetime) -> list[Entity]:
         """Sweep entities; mark vessels that have gone silent past threshold."""
         flagged: list[Entity] = []
-        for ent in self.entities.values():
+        # Snapshot to avoid `dict changed size during iteration` when the
+        # AISStream worker mutates self.entities concurrently from another
+        # thread. The list() copy is atomic under the GIL.
+        for ent in list(self.entities.values()):
             if ent.type != EntityType.VESSEL:
                 continue
             if (now - ent.last_seen) > AIS_GAP_THRESHOLD:
@@ -308,7 +314,7 @@ class FusionEngine:
         """Operator approves/rejects all pending recs for an entity."""
         affected: list[Recommendation] = []
         now = datetime.utcnow()
-        for rec in self.recommendations.values():
+        for rec in list(self.recommendations.values()):
             if rec.entity_id != entity_id or rec.decision != Decision.PENDING:
                 continue
             rec.decision = decision
@@ -336,7 +342,7 @@ class FusionEngine:
         related_audit = [a for a in audit_log.all()
                          if a.payload.get("entity_id") == entity_id
                          or a.payload.get("obs_id") in ent.observation_ids]
-        related_recs = [r for r in self.recommendations.values()
+        related_recs = [r for r in list(self.recommendations.values())
                         if r.entity_id == entity_id]
         return {
             "entity": ent.model_dump(),

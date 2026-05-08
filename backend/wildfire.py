@@ -233,7 +233,10 @@ class WildfireFusion:
         Weather observations attach to nearby fire_events as context,
         elevating priority when conditions are dangerous.
         """
-        for ent in self.entities.values():
+        # Snapshot — wildfire ingest also mutates self.entities concurrently
+        # if a separate ingest source ever lands. Defensive against future
+        # threading bugs even if today only one thread mutates it.
+        for ent in list(self.entities.values()):
             if ent.type != EntityType.FIRE_EVENT:
                 continue
             if haversine_km(ent.geom, obs.geom) > 50:
@@ -295,7 +298,7 @@ class WildfireFusion:
         # so the parameter is accepted for API stability but unused here.
         _ = max_window
         best, best_d = None, max_km + 1
-        for eid, ent in self.entities.items():
+        for eid, ent in list(self.entities.items()):
             if ent.type not in (EntityType.HOTSPOT, EntityType.FIRE_EVENT,
                                 EntityType.SMOKE_PLUME):
                 continue
@@ -354,7 +357,7 @@ class WildfireFusion:
                ) -> list[Recommendation]:
         affected = []
         now = datetime.utcnow()
-        for rec in self.recommendations.values():
+        for rec in list(self.recommendations.values()):
             if rec.entity_id != entity_id or rec.decision != Decision.PENDING:
                 continue
             rec.decision = decision
@@ -380,7 +383,7 @@ class WildfireFusion:
         related_audit = [a for a in audit_log.all()
                          if a.payload.get("entity_id") == entity_id
                          or a.payload.get("obs_id") in ent.observation_ids]
-        related_recs = [r for r in self.recommendations.values()
+        related_recs = [r for r in list(self.recommendations.values())
                         if r.entity_id == entity_id]
         return {
             "entity": ent.model_dump(),
