@@ -69,8 +69,33 @@ def get_engine():
     global _engine, _SessionLocal
     if _engine is None:
         url = _resolve_database_url()
-        # pool_pre_ping handles Neon's idle disconnects gracefully.
-        _engine = create_engine(url, pool_pre_ping=True, future=True)
+        # Pool sized for the AIS-ingest load profile:
+        #   - AISStream pushes ~3 messages/sec at peak.
+        #   - Each ingest does ~4 DB ops (put_observation + put_entity +
+        #     2 audit_log.append calls), each its own session_scope.
+        #   - That's ~12 short-lived connection acquires/sec sustained.
+        #   - + the gap sweeper + retention loop + HTTP request handlers.
+        #
+        # SQLAlchemy default pool_size=5 + max_overflow=10 was too small
+        # under load: requests piled up waiting for connections, /health
+        # eventually hung, Fly's health check tripped, machine got marked
+        # unhealthy. Bumping to 20+30 = up to 50 concurrent connections.
+        # Neon's free tier allows 100 concurrent connections, so we're
+        # well within budget.
+        #
+        # pool_timeout = 10s: after that, raise instead of waiting forever.
+        # That converts a deadlock into a 500 the operator can see.
+        # pool_recycle = 1800: Neon kills idle connections after a while;
+        # recycle proactively so we don't trip pool_pre_ping mid-request.
+        _engine = create_engine(
+            url,
+            pool_pre_ping=True,
+            pool_size=20,
+            max_overflow=30,
+            pool_timeout=10,
+            pool_recycle=1800,
+            future=True,
+        )
         _SessionLocal = sessionmaker(
             bind=_engine, autoflush=False, autocommit=False, expire_on_commit=False,
         )
