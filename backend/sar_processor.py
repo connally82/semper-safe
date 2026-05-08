@@ -242,7 +242,7 @@ def _gen_detection_id() -> str:
 
 
 def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
-                  tile_px: int = TILE_PX) -> dict:
+                  tile_px: int = TILE_PX, fuse_engine=None) -> dict:
     """End-to-end detection pipeline for one downloaded SAR scene.
 
     Steps:
@@ -405,6 +405,14 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
                 },
             }
 
+    fusion_summary = None
+    if fuse_engine is not None and detections:
+        try:
+            fusion_summary = fuse_detections(fuse_engine, scene_id)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("[%s] fusion step failed (detections persisted): %s",
+                          scene_id, exc)
+
     return {
         "scene_id": scene_id,
         "scene_name": scene_name,
@@ -413,4 +421,129 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
         "n_detections": len(detections),
         "elapsed_s": round(elapsed, 1),
         "pfa": pfa,
+        "fusion": fusion_summary,
     }
+
+
+# ---------------------------------------------------------------------- fusion
+
+
+def fuse_detections(engine, scene_id: str) -> dict:
+    """Match each sar_detection to AIS vessels (or classify as dark).
+
+    Hands each detection to engine.ingest as a SourceType.SAR observation.
+    The engine's _ingest_sar already does the matching:
+      - VESSEL / AIS_GAP within fusion window → match, append to entity
+      - existing DARK_VESSEL nearby → track continuity (still no AIS match)
+      - none of the above → fresh DARK_VESSEL entity
+
+    We then set sar_detections.matched_entity_id ONLY when the resulting
+    entity has an AIS lineage (type ∈ {VESSEL, AIS_GAP}). Dark vessels
+    (new or continuing) leave matched_entity_id null because the
+    /detections endpoint and the frontend layer use that null vs set
+    distinction to color points red (dark) vs green (matched).
+
+    Idempotency: skips detections that already have matched_entity_id set.
+    Re-running fuse on the same scene is safe and only fills in unmatched
+    rows. Note that the engine itself is NOT idempotent — re-feeding the
+    same observation twice would inflate observation_ids.
+
+    Returns counts dict for audit + admin response.
+    """
+    from db import models as dbm
+    from db.session import session_scope
+    from sqlalchemy import select as sa_select
+    from geoalchemy2.shape import to_shape
+
+    from models import EntityType, Observation, SourceType
+
+    # Load scene + unmatched detections in one txn.
+    with session_scope() as s:
+        scene = s.get(dbm.SarSceneRow, scene_id)
+        if scene is None:
+            raise RuntimeError(f"sar_scenes row not found: {scene_id}")
+        rows = s.execute(
+            sa_select(dbm.SarDetectionRow)
+            .where(dbm.SarDetectionRow.scene_id == scene_id)
+            .where(dbm.SarDetectionRow.matched_entity_id.is_(None))
+        ).scalars().all()
+        # Snapshot the data we need outside the session — the rows objects
+        # detach when the session closes.
+        scene_t = scene.acquired_at
+        det_payload = []
+        for r in rows:
+            pt = to_shape(r.geom)
+            det_payload.append({
+                "detection_id": r.detection_id,
+                "lon": pt.x, "lat": pt.y,
+                "rcs_db": r.rcs_db, "length_m": r.length_m,
+                "confidence": r.confidence,
+            })
+
+    log.info("[%s] fusing %d unmatched detections at scene t=%s",
+             scene_id, len(det_payload), scene_t.isoformat())
+
+    n_ais_matched = 0
+    n_dark_continued = 0
+    n_dark_new = 0
+    matched: dict[str, str] = {}    # detection_id → entity_id
+
+    import h3
+    from models import Geom
+    H3_RES = 8
+
+    for d in det_payload:
+        # Pre-snapshot the engine's known dark vessels so we can tell
+        # afterward whether the engine matched to an existing one
+        # (track continuity) vs created a new one.
+        existing_dark_ids = {
+            eid for eid, ent in list(engine.entities.items())
+            if ent.type == EntityType.DARK_VESSEL
+        }
+
+        obs = Observation(
+            obs_id=f"obs_sar_{d['detection_id']}",
+            source=SourceType.SAR,
+            source_id=d["detection_id"],
+            geom=Geom(lon=d["lon"], lat=d["lat"]),
+            h3_cell=h3.latlng_to_cell(d["lat"], d["lon"], H3_RES),
+            t=scene_t,
+            attrs={
+                "scene_id": scene_id,
+                "rcs_db": d["rcs_db"],
+                "length_m": d["length_m"],
+            },
+            confidence=d["confidence"],
+            raw_lineage=f"sar:{scene_id}",
+        )
+        ent = engine.ingest(obs)
+
+        if ent.type in (EntityType.VESSEL, EntityType.AIS_GAP):
+            n_ais_matched += 1
+            matched[d["detection_id"]] = ent.entity_id
+        elif ent.type == EntityType.DARK_VESSEL:
+            if ent.entity_id in existing_dark_ids:
+                n_dark_continued += 1
+            else:
+                n_dark_new += 1
+        # other types are unexpected — leave unset
+
+    # Persist matched_entity_id back to the detections.
+    if matched:
+        with session_scope() as s:
+            for det_id, eid in matched.items():
+                s.execute(
+                    dbm.SarDetectionRow.__table__.update()
+                    .where(dbm.SarDetectionRow.detection_id == det_id)
+                    .values(matched_entity_id=eid)
+                )
+
+    summary = {
+        "scene_id": scene_id,
+        "n_processed": len(det_payload),
+        "n_ais_matched": n_ais_matched,
+        "n_dark_continued": n_dark_continued,
+        "n_dark_new": n_dark_new,
+    }
+    log.info("[%s] fusion: %s", scene_id, summary)
+    return summary

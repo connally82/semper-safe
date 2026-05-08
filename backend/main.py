@@ -819,10 +819,14 @@ def admin_sar_download(
 
 
 def _do_sar_process(scene_id: str) -> None:
-    """Background-task body for running CFAR on a downloaded scene."""
+    """Background-task body for running CFAR on a downloaded scene.
+
+    Also auto-runs the SAR↔AIS fusion step at the end so the new
+    detections get matched_entity_id populated where applicable.
+    """
     try:
         import sar_processor  # lazy: imports rasterio (heavy native lib)
-        result = sar_processor.process_scene(scene_id)
+        result = sar_processor.process_scene(scene_id, fuse_engine=maritime)
         audit_log.append(
             actor="admin", event_type="sar_scene_processed",
             payload={
@@ -831,12 +835,29 @@ def _do_sar_process(scene_id: str) -> None:
                 "n_tiles": result.get("n_tiles"),
                 "n_raw": result.get("n_raw"),
                 "elapsed_s": result.get("elapsed_s"),
+                "fusion": result.get("fusion"),
                 "skipped": result.get("skipped"),
             },
         )
         log.info("admin SAR process done: %s", result)
     except Exception as exc:  # noqa: BLE001
         log.exception("admin SAR process failed: %s", exc)
+
+
+def _do_sar_fuse(scene_id: str) -> None:
+    """Background-task body for running just the fusion step on an
+    already-detected scene. Re-runnable + idempotent: skips detections
+    whose matched_entity_id is already set."""
+    try:
+        import sar_processor
+        result = sar_processor.fuse_detections(maritime, scene_id)
+        audit_log.append(
+            actor="admin", event_type="sar_scene_fused",
+            payload=result,
+        )
+        log.info("admin SAR fuse done: %s", result)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("admin SAR fuse failed: %s", exc)
 
 
 @app.post("/admin/sar/process/{scene_id}", status_code=202)
@@ -860,6 +881,28 @@ def admin_sar_process(
         "scene_id": scene_id,
         "status": "queued",
         "tip": "poll sar_scenes.state (→ 'detected') and sar_detections rows",
+    }
+
+
+@app.post("/admin/sar/fuse/{scene_id}", status_code=202)
+def admin_sar_fuse(
+    scene_id: str,
+    background_tasks: BackgroundTasks,
+    x_admin_token: str | None = Header(default=None),
+):
+    """Run the SAR↔AIS fusion step on an already-detected scene.
+
+    Useful for backfilling matched_entity_id on scenes processed before
+    fusion was wired in, or for re-running fusion after AIS data has been
+    re-ingested. Idempotent: skips detections whose matched_entity_id is
+    already set.
+    """
+    _require_admin(x_admin_token)
+    background_tasks.add_task(_do_sar_fuse, scene_id)
+    return {
+        "scene_id": scene_id,
+        "status": "queued",
+        "tip": "poll sar_detections.matched_entity_id to see matches land",
     }
 
 
