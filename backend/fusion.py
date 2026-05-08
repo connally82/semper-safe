@@ -31,17 +31,40 @@ DOMAIN = "maritime"
 # ----------------------------------------------------------------------
 # Tunables — would be config in production
 # ----------------------------------------------------------------------
-# 8-minute threshold tuned against ~12 minutes of live Texas-shoreline AIS
-# data on 2026-05-07: 742 inter-arrival gaps across 299 vessels showed
-# p50=61s, p90=3min, p99=5.3min, max-observed=9.5min. 8min sits comfortably
-# beyond the 99th percentile of normal reporting cadence so genuine
-# dropouts surface without crying wolf on slow Class B reporters.
-# Revisit after we have a longer window — vessels moored in port may
-# legitimately go quiet for 15+ minutes and the current sample doesn't
-# include enough port-state observations to model that case.
-AIS_GAP_THRESHOLD = timedelta(minutes=8)
+# Class-aware AIS gap thresholds. Different operating states have very
+# different normal reporting cadences per ITU-R M.1371:
+#   - Underway (nav=0/8): every 2-10 sec for Class A — 8 min of silence is anomalous
+#   - At anchor / moored / aground (nav=1/5/6): every 3 min legally; in practice
+#     moored vessels at dock can go 30+ min between reports without it meaning
+#     anything. Tuned against live Texas-coast data 2026-05-08: 132 of 311
+#     vessels were getting flagged at 8 min — 30% false-positive rate dominated
+#     by moored vessels at the Houston/Galveston ports.
+#   - Fishing (nav=7): often slow-reporting Class B; intermediate threshold.
+#
+# Rest is per-class; nav_status comes from the most recent PositionReport
+# stored in entity.attrs.nav_status.
+AIS_GAP_THRESHOLD = timedelta(minutes=8)              # underway / default
+AIS_GAP_THRESHOLD_QUIESCENT = timedelta(minutes=60)   # at anchor, moored, aground
+AIS_GAP_THRESHOLD_FISHING = timedelta(minutes=15)     # nav=7 fishing
+QUIESCENT_NAV_STATES = {1, 5, 6}                      # 1=anchor, 5=moored, 6=aground
+FISHING_NAV_STATES = {7}                              # 7=engaged in fishing
+
 SAR_AIS_MATCH_RADIUS_KM = 1.5               # how close a SAR blob must be to an AIS report
 SAR_AIS_MATCH_WINDOW = timedelta(minutes=20)
+
+
+def gap_threshold_for(ent: Entity) -> timedelta:
+    """Pick the AIS gap threshold appropriate for the entity's last-known
+    navigational state. Fall back to the underway threshold for unknown
+    states — that's the conservative choice (a vessel reporting nav=12
+    'reserved' is more likely a software bug on an underway vessel than
+    a genuinely-quiet docked one)."""
+    nav = ent.attrs.get("nav_status")
+    if nav in QUIESCENT_NAV_STATES:
+        return AIS_GAP_THRESHOLD_QUIESCENT
+    if nav in FISHING_NAV_STATES:
+        return AIS_GAP_THRESHOLD_FISHING
+    return AIS_GAP_THRESHOLD
 
 
 # ----------------------------------------------------------------------
@@ -132,6 +155,15 @@ class FusionEngine:
         ent.geom = obs.geom
         ent.last_seen = obs.t
         ent.observation_ids.append(obs.obs_id)
+        # Refresh telemetry-style attrs from the latest observation so that
+        # gap_threshold_for(ent) sees the current navigational state. Don't
+        # blow away the whole attrs dict — name/mmsi/destination from
+        # ShipStaticData live there too.
+        for telemetry_key in (
+            "nav_status", "heading", "speed_kn", "true_heading", "rate_of_turn",
+        ):
+            if telemetry_key in obs.attrs:
+                ent.attrs[telemetry_key] = obs.attrs[telemetry_key]
         # If a previously-dark vessel reappears on AIS, downgrade priority
         if ent.type == EntityType.AIS_GAP:
             ent.type = EntityType.VESSEL
@@ -250,7 +282,9 @@ class FusionEngine:
 
     # --- gap detection -----------------------------------------------
     def detect_gaps(self, now: datetime) -> list[Entity]:
-        """Sweep entities; mark vessels that have gone silent past threshold."""
+        """Sweep entities; mark vessels that have gone silent past their
+        class-appropriate threshold (8min underway, 60min moored/anchored,
+        15min fishing). See gap_threshold_for() for rationale."""
         flagged: list[Entity] = []
         # Snapshot to avoid `dict changed size during iteration` when the
         # AISStream worker mutates self.entities concurrently from another
@@ -258,7 +292,8 @@ class FusionEngine:
         for ent in list(self.entities.values()):
             if ent.type != EntityType.VESSEL:
                 continue
-            if (now - ent.last_seen) > AIS_GAP_THRESHOLD:
+            threshold = gap_threshold_for(ent)
+            if (now - ent.last_seen) > threshold:
                 ent.type = EntityType.AIS_GAP
                 ent.priority_score = 0.55     # medium — could be benign or IUU
                 ent.notes = (f"AIS dropout. Last report "
@@ -268,7 +303,9 @@ class FusionEngine:
                     actor="system",
                     event_type="entity_reclassified",
                     payload={"entity_id": ent.entity_id, "to": "ais_gap",
-                             "last_seen": ent.last_seen.isoformat()},
+                             "last_seen": ent.last_seen.isoformat(),
+                             "threshold_min": threshold.total_seconds() / 60,
+                             "nav_status": ent.attrs.get("nav_status")},
                 )
                 self._make_recommendation(ent)
                 flagged.append(ent)
