@@ -309,6 +309,95 @@ PRODUCT_DOWNLOAD_URL_TPL = (
 )
 
 
+def download_scene_to_r2(scene_id: str, *,
+                          chunk_size: int = 1 << 20,
+                          timeout_s: float = 600.0) -> dict:
+    """Stream-download a Sentinel-1 product directly into Cloudflare R2.
+
+    Uses tempfile.SpooledTemporaryFile (auto-rolls from RAM to disk above
+    16 MB) so memory footprint is bounded regardless of the 1-2 GB scene
+    size. boto3.upload_fileobj does the multipart upload from there.
+
+    Updates sar_scenes:
+      - raw_url   = R2 URL for the .SAFE.zip
+      - state     = 'downloaded' on success, 'failed' on error
+      - failure_reason populated on failure
+
+    Requires both Copernicus auth (CDSE_USERNAME/CDSE_PASSWORD) AND R2
+    credentials (R2_*) to be set. Raises RuntimeError if either is missing.
+    """
+    import tempfile
+
+    from db import models as dbm
+    from db import archive
+    from db.session import session_scope
+
+    if not auth().is_configured():
+        raise RuntimeError("Copernicus auth not configured")
+    cfg = archive._r2_config()  # noqa: SLF001 — reuse the validated R2 config
+    if cfg is None:
+        raise RuntimeError("R2 not configured (R2_ACCOUNT_ID/R2_ACCESS_KEY_ID/...)")
+
+    tok = auth().token()
+    if not tok:
+        raise RuntimeError("Copernicus token fetch failed")
+
+    url = PRODUCT_DOWNLOAD_URL_TPL.format(scene_id=scene_id)
+    key = f"sar/scenes/{scene_id}.SAFE.zip"
+    raw_url = f"r2://{cfg['bucket']}/{key}"
+
+    with session_scope() as s:
+        scene = s.get(dbm.SarSceneRow, scene_id)
+        if scene is None:
+            raise RuntimeError(f"sar_scenes row not found: {scene_id}")
+        if scene.state == "downloaded" and scene.raw_url:
+            return {"scene_id": scene_id, "skipped": "already downloaded",
+                    "raw_url": scene.raw_url}
+
+    spool_threshold = 16 * 1024 * 1024  # roll to disk above 16 MB
+    bytes_seen = 0
+    try:
+        with tempfile.SpooledTemporaryFile(max_size=spool_threshold) as buf:
+            with httpx.stream(
+                "GET", url, headers={"Authorization": f"Bearer {tok}"},
+                timeout=timeout_s, follow_redirects=True,
+            ) as r:
+                r.raise_for_status()
+                for chunk in r.iter_bytes(chunk_size):
+                    buf.write(chunk)
+                    bytes_seen += len(chunk)
+
+            buf.seek(0)
+            client = archive._r2_client(cfg)  # noqa: SLF001
+            client.upload_fileobj(
+                buf, cfg["bucket"], key,
+                ExtraArgs={"ContentType": "application/zip"},
+            )
+    except Exception as exc:  # noqa: BLE001
+        with session_scope() as s:
+            scene = s.get(dbm.SarSceneRow, scene_id)
+            if scene is not None:
+                scene.state = "failed"
+                scene.failure_reason = f"{type(exc).__name__}: {exc}"[:500]
+        log.exception("download_scene_to_r2 failed for %s", scene_id)
+        raise
+
+    with session_scope() as s:
+        scene = s.get(dbm.SarSceneRow, scene_id)
+        if scene is not None:
+            scene.raw_url = raw_url
+            scene.state = "downloaded"
+            scene.failure_reason = None
+
+    log.info("downloaded scene %s → %s (%d bytes)", scene_id, raw_url, bytes_seen)
+    return {
+        "scene_id": scene_id,
+        "raw_url": raw_url,
+        "bytes": bytes_seen,
+        "key": key,
+    }
+
+
 def download_scene(scene_id: str, *, dest_path: str,
                    chunk_size: int = 1 << 20,
                    timeout_s: float = 600.0) -> dict:

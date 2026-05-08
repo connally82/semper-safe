@@ -16,7 +16,7 @@ import asyncio
 import logging
 import os
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -591,6 +591,63 @@ def wildfire_track(eid: str, limit: int = 200):
 @app.get("/wildfire/timeline")
 def wildfire_timeline(at: str | None = None, lookback_minutes: int = 60):
     return _timeline("wildfire", at, lookback_minutes)
+
+
+# --- Admin endpoints for manual SAR pipeline triggers ----------------
+#
+# Synchronous and BLOCKING — fine for one-off operator triggers, NOT for
+# general traffic. Gated by an ADMIN_TOKEN header so they're not
+# browseable. Set ADMIN_TOKEN as a Fly secret.
+
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+
+
+def _require_admin(x_admin_token: str | None) -> None:
+    if not ADMIN_TOKEN:
+        raise HTTPException(503, "ADMIN_TOKEN not configured")
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(401, "missing or invalid X-Admin-Token")
+
+
+@app.post("/admin/sar/discover")
+def admin_sar_discover(x_admin_token: str | None = Header(default=None)):
+    """Manually trigger a Sentinel-1 catalog discovery sweep."""
+    _require_admin(x_admin_token)
+    scenes = sar.discover_scenes(limit=50)
+    result = sar.record_scenes(scenes)
+    audit_log.append(
+        actor="admin", event_type="sar_discover_manual",
+        payload={"discovered": len(scenes), **result},
+    )
+    return {"discovered": len(scenes), **result}
+
+
+@app.post("/admin/sar/download/{scene_id}")
+def admin_sar_download(
+    scene_id: str,
+    x_admin_token: str | None = Header(default=None),
+):
+    """Manually download a Sentinel-1 scene from Copernicus to R2.
+
+    Runs synchronously; takes 30-90 seconds for a 1-2 GB scene over Fly's
+    network. Updates sar_scenes state machine.
+    """
+    _require_admin(x_admin_token)
+    try:
+        result = sar.download_scene_to_r2(scene_id)
+        audit_log.append(
+            actor="admin", event_type="sar_scene_downloaded",
+            payload={
+                "scene_id": scene_id,
+                "raw_url": result.get("raw_url"),
+                "bytes": result.get("bytes"),
+                "skipped": result.get("skipped"),
+            },
+        )
+        return result
+    except Exception as exc:  # noqa: BLE001
+        log.exception("admin SAR download failed: %s", exc)
+        raise HTTPException(500, f"{type(exc).__name__}: {exc}") from exc
 
 
 @app.get("/wildfire/entities/{eid}/lineage")
