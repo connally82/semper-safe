@@ -1133,12 +1133,17 @@ def admin_purge_on_land(
     dry_run: bool = True,
     x_admin_token: str | None = Header(default=None),
 ):
-    """One-shot cleanup: delete sar_detections that fall on dry land.
+    """One-shot cleanup: delete sar_detections AND dark_vessel entities
+    that fall on dry land.
 
     Scenes processed before the land-mask was wired (Phase 4.x) include
     inland CFAR false positives — buildings, ag patterns, etc. that
-    appear bright in SAR. This endpoint applies the current land_mask
-    polygon to every existing detection and drops the on-land ones.
+    appear bright in SAR. The fusion step then created a dark_vessel
+    entity for each. This endpoint applies the current land_mask
+    polygon to both:
+      - sar_detections.geom — drops the row outright
+      - entities (type=dark_vessel) — drops the entity + its
+        recommendations + its in-memory engine entry
 
     Pass dry_run=false to actually delete; default reports counts only.
     """
@@ -1153,33 +1158,68 @@ def admin_purge_on_land(
         return {"error": "land mask not loaded; check backend/data/aoi_land.geojson"}
 
     with session_scope() as s:
-        rows = s.execute(sa_select(dbm.SarDetectionRow)).scalars().all()
-        on_land_ids = []
-        for r in rows:
+        # 1) SAR detections on land
+        det_rows = s.execute(sa_select(dbm.SarDetectionRow)).scalars().all()
+        det_on_land_ids = []
+        for r in det_rows:
             pt = to_shape(r.geom)
             if land_mask.is_on_land(pt.y, pt.x):
-                on_land_ids.append(r.detection_id)
-        n = len(on_land_ids)
-        sample = on_land_ids[:5]
+                det_on_land_ids.append(r.detection_id)
 
-        if dry_run or n == 0:
+        # 2) Dark-vessel entities on land. We don't touch type=vessel /
+        # ais_gap because those reflect AIS reality regardless of where
+        # the latest report places them (think a shore-side AIS receiver
+        # mapping a fishing trawler against a county boundary).
+        ent_rows = s.execute(
+            sa_select(dbm.EntityRow).where(
+                dbm.EntityRow.domain == "maritime",
+                dbm.EntityRow.type == "dark_vessel",
+            )
+        ).scalars().all()
+        ent_on_land_ids = []
+        for r in ent_rows:
+            pt = to_shape(r.geom)
+            if land_mask.is_on_land(pt.y, pt.x):
+                ent_on_land_ids.append(r.entity_id)
+
+        if dry_run or (not det_on_land_ids and not ent_on_land_ids):
             return {"dry_run": dry_run,
-                    "total_detections": len(rows),
-                    "on_land_count": n,
-                    "sample_detection_ids": sample}
+                    "total_detections": len(det_rows),
+                    "detections_on_land": len(det_on_land_ids),
+                    "total_dark_entities": len(ent_rows),
+                    "dark_entities_on_land": len(ent_on_land_ids)}
 
-        s.execute(
-            sa_delete(dbm.SarDetectionRow)
-            .where(dbm.SarDetectionRow.detection_id.in_(on_land_ids))
-        )
+        if det_on_land_ids:
+            s.execute(
+                sa_delete(dbm.SarDetectionRow)
+                .where(dbm.SarDetectionRow.detection_id.in_(det_on_land_ids))
+            )
+        if ent_on_land_ids:
+            s.execute(
+                sa_delete(dbm.RecommendationRow)
+                .where(dbm.RecommendationRow.entity_id.in_(ent_on_land_ids))
+            )
+            s.execute(
+                sa_delete(dbm.EntityRow)
+                .where(dbm.EntityRow.entity_id.in_(ent_on_land_ids))
+            )
+
+    # Drop in-memory engine copies so /maritime/entities reflects the
+    # cleanup immediately without a restart.
+    for eid in ent_on_land_ids:
+        maritime.entities.pop(eid, None)
 
     audit_log.append(
         actor="admin", event_type="sar_on_land_purged",
-        payload={"deleted_count": n, "sample_detection_ids": sample},
+        payload={"detections_deleted": len(det_on_land_ids),
+                 "dark_entities_deleted": len(ent_on_land_ids),
+                 "sample_detection_ids": det_on_land_ids[:5],
+                 "sample_entity_ids": ent_on_land_ids[:5]},
     )
-    return {"dry_run": False, "deleted_count": n,
-            "sample_detection_ids": sample,
-            "remaining": len(rows) - n}
+    return {"dry_run": False,
+            "detections_deleted": len(det_on_land_ids),
+            "dark_entities_deleted": len(ent_on_land_ids),
+            "remaining_detections": len(det_rows) - len(det_on_land_ids)}
 
 
 @app.post("/admin/maritime/purge-non-aoi")
