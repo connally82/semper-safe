@@ -129,24 +129,28 @@ const BUOYS_PATH = "/maritime/buoys";
 // losing freshness.
 const BUOYS_REFRESH_MS = 5 * 60 * 1000;
 
-// GOES-East ABI GeoColor — geostationary real-time imagery via NASA
-// GIBS WMTS. Updated every ~10 min. We treat it as a translucent
-// overlay so coastlines + AIS markers + SAR/S2 layers stay readable
-// underneath. Max zoom 7 — past that GIBS doesn't have tiles for this
-// product.
+// GOES-East ABI real-time imagery via NASA GIBS WMTS, ~10 min cadence.
+// Three modes (cycled by a single button):
+//   off       — layer hidden
+//   geocolor  — daytime true-color (clouds, sun glint, ocean)
+//   firetemp  — thermal-fire-tuned: bright orange/red over hot anomalies
+//               (ship engine fires, refinery flares, wildfires)
+// Single source with setTiles() swap on mode change. Max zoom 7 — GIBS
+// limit for these products.
 const GOES_SOURCE_ID = "ss-goes";
 const GOES_LAYER_ID = "ss-goes-raster";
-const GOES_STORAGE_KEY = "ss-goes-overlay";
-// TIME=default means "most recent available". GIBS rolls this every
-// ~10 min, so MapLibre re-requesting tiles on pan/zoom auto-picks up
-// fresh imagery. We force a periodic source-refresh so a stationary
-// view also updates.
-const GOES_TILE_URL =
-  "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/" +
-  "GOES-East_ABI_GeoColor/default/default/" +
-  "GoogleMapsCompatible_Level7/{z}/{y}/{x}.png";
+const GOES_STORAGE_KEY = "ss-goes-mode";   // "off" | "geocolor" | "firetemp"
+const GOES_TILE_URLS = {
+  geocolor: "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/" +
+            "GOES-East_ABI_GeoColor/default/default/" +
+            "GoogleMapsCompatible_Level7/{z}/{y}/{x}.png",
+  firetemp: "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/" +
+            "GOES-East_ABI_FireTemp/default/default/" +
+            "GoogleMapsCompatible_Level7/{z}/{y}/{x}.png",
+};
 const GOES_REFRESH_MS = 10 * 60 * 1000;
 const GOES_OPACITY = 0.55;
+const GOES_CYCLE = ["off", "geocolor", "firetemp"];
 
 async function fetchTrack(apiPath, eid, signal) {
   const r = await fetch(`${API_BASE}${apiPath}/entities/${eid}/track?limit=200`, { signal });
@@ -273,10 +277,12 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
   });
   const [buoysData, setBuoysData] = useState(null);
 
-  const [showGoes, setShowGoes] = useState(() => {
-    if (typeof window === "undefined") return false;
-    try { return window.localStorage.getItem(GOES_STORAGE_KEY) === "1"; }
-    catch { return false; }
+  const [goesMode, setGoesMode] = useState(() => {
+    if (typeof window === "undefined") return "off";
+    try {
+      const v = window.localStorage.getItem(GOES_STORAGE_KEY);
+      return GOES_CYCLE.includes(v) ? v : "off";
+    } catch { return "off"; }
   });
 
   // ------------------------------------------------------------------
@@ -413,22 +419,18 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
       if (!map.getSource(GOES_SOURCE_ID)) {
         map.addSource(GOES_SOURCE_ID, {
           type: "raster",
-          tiles: [GOES_TILE_URL],
+          tiles: [GOES_TILE_URLS.geocolor],   // mode-effect swaps via setTiles
           tileSize: 256,
           attribution:
-            "GOES-East GeoColor &copy; NOAA via NASA GIBS",
+            "GOES-East &copy; NOAA via NASA GIBS",
           maxzoom: 7,
         });
         map.addLayer({
           id: GOES_LAYER_ID,
           type: "raster",
           source: GOES_SOURCE_ID,
-          paint: {
-            "raster-opacity": GOES_OPACITY,
-            // Hide initially; the toggle effect sets it via setLayoutProperty
-            // when showGoes flips on.
-          },
-          layout: { "visibility": "none" },
+          paint: { "raster-opacity": GOES_OPACITY },
+          layout: { "visibility": "none" },   // mode-effect makes it visible
         });
       }
       if (!map.getSource(BUOYS_SOURCE_ID)) {
@@ -972,28 +974,31 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
     src.setData(showBuoys && buoysData ? buoysData : empty);
   }, [buoysData, showBuoys, ready]);
 
-  // GOES overlay: toggle visibility + force a periodic source refresh
-  // so a stationary view picks up new 10-min frames. We can't directly
-  // poke MapLibre's tile cache, so we re-set the tiles array — same
-  // URL — which causes it to invalidate & re-fetch.
+  // GOES overlay: mode-driven visibility + tile-URL swap. setTiles()
+  // both updates the source and invalidates MapLibre's tile cache so
+  // a fresh fetch happens for the new mode (or the next 10-min frame).
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !ready) return;
     if (!map.getLayer(GOES_LAYER_ID)) return;
-    map.setLayoutProperty(GOES_LAYER_ID, "visibility",
-                          showGoes ? "visible" : "none");
-    try {
-      window.localStorage.setItem(GOES_STORAGE_KEY, showGoes ? "1" : "0");
-    } catch { /* ignore */ }
-    if (!showGoes) return;
-    // Periodic refresh — re-set the source's tiles spec so MapLibre
-    // re-pulls fresh imagery (TIME=default rolls every ~10 min).
+    try { window.localStorage.setItem(GOES_STORAGE_KEY, goesMode); }
+    catch { /* ignore */ }
+    if (goesMode === "off") {
+      map.setLayoutProperty(GOES_LAYER_ID, "visibility", "none");
+      return;
+    }
+    const url = GOES_TILE_URLS[goesMode] || GOES_TILE_URLS.geocolor;
+    const src = map.getSource(GOES_SOURCE_ID);
+    if (src && src.setTiles) src.setTiles([url]);
+    map.setLayoutProperty(GOES_LAYER_ID, "visibility", "visible");
+    // Periodic refresh — re-set tiles spec so MapLibre re-pulls fresh
+    // imagery as GIBS publishes new 10-min frames.
     const interval = window.setInterval(() => {
-      const src = map.getSource(GOES_SOURCE_ID);
-      if (src && src.setTiles) src.setTiles([GOES_TILE_URL]);
+      const s = map.getSource(GOES_SOURCE_ID);
+      if (s && s.setTiles) s.setTiles([url]);
     }, GOES_REFRESH_MS);
     return () => window.clearInterval(interval);
-  }, [showGoes, ready]);
+  }, [goesMode, ready]);
 
   // Render the (cached) track points into the GeoJSON source, clipped at
   // the scrubbed-to time. Cheap effect: just a filter+map over an array.
@@ -1132,20 +1137,35 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
         </button>
         <button
           type="button"
-          title="Toggle GOES-East GeoColor real-time imagery (NASA GIBS, ~10 min)"
-          onClick={() => setShowGoes((v) => !v)}
+          title={
+            "Cycle GOES-East real-time imagery (NASA GIBS, ~10 min):  " +
+            "off → GeoColor (true color) → FireTemp (thermal anomaly)"
+          }
+          onClick={() => {
+            const i = GOES_CYCLE.indexOf(goesMode);
+            setGoesMode(GOES_CYCLE[(i + 1) % GOES_CYCLE.length]);
+          }}
           style={{
             appearance: "none",
             border: "none",
             borderLeft: "1px solid rgba(255,255,255,0.18)",
             cursor: "pointer",
             padding: "6px 10px",
-            background: showGoes ? "rgba(180,160,80,0.22)" : "transparent",
-            color: showGoes ? "#e8d8a8" : "rgba(255,255,255,0.7)",
+            background:
+              goesMode === "off" ? "transparent" :
+              goesMode === "firetemp" ? "rgba(255,90,40,0.30)" :
+              "rgba(180,160,80,0.22)",
+            color:
+              goesMode === "off" ? "rgba(255,255,255,0.7)" :
+              goesMode === "firetemp" ? "#ffd0b8" :
+              "#e8d8a8",
             textTransform: "uppercase",
+            minWidth: 56,
           }}
         >
-          GOES
+          {goesMode === "off" ? "GOES"
+           : goesMode === "firetemp" ? "FIRE"
+           : "GEO"}
         </button>
       </div>
 
