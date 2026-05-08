@@ -77,6 +77,36 @@ async function fetchTrack(apiPath, eid, signal) {
   return r.json();
 }
 
+async function fetchTimeline(apiPath, atIso, signal) {
+  const url = `${API_BASE}${apiPath}/timeline?at=${encodeURIComponent(atIso)}&lookback_minutes=60`;
+  const r = await fetch(url, { signal });
+  if (!r.ok) throw new Error(`timeline ${r.status}`);
+  return r.json();
+}
+
+// Map a /timeline `snapshot` row to the entity shape Workbench feeds the map.
+// /timeline is intentionally lightweight and doesn't include obs IDs / tracks.
+function snapshotToEntity(s) {
+  return {
+    id: s.entity_id,
+    type: s.type,
+    lon: s.lon,
+    lat: s.lat,
+    priority: s.priority_score ?? 0.5,
+    confidence: 1.0,
+    name: s.name,
+    mmsi: s.mmsi,
+    attrs: { mmsi: s.mmsi, name: s.name },
+    first_seen: s.t,
+    last_seen: s.t,
+    notes: "",
+    obs_count: 0,
+    track: [],
+    obs: [],
+    recommendation: null,
+  };
+}
+
 function entityRadius(type) {
   if (type === "vessel" || type === "false_positive") return 4;
   if (type === "fire_event") return 7;
@@ -100,6 +130,13 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
       return DEFAULT_BASEMAP;
     }
   });
+
+  // Time-scrub state. scrubMinutes==0 means "live / now"; positive values
+  // step backward in time (T-1, T-2, ... T-60). When scrubbing we hide the
+  // live `entities` prop and render a snapshot from /maritime/timeline.
+  const [scrubMinutes, setScrubMinutes] = useState(0);
+  const [scrubSnapshot, setScrubSnapshot] = useState(null);
+  const [scrubLoading, setScrubLoading] = useState(false);
 
   // ------------------------------------------------------------------
   // Initialize the map exactly once.
@@ -192,15 +229,47 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
   }, [basemap]);
 
   // ------------------------------------------------------------------
+  // When scrubbing back in time, fetch a /timeline snapshot.
+  // Cancel in-flight on slider change so the last value wins.
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    if (scrubMinutes === 0) {
+      setScrubSnapshot(null);
+      setScrubLoading(false);
+      return;
+    }
+    const ctrl = new AbortController();
+    const at = new Date(Date.now() - scrubMinutes * 60_000).toISOString();
+    setScrubLoading(true);
+    fetchTimeline(cfg.apiPath, at, ctrl.signal)
+      .then((data) => {
+        if (ctrl.signal.aborted) return;
+        setScrubSnapshot((data.snapshot || []).map(snapshotToEntity));
+        setScrubLoading(false);
+      })
+      .catch((err) => {
+        if (err.name === "AbortError") return;
+        // eslint-disable-next-line no-console
+        console.warn("timeline fetch failed:", err);
+        setScrubLoading(false);
+      });
+    return () => ctrl.abort();
+  }, [scrubMinutes, cfg.apiPath]);
+
+  // Source the markers either from live `entities` (now) or the
+  // snapshot fetched for the scrubbed-to time.
+  const renderEntities = scrubSnapshot ?? entities;
+
+  // ------------------------------------------------------------------
   // Sync markers whenever entities change. Reuse existing marker DOM
   // when the entity is unchanged so we don't churn through 1000s of
   // create/destroys every time AISStream pushes a new observation.
   // ------------------------------------------------------------------
   const entitiesById = useMemo(() => {
     const m = new Map();
-    for (const e of entities) m.set(e.id, e);
+    for (const e of renderEntities) m.set(e.id, e);
     return m;
-  }, [entities]);
+  }, [renderEntities]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -208,7 +277,7 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
 
     const liveIds = new Set();
 
-    for (const e of entities) {
+    for (const e of renderEntities) {
       if (typeof e.lon !== "number" || typeof e.lat !== "number") continue;
       liveIds.add(e.id);
 
@@ -285,10 +354,10 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
 
     // First non-empty data → auto-fit. After that, leave the user's pan/zoom
     // alone so refreshes don't snap them out of context.
-    if (!fitDoneRef.current && entities.length > 0) {
+    if (!fitDoneRef.current && renderEntities.length > 0) {
       const bounds = new maplibregl.LngLatBounds();
       let any = false;
-      for (const e of entities) {
+      for (const e of renderEntities) {
         if (typeof e.lon === "number" && typeof e.lat === "number") {
           bounds.extend([e.lon, e.lat]);
           any = true;
@@ -299,7 +368,7 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
         fitDoneRef.current = true;
       }
     }
-  }, [entities, entitiesById, selectedId, cfg, ready, onSelect]);
+  }, [renderEntities, entitiesById, selectedId, cfg, ready, onSelect]);
 
   // ------------------------------------------------------------------
   // Selection change → fetch the track and render it as a polyline.
@@ -420,6 +489,98 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
           );
         })}
       </div>
+
+      {/* Time-scrub slider. Bottom-center, full width. Slider value is
+          minutes-into-the-past (0 = now). Operators slide back to see
+          where vessels were earlier. Hidden if entities is empty so the
+          map looks clean before data lands. */}
+      {renderEntities.length > 0 && (
+        <ScrubBar
+          minutes={scrubMinutes}
+          loading={scrubLoading}
+          live={scrubMinutes === 0}
+          onChange={setScrubMinutes}
+          onLive={() => setScrubMinutes(0)}
+        />
+      )}
+    </div>
+  );
+}
+
+function ScrubBar({ minutes, loading, live, onChange, onLive }) {
+  const label = live
+    ? "live · now"
+    : `T-${minutes} min · ${new Date(Date.now() - minutes * 60_000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        left: "50%",
+        bottom: 12,
+        transform: "translateX(-50%)",
+        display: "flex",
+        alignItems: "center",
+        gap: 12,
+        padding: "8px 14px",
+        background: "rgba(4,8,16,0.82)",
+        border: "1px solid rgba(255,255,255,0.18)",
+        borderRadius: 6,
+        fontFamily:
+          "'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace",
+        fontSize: 11,
+        letterSpacing: "0.06em",
+        color: "rgba(255,255,255,0.85)",
+        zIndex: 1,
+        minWidth: 360,
+      }}
+    >
+      <button
+        type="button"
+        onClick={onLive}
+        disabled={live}
+        title="snap to now"
+        style={{
+          appearance: "none",
+          border: "1px solid rgba(255,255,255,0.25)",
+          background: live ? "rgba(95,208,147,0.18)" : "rgba(255,255,255,0.04)",
+          color: live ? "#cdf2dd" : "rgba(255,255,255,0.85)",
+          padding: "3px 8px",
+          borderRadius: 3,
+          fontSize: 10,
+          fontFamily: "inherit",
+          letterSpacing: "0.08em",
+          cursor: live ? "default" : "pointer",
+          textTransform: "uppercase",
+        }}
+      >
+        live
+      </button>
+      <input
+        type="range"
+        min={0}
+        max={60}
+        step={1}
+        value={minutes}
+        onChange={(e) => onChange(Number(e.target.value))}
+        // Slider is conceptually "minutes ago"; rendering it left=past,
+        // right=now feels right when read like a timeline.
+        style={{
+          flex: 1,
+          accentColor: "#5fd093",
+          direction: "rtl",
+        }}
+      />
+      <span
+        style={{
+          minWidth: 132,
+          textAlign: "right",
+          color: live ? "#5fd093" : loading ? "#f0a830" : "rgba(255,255,255,0.85)",
+          fontVariantNumeric: "tabular-nums",
+        }}
+      >
+        {loading ? "loading…" : label}
+      </span>
     </div>
   );
 }
