@@ -567,6 +567,101 @@ def maritime_lineage(eid: str):
     return data
 
 
+# --- SAR layer ----------------------------------------------------------
+#
+# Two read endpoints for the frontend MapLibre SAR overlay. Returns
+# GeoJSON FeatureCollections so the frontend can hand them straight to
+# maplibre-gl source.setData(). All geometry already in WGS84 (srid=4326).
+
+@app.get("/maritime/sar/scenes")
+def maritime_sar_scenes(
+    state: str | None = None,
+    since_hours: int = 168,
+    limit: int = 50,
+):
+    """Sentinel-1 scene footprints (Polygon GeoJSON). Default = last 7 days
+    of scenes. Filter by state to restrict to e.g. only 'detected'.
+    """
+    from datetime import datetime, timezone, timedelta
+    from sqlalchemy import select as sa_select
+    from geoalchemy2.shape import to_shape
+    from db import models as dbm
+    from db.session import session_scope
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+    q = sa_select(dbm.SarSceneRow).where(dbm.SarSceneRow.acquired_at >= cutoff)
+    if state:
+        q = q.where(dbm.SarSceneRow.state == state)
+    q = q.order_by(dbm.SarSceneRow.acquired_at.desc()).limit(limit)
+
+    features = []
+    with session_scope() as s:
+        rows = s.execute(q).scalars().all()
+        for r in rows:
+            poly = to_shape(r.footprint)
+            attrs = r.attrs or {}
+            features.append({
+                "type": "Feature",
+                "geometry": poly.__geo_interface__,
+                "properties": {
+                    "scene_id": r.scene_id,
+                    "platform": r.platform,
+                    "polarization": r.polarization,
+                    "acquired_at": r.acquired_at.isoformat(),
+                    "state": r.state,
+                    "n_detections": (attrs.get("detection_summary") or {}).get("n_kept"),
+                    "name": attrs.get("name"),
+                },
+            })
+    return {"type": "FeatureCollection", "features": features}
+
+
+@app.get("/maritime/sar/detections")
+def maritime_sar_detections(
+    since_hours: int = 168,
+    scene_id: str | None = None,
+    limit: int = 5000,
+):
+    """SAR detection points (Point GeoJSON). Each detection has rcs_db,
+    length_m, confidence, matched_entity_id.
+
+    matched_entity_id == null → dark vessel candidate (no AIS within fusion
+    window when this scene was processed). Frontend colors these red.
+    """
+    from datetime import datetime, timezone, timedelta
+    from sqlalchemy import select as sa_select
+    from geoalchemy2.shape import to_shape
+    from db import models as dbm
+    from db.session import session_scope
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+    q = sa_select(dbm.SarDetectionRow).where(dbm.SarDetectionRow.detected_at >= cutoff)
+    if scene_id:
+        q = q.where(dbm.SarDetectionRow.scene_id == scene_id)
+    q = q.order_by(dbm.SarDetectionRow.detected_at.desc()).limit(limit)
+
+    features = []
+    with session_scope() as s:
+        rows = s.execute(q).scalars().all()
+        for r in rows:
+            pt = to_shape(r.geom)
+            features.append({
+                "type": "Feature",
+                "geometry": pt.__geo_interface__,
+                "properties": {
+                    "detection_id": r.detection_id,
+                    "scene_id": r.scene_id,
+                    "rcs_db": r.rcs_db,
+                    "length_m": r.length_m,
+                    "confidence": r.confidence,
+                    "matched_entity_id": r.matched_entity_id,
+                    "detected_at": r.detected_at.isoformat(),
+                    "is_dark_vessel": r.matched_entity_id is None,
+                },
+            })
+    return {"type": "FeatureCollection", "features": features}
+
+
 @app.post("/maritime/actions/{eid}/approve")
 def maritime_approve(eid: str, body: DecisionRequest):
     affected = maritime.decide(eid, decision=Decision.APPROVED,
