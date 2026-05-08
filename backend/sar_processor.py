@@ -49,6 +49,7 @@ from urllib.request import Request, urlopen
 import numpy as np
 
 from cfar import CfarConfig, detect_vessels
+import fixed_structures
 
 log = logging.getLogger("sar_processor")
 
@@ -79,6 +80,14 @@ AOI_LON_MIN, AOI_LON_MAX = -98.0, -93.5
 # CFAR PFA — 1e-7 over the tile gives a few false alarms per scene that
 # the cluster filters then knock down to plausible vessel candidates.
 DEFAULT_PFA = 1e-7
+
+# Suppression radius for known offshore platforms. Detections within this
+# distance of a structure in fixed_structures.gulf_offshore_platforms.json
+# are silently dropped during ingest. 200 m comfortably exceeds the GCP
+# geocoder residual (~30 m) plus the IW GRDH pixel footprint (~10 m),
+# while staying tight enough that a vessel transiting near a platform
+# isn't suppressed.
+FIXED_STRUCTURE_RADIUS_M = 200.0
 
 
 # ---------------------------------------------------------------------- helpers
@@ -325,6 +334,10 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
     t0 = time.time()
     n_tiles = 0
     n_raw = 0
+    n_platform_dropped = 0     # detections suppressed via fixed_structures
+    log.info("[%s] platform suppression: %d known structures, radius %.0f m",
+             scene_id, fixed_structures.platform_count(),
+             FIXED_STRUCTURE_RADIUS_M)
 
     log.info("[%s] opening %s", scene_id, inner_tiff)
     with rasterio.open(gdal_path) as src:
@@ -356,6 +369,13 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
                     if not (AOI_LAT_MIN <= lat <= AOI_LAT_MAX
                             and AOI_LON_MIN <= lon <= AOI_LON_MAX):
                         continue
+                    # Drop returns coincident with a known fixed structure
+                    # (oil rig, production platform, light vessel, etc).
+                    # See fixed_structures.py docstring for sourcing notes.
+                    if fixed_structures.is_near_fixed_structure(
+                            lat, lon, radius_m=FIXED_STRUCTURE_RADIUS_M):
+                        n_platform_dropped += 1
+                        continue
                     # Confidence heuristic: scale rcs_db with a squashing function.
                     # rcs 60 dB → 0.5; 80 dB → 0.85; 100 dB → 0.95.
                     conf = 1.0 / (1.0 + math.exp(-(d.rcs_db - 70.0) / 8.0))
@@ -371,8 +391,10 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
                     })
 
     elapsed = time.time() - t0
-    log.info("[%s] CFAR done in %.1fs — %d tiles, %d raw, %d kept",
-             scene_id, elapsed, n_tiles, n_raw, len(detections))
+    log.info("[%s] CFAR done in %.1fs — %d tiles, %d raw, %d kept, "
+             "%d dropped as fixed structures",
+             scene_id, elapsed, n_tiles, n_raw, len(detections),
+             n_platform_dropped)
 
     # 5) Persist
     detected_at = datetime.now(timezone.utc)
@@ -398,6 +420,7 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
                     "n_tiles": n_tiles,
                     "n_raw": n_raw,
                     "n_kept": len(detections),
+                    "n_platform_dropped": n_platform_dropped,
                     "elapsed_s": round(elapsed, 1),
                     "pfa": pfa,
                     "tile_px": tile_px,
