@@ -220,3 +220,190 @@ def record_scenes(scenes: list[dict[str, Any]]) -> dict[str, int]:
             )
 
     return {"inserted": len(new_rows), "skipped_existing": len(rows) - len(new_rows)}
+
+
+# --- Download --------------------------------------------------------
+
+PRODUCT_DOWNLOAD_URL_TPL = (
+    "https://zipper.dataspace.copernicus.eu/odata/v1/Products({scene_id})/$value"
+)
+
+
+def download_scene_to_r2(scene_id: str, *,
+                          http_chunk_size: int = 1 << 20,
+                          part_size: int = 16 * 1024 * 1024,
+                          timeout_s: float = 600.0) -> dict:
+    """True-stream a Sentinel-2 product .SAFE.zip into Cloudflare R2.
+
+    Same multipart-streaming pattern as sar.download_scene_to_r2 — see
+    that docstring for the memory profile + abort semantics. The only
+    deltas: different scene table (s2_scenes), different R2 prefix
+    (s2/scenes/), and the auth singleton is shared (CDSE).
+
+    Updates s2_scenes:
+      raw_url    = r2://bucket/s2/scenes/{scene_id}.SAFE.zip on success
+      state      = 'downloaded' / 'failed'
+      failure_reason populated on error
+
+    Aborts the multipart upload on any exception so we don't leak parts.
+    """
+    # Reuse the SAR module's CDSE auth singleton — same Copernicus account.
+    from sar import auth as cdse_auth
+    from db import archive
+    from db import models as dbm
+    from db.session import session_scope
+
+    if not cdse_auth().is_configured():
+        raise RuntimeError("Copernicus auth not configured")
+    cfg = archive._r2_config()  # noqa: SLF001
+    if cfg is None:
+        raise RuntimeError("R2 not configured (R2_*)")
+
+    tok = cdse_auth().token()
+    if not tok:
+        raise RuntimeError("Copernicus token fetch failed")
+
+    url = PRODUCT_DOWNLOAD_URL_TPL.format(scene_id=scene_id)
+    key = f"s2/scenes/{scene_id}.SAFE.zip"
+    raw_url = f"r2://{cfg['bucket']}/{key}"
+
+    with session_scope() as s:
+        scene = s.get(dbm.S2SceneRow, scene_id)
+        if scene is None:
+            raise RuntimeError(f"s2_scenes row not found: {scene_id}")
+        if scene.state == "downloaded" and scene.raw_url:
+            return {"scene_id": scene_id, "skipped": "already downloaded",
+                    "raw_url": scene.raw_url}
+
+    if part_size < 5 * 1024 * 1024:
+        raise ValueError("S3 part_size must be >= 5 MB")
+
+    client = archive._r2_client(cfg)  # noqa: SLF001
+    bucket = cfg["bucket"]
+
+    log.info("starting multipart upload for S2 scene %s -> %s",
+             scene_id, raw_url)
+    create = client.create_multipart_upload(
+        Bucket=bucket, Key=key, ContentType="application/zip",
+    )
+    upload_id = create["UploadId"]
+
+    parts: list[dict] = []
+    bytes_seen = 0
+    part_buf = bytearray()
+    part_number = 1
+
+    def _flush_part(buf: bytearray, n: int) -> None:
+        if not buf:
+            return
+        resp = client.upload_part(
+            Bucket=bucket, Key=key, UploadId=upload_id,
+            PartNumber=n, Body=bytes(buf),
+        )
+        parts.append({"PartNumber": n, "ETag": resp["ETag"]})
+        log.info("uploaded S2 part %d (%d bytes) for scene %s",
+                 n, len(buf), scene_id)
+
+    try:
+        with httpx.stream(
+            "GET", url, headers={"Authorization": f"Bearer {tok}"},
+            timeout=timeout_s, follow_redirects=True,
+        ) as r:
+            r.raise_for_status()
+            for chunk in r.iter_bytes(http_chunk_size):
+                if not chunk:
+                    continue
+                part_buf.extend(chunk)
+                bytes_seen += len(chunk)
+                while len(part_buf) >= part_size:
+                    head = part_buf[:part_size]
+                    del part_buf[:part_size]
+                    _flush_part(head, part_number)
+                    part_number += 1
+        if part_buf:
+            _flush_part(part_buf, part_number)
+            part_number += 1
+
+        if not parts:
+            raise RuntimeError("download produced 0 bytes")
+
+        client.complete_multipart_upload(
+            Bucket=bucket, Key=key, UploadId=upload_id,
+            MultipartUpload={"Parts": parts},
+        )
+    except Exception as exc:  # noqa: BLE001
+        try:
+            client.abort_multipart_upload(
+                Bucket=bucket, Key=key, UploadId=upload_id,
+            )
+        except Exception as abort_exc:  # noqa: BLE001
+            log.warning("abort_multipart_upload also failed for %s: %s",
+                        scene_id, abort_exc)
+        with session_scope() as s:
+            scene = s.get(dbm.S2SceneRow, scene_id)
+            if scene is not None:
+                scene.state = "failed"
+                scene.failure_reason = f"{type(exc).__name__}: {exc}"[:500]
+        log.exception("S2 download failed for %s", scene_id)
+        raise
+
+    with session_scope() as s:
+        scene = s.get(dbm.S2SceneRow, scene_id)
+        if scene is not None:
+            scene.raw_url = raw_url
+            scene.state = "downloaded"
+            scene.failure_reason = None
+            scene.attrs = {**(scene.attrs or {}),
+                           "bytes_uploaded": bytes_seen,
+                           "parts": len(parts)}
+
+    log.info("downloaded S2 scene %s -> %s (%d bytes, %d parts)",
+             scene_id, raw_url, bytes_seen, len(parts))
+    return {"scene_id": scene_id, "raw_url": raw_url,
+            "bytes": bytes_seen, "parts": len(parts), "key": key}
+
+
+# --- Best-match lookup ----------------------------------------------
+
+def find_nearest_s2_for_sar_scene(sar_scene_id: str, *,
+                                   max_days: int = 3,
+                                   max_cloud_pct: float = 40.0) -> str | None:
+    """Find the S2 scene whose acquired_at is closest to a SAR scene's
+    acquired_at AND whose footprint overlaps. Used to suggest visual
+    confirmation imagery for SAR detections.
+
+    Returns the S2 scene_id or None.
+    """
+    from datetime import timedelta
+    from sqlalchemy import select as sa_select, or_, func
+    from geoalchemy2.functions import ST_Intersects
+
+    from db import models as dbm
+    from db.session import session_scope
+
+    with session_scope() as s:
+        sar_scene = s.get(dbm.SarSceneRow, sar_scene_id)
+        if sar_scene is None:
+            return None
+        sar_t = sar_scene.acquired_at
+        window_lo = sar_t - timedelta(days=max_days)
+        window_hi = sar_t + timedelta(days=max_days)
+
+        rows = s.execute(
+            sa_select(dbm.S2SceneRow.scene_id, dbm.S2SceneRow.acquired_at)
+            .where(
+                dbm.S2SceneRow.acquired_at >= window_lo,
+                dbm.S2SceneRow.acquired_at <= window_hi,
+                or_(
+                    dbm.S2SceneRow.cloud_cover_pct.is_(None),
+                    dbm.S2SceneRow.cloud_cover_pct <= max_cloud_pct,
+                ),
+                # Footprints overlap.
+                ST_Intersects(dbm.S2SceneRow.footprint, sar_scene.footprint),
+            )
+        ).all()
+        if not rows:
+            return None
+        # Pick the one closest in time to the SAR pass.
+        rows.sort(key=lambda r: abs((r.acquired_at - sar_t).total_seconds()))
+        return rows[0].scene_id

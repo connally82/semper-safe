@@ -396,10 +396,13 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
       if (!f) return;
       const p = f.properties || {};
       const dark = p.matched_entity_id == null;
+      // Cache-busting param ensures we don't see stale cached chips
+      // across detection_id reuses (which shouldn't happen but is cheap).
+      const chipUrl = `${API_BASE}/maritime/sar/detections/${p.detection_id}/optical_chip`;
       const html = `
         <div style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;
                     font-size:11px;letter-spacing:0.04em;color:#040810;
-                    min-width:200px;">
+                    min-width:280px;">
           <div style="font-weight:bold;color:${dark ? "#a02030" : "#1a6a3a"};
                       text-transform:uppercase;margin-bottom:4px;">
             ${dark ? "Dark vessel candidate" : "AIS-matched detection"}
@@ -411,9 +414,22 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
             ? `<div>Match: <code>${p.matched_entity_id}</code></div>`
             : ""}
           <div style="margin-top:4px;color:#666;">scene ${(p.scene_id || "").slice(0, 8)}…</div>
+          <div style="margin-top:8px;border-top:1px solid #ddd;padding-top:6px;">
+            <div style="font-size:10px;color:#666;text-transform:uppercase;letter-spacing:0.06em;
+                        margin-bottom:3px;">
+              Sentinel-2 daylight chip
+            </div>
+            <img
+              src="${chipUrl}"
+              alt="Sentinel-2 optical chip"
+              style="display:block;width:260px;height:auto;background:#222;
+                     border:1px solid #ddd;border-radius:3px;"
+              onerror="this.outerHTML='<div style=&quot;color:#999;font-size:10px;padding:8px;background:#f0f0f0;border-radius:3px;&quot;>No optical match (closest S2 not downloaded yet, or no clear-sky pass within ±3 days)</div>'"
+            />
+          </div>
         </div>
       `;
-      new maplibregl.Popup({ closeButton: true, maxWidth: "260px" })
+      new maplibregl.Popup({ closeButton: true, maxWidth: "320px" })
         .setLngLat(f.geometry.coordinates)
         .setHTML(html)
         .addTo(map);

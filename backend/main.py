@@ -1120,6 +1120,112 @@ def admin_s2_scenes(
     return {"count": len(out), "scenes": out}
 
 
+def _do_s2_download(scene_id: str) -> None:
+    """Background-task body for streaming an S2 scene to R2."""
+    try:
+        result = s2.download_scene_to_r2(scene_id)
+        audit_log.append(
+            actor="admin", event_type="s2_scene_downloaded",
+            payload={"scene_id": scene_id,
+                     "bytes": result.get("bytes"),
+                     "parts": result.get("parts"),
+                     "skipped": result.get("skipped")},
+        )
+        log.info("admin S2 download done: %s", result)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("admin S2 download failed: %s", exc)
+
+
+@app.post("/admin/s2/download/{scene_id}", status_code=202)
+def admin_s2_download(
+    scene_id: str,
+    background_tasks: BackgroundTasks,
+    x_admin_token: str | None = Header(default=None),
+):
+    """Kick off a Sentinel-2 scene multipart download to R2.
+
+    Returns 202; the actual transfer (~5 min for a 1 GB L2A scene) runs
+    as a FastAPI BackgroundTask so the AIS / health-check loops keep
+    ticking. Watch s2_scenes.state to see 'discovered' → 'downloaded'.
+    """
+    _require_admin(x_admin_token)
+    background_tasks.add_task(_do_s2_download, scene_id)
+    return {"scene_id": scene_id, "status": "queued",
+            "tip": "poll s2_scenes.state for completion"}
+
+
+@app.get("/maritime/sar/detections/{detection_id}/optical_chip")
+def maritime_sar_optical_chip(
+    detection_id: str,
+    half_size_m: float = 1500.0,
+):
+    """Serve a Sentinel-2 RGB chip centered on the SAR detection.
+
+    Returns image/jpeg on success. Returns 404 if the detection or
+    matching S2 scene doesn't exist; 202 (with body) if the matching
+    S2 scene hasn't been downloaded yet — caller should re-poll after
+    triggering /admin/s2/download/{scene_id}.
+
+    First request for a given detection generates the chip and caches
+    it in R2; subsequent requests are served from cache (~ms).
+    """
+    from fastapi.responses import Response, JSONResponse
+    from sqlalchemy import select as sa_select
+    from geoalchemy2.shape import to_shape
+    from db import models as dbm
+    from db.session import session_scope
+
+    with session_scope() as s:
+        det = s.execute(
+            sa_select(dbm.SarDetectionRow)
+            .where(dbm.SarDetectionRow.detection_id == detection_id)
+        ).scalar_one_or_none()
+        if det is None:
+            raise HTTPException(404, f"detection not found: {detection_id}")
+        sar_scene_id = det.scene_id
+        pt = to_shape(det.geom)
+        det_lat, det_lon = pt.y, pt.x
+
+    s2_scene_id = s2.find_nearest_s2_for_sar_scene(sar_scene_id,
+                                                     max_days=3,
+                                                     max_cloud_pct=40.0)
+    if s2_scene_id is None:
+        raise HTTPException(
+            404,
+            "no Sentinel-2 scene within ±3 days and ≤40% cloud "
+            "overlaps this detection's SAR scene",
+        )
+
+    # Make sure the matched S2 scene is downloaded.
+    with session_scope() as s:
+        s2_scene = s.get(dbm.S2SceneRow, s2_scene_id)
+        if s2_scene is None or s2_scene.state != "downloaded":
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "status": "s2_scene_not_yet_downloaded",
+                    "s2_scene_id": s2_scene_id,
+                    "tip": "POST /admin/s2/download/{scene_id} then retry",
+                },
+            )
+
+    import s2_processor
+    try:
+        chip = s2_processor.extract_chip(
+            detection_id, s2_scene_id, det_lat, det_lon,
+            half_size_m=half_size_m,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("optical_chip generation failed: %s", exc)
+        raise HTTPException(500, f"chip generation failed: {exc}")
+
+    return Response(
+        content=chip,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @app.post("/admin/sar/discover")
 def admin_sar_discover(x_admin_token: str | None = Header(default=None)):
     """Manually trigger a Sentinel-1 catalog discovery sweep."""
