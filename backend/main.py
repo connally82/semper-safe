@@ -58,6 +58,8 @@ _audit_archive_task: asyncio.Task[None] | None = None
 _audit_archive_cancel: asyncio.Event | None = None
 _sar_discover_task: asyncio.Task[None] | None = None
 _sar_discover_cancel: asyncio.Event | None = None
+_sar_auto_process_task: asyncio.Task[None] | None = None
+_sar_auto_process_cancel: asyncio.Event | None = None
 
 # How often to scan maritime entities for AIS dropouts. The sweep is cheap
 # (in-memory iteration over self.entities); the real cost is the audit/store
@@ -84,6 +86,27 @@ AUDIT_ARCHIVE_DRAIN_CAP = 50  # max archive_audit_chain() calls per tick (safety
 # credentials are configured. Sentinel-1 has 6-day repeat over a given
 # area, so a 6-hour cadence comfortably catches every pass.
 SAR_DISCOVERY_INTERVAL_S = int(os.environ.get("SAR_DISCOVERY_INTERVAL_S", "21600"))
+
+# Sentinel-1 auto-process loop: every 30 min, pick the freshest discovered
+# scene that fits our memory budget and run it through download → CFAR →
+# fusion serially. Off by default (SAR_AUTO_PROCESS=1 to enable) so we
+# stay in manual mode until we trust the pipeline; once on, the platform
+# turns into a "set it and forget it" SAR vessel monitor. The 30-min
+# interval is gated by per-scene wall clock — typical scene takes
+# ~5 min download + ~8 min CFAR ≈ 13 min, so 30-min cadence leaves
+# plenty of headroom for AIS ingest + audit archive.
+SAR_AUTO_PROCESS = os.environ.get("SAR_AUTO_PROCESS") == "1"
+SAR_AUTO_PROCESS_INTERVAL_S = int(os.environ.get("SAR_AUTO_PROCESS_INTERVAL_S", "1800"))
+# Memory cap for an auto-processable scene. CFAR peak per 2048 tile is
+# ~130 MB; baseline ~400 MB; we want under 1 GB peak so reject huge
+# scenes (>1.2 GB downloaded). Manual /admin/sar/process can still
+# run them after careful operator triage.
+SAR_AUTO_MAX_BYTES = int(os.environ.get("SAR_AUTO_MAX_BYTES", str(1_200_000_000)))
+# Only auto-process scenes acquired within this window. Older scenes
+# have no AIS data left in the 24-h retention window, so fusion can't
+# match — they'd produce all-dark detections (real, but uninteresting
+# for live ops). Operator can still backfill via manual endpoints.
+SAR_AUTO_MAX_AGE_HOURS = int(os.environ.get("SAR_AUTO_MAX_AGE_HOURS", "48"))
 
 # In-memory cache window: keep only recent observations in
 # engine.observations to bound RAM. Evicted obs still live in Postgres
@@ -169,6 +192,136 @@ async def _sar_discover_loop(cancel: asyncio.Event) -> None:
                 log.exception("SAR discovery crashed: %s", exc)
         # Subsequent runs: every SAR_DISCOVERY_INTERVAL_S.
         first_delay = SAR_DISCOVERY_INTERVAL_S
+
+
+async def _sar_auto_process_loop(cancel: asyncio.Event) -> None:
+    """Serial auto-process pipeline: pick a discovered scene and run it
+    through download → CFAR → fusion end-to-end on each tick.
+
+    Why serial: each stage is sync numpy/boto3/Postgres. Running two
+    scenes in parallel would double per-tile CFAR memory, blowing the
+    1 GB Fly VM. Operator-triggered admin endpoints still work
+    independently — they hit the same idempotency guards in
+    sar_processor (state machine on sar_scenes), so concurrent manual +
+    auto runs won't stomp on each other.
+
+    Selection criteria per tick (see sar_auto_pick_next):
+      - state = 'discovered' (catalog row exists, no R2 object yet)
+      - failure_reason IS NULL (skip prior fails — re-attempt manually)
+      - content_length < SAR_AUTO_MAX_BYTES (memory headroom)
+      - acquired_at within SAR_AUTO_MAX_AGE_HOURS (so AIS data is still
+        in the 24-h retention window — older scenes go all-dark, less
+        useful for live ops)
+      - sorted by acquired_at desc (freshest first)
+
+    Loop logic:
+      - sleep SAR_AUTO_PROCESS_INTERVAL_S, then run
+      - if no eligible scene, just log + sleep again
+      - on download error: mark state='failed' with reason, continue
+      - on CFAR error: state stays 'downloaded', continue (re-runnable
+        via /admin/sar/process)
+      - all exceptions caught — never let the loop die
+    """
+    # Don't start hammering Copernicus + R2 the moment uvicorn comes up;
+    # let bootstrap finish + AIS settle first. Match the 60-s warmup the
+    # discovery loop uses.
+    first_delay = 90
+    while not cancel.is_set():
+        try:
+            await asyncio.wait_for(cancel.wait(), timeout=first_delay)
+        except asyncio.TimeoutError:
+            try:
+                await _sar_auto_process_one()
+            except Exception as exc:  # noqa: BLE001
+                log.exception("SAR auto-process tick crashed: %s", exc)
+        first_delay = SAR_AUTO_PROCESS_INTERVAL_S
+
+
+def _sar_auto_pick_next() -> str | None:
+    """Return the scene_id of the next eligible scene, or None.
+
+    Sync helper — call from a thread via asyncio.to_thread.
+    """
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy import select as sa_select, and_
+    from db import models as dbm
+    from db.session import session_scope
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=SAR_AUTO_MAX_AGE_HOURS)
+    with session_scope() as s:
+        # We can't filter by content_length_bytes in SQL because it's
+        # nested in attrs JSONB. Pull a small candidate set and filter
+        # in Python — eligible scenes are usually <10 per tick.
+        rows = s.execute(
+            sa_select(dbm.SarSceneRow)
+            .where(and_(
+                dbm.SarSceneRow.state == "discovered",
+                dbm.SarSceneRow.failure_reason.is_(None),
+                dbm.SarSceneRow.acquired_at >= cutoff,
+            ))
+            .order_by(dbm.SarSceneRow.acquired_at.desc())
+            .limit(20)
+        ).scalars().all()
+        for r in rows:
+            sz = (r.attrs or {}).get("content_length_bytes") or 0
+            if 0 < sz <= SAR_AUTO_MAX_BYTES:
+                return r.scene_id
+    return None
+
+
+async def _sar_auto_process_one() -> None:
+    """Run download → CFAR → fusion for one auto-eligible scene, if any.
+
+    The download and process steps are sync (boto3 + numpy hold the GIL)
+    so we hand them to a threadpool worker via asyncio.to_thread. The
+    main asyncio loop keeps serving health checks + AIS ingest during
+    the 5-minute download and 8-minute CFAR pass — same pattern as the
+    /admin/sar/process BackgroundTask path.
+    """
+    import sar
+    import sar_processor
+
+    scene_id = await asyncio.to_thread(_sar_auto_pick_next)
+    if scene_id is None:
+        log.info("SAR auto-process: no eligible scene this tick")
+        return
+
+    log.info("SAR auto-process: starting %s", scene_id)
+    audit_log.append(
+        actor="system", event_type="sar_auto_pipeline_started",
+        payload={"scene_id": scene_id},
+    )
+
+    try:
+        dl = await asyncio.to_thread(sar.download_scene_to_r2, scene_id)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("SAR auto-process: download failed for %s: %s",
+                      scene_id, exc)
+        # download_scene_to_r2 already records failure_reason on the row.
+        return
+    log.info("SAR auto-process: downloaded %s — %s",
+             scene_id, {k: dl.get(k) for k in ("bytes", "parts", "skipped")})
+
+    try:
+        proc = await asyncio.to_thread(
+            sar_processor.process_scene, scene_id,
+            fuse_engine=maritime,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("SAR auto-process: CFAR failed for %s: %s",
+                      scene_id, exc)
+        return
+
+    audit_log.append(
+        actor="system", event_type="sar_auto_pipeline_completed",
+        payload={
+            "scene_id": scene_id,
+            "n_detections": proc.get("n_detections"),
+            "fusion": proc.get("fusion"),
+        },
+    )
+    log.info("SAR auto-process: %s done — %d detections, fusion=%s",
+             scene_id, proc.get("n_detections"), proc.get("fusion"))
 
 
 async def _audit_archive_loop(cancel: asyncio.Event) -> None:
@@ -323,6 +476,7 @@ def _bootstrap():
         global _retention_task, _retention_cancel
         global _audit_archive_task, _audit_archive_cancel
         global _sar_discover_task, _sar_discover_cancel
+        global _sar_auto_process_task, _sar_auto_process_cancel
         _aisstream_cancel = asyncio.Event()
 
         async def _on_observation(obs):
@@ -389,6 +543,22 @@ def _bootstrap():
             )
             log.info("SAR discovery task started (every %ds)",
                      SAR_DISCOVERY_INTERVAL_S)
+
+            # Sentinel-1 auto-process pipeline — opt-in, requires
+            # Copernicus auth + R2 to actually do anything. Runs the
+            # discover→download→CFAR→fuse sequence on a 30-min cadence.
+            if SAR_AUTO_PROCESS:
+                _sar_auto_process_cancel = asyncio.Event()
+                _sar_auto_process_task = loop.create_task(
+                    _sar_auto_process_loop(_sar_auto_process_cancel)
+                )
+                log.info("SAR auto-process task started "
+                         "(every %ds, max %.1f GB, max age %dh)",
+                         SAR_AUTO_PROCESS_INTERVAL_S,
+                         SAR_AUTO_MAX_BYTES / 1e9,
+                         SAR_AUTO_MAX_AGE_HOURS)
+            else:
+                log.info("SAR_AUTO_PROCESS not set; auto pipeline disabled")
     else:
         log.info("AISSTREAM_API_KEY not set; skipping AIS ingestion + gap sweep + retention")
 
@@ -400,14 +570,15 @@ async def _shutdown():
     global _retention_task, _retention_cancel
     global _audit_archive_task, _audit_archive_cancel
     global _sar_discover_task, _sar_discover_cancel
+    global _sar_auto_process_task, _sar_auto_process_cancel
     for cancel in (_aisstream_cancel, _gap_sweeper_cancel,
                    _retention_cancel, _audit_archive_cancel,
-                   _sar_discover_cancel):
+                   _sar_discover_cancel, _sar_auto_process_cancel):
         if cancel is not None:
             cancel.set()
     for task in (_aisstream_task, _gap_sweeper_task,
                  _retention_task, _audit_archive_task,
-                 _sar_discover_task):
+                 _sar_discover_task, _sar_auto_process_task):
         if task is not None:
             task.cancel()
             try:
