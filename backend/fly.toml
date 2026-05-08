@@ -53,6 +53,12 @@ primary_region = "dfw"
 
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "256mb"
+  # 256mb was OOM-killing uvicorn within ~12 min of AISStream ingest because
+  # engine.observations held every observation in memory unbounded. 512mb
+  # keeps us within Fly's free hobby allowance (3x shared-cpu-1x@256mb ~=
+  # 1x shared-cpu-1x@768mb of credit; we're at 512mb). Real fix is bounding
+  # the in-memory cache (filed as a follow-up); this is the immediate
+  # stabilization.
+  memory = "512mb"
   cpu_kind = "shared"
   cpus = 1
