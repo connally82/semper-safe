@@ -795,8 +795,39 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
       const strokeWidth = isSelected ? 2 : 1;
       const cross = e.type === "false_positive";
 
+      // Heading: prefer true_heading (compass), fall back to AIS heading
+      // attribute, then COG (course over ground). AISStream sometimes
+      // ships any of the three. Heading 511 is "not available" per
+      // ITU-R M.1371; we treat that as null.
+      const a = e.attrs || {};
+      const rawHeading = (
+        a.true_heading ?? a.heading ?? a.cog_deg ?? a.cog ?? null
+      );
+      const headingDeg = (typeof rawHeading === "number"
+                          && rawHeading >= 0
+                          && rawHeading < 360
+                          && rawHeading !== 511)
+        ? rawHeading : null;
+      // Only show arrows for moving vessels — anchored / moored boats
+      // would have stale heading. Speed > 1 kn ≈ "actually under way".
+      const speed = a.speed_kn ?? a.sog_kn ?? null;
+      const showArrow = (
+        headingDeg != null
+        && (e.type === "vessel" || e.type === "ais_gap")
+        && (speed == null || speed > 1.0)
+      );
+      // SVG arrow: a chevron 0..-12 along the y axis (north). Outer
+      // <g transform="rotate(N)"> rotates it to the heading direction.
+      const arrowSvg = showArrow ? `
+        <g transform="rotate(${headingDeg})">
+          <path d="M 0 -${r + 8} L -3 -${r + 1} L 3 -${r + 1} Z"
+                fill="${meta.color}"
+                stroke="${stroke}" stroke-width="0.8"
+                stroke-linejoin="round" />
+        </g>` : "";
+
       el.innerHTML = `
-        <svg viewBox="-10 -10 20 20" width="16" height="16"
+        <svg viewBox="-12 -12 24 24" width="20" height="20"
              style="overflow:visible;display:block;">
           ${meta.glow ? `<circle r="14" fill="${meta.color}" opacity="0.18"/>` : ""}
           ${isSelected ? `<circle r="${r + 5}" fill="none"
@@ -813,9 +844,16 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
                      </g>`
                   : `<circle r="${r}" fill="${meta.color}"
                               stroke="${stroke}" stroke-width="${strokeWidth}"/>`}
+          ${arrowSvg}
         </svg>
       `;
-      el.title = `${meta.label || e.type}${e.name ? ` — ${e.name}` : ""}`;
+      el.title = `${meta.label || e.type}${e.name ? ` — ${e.name}` : ""}` +
+                 `${headingDeg != null ? ` · ${Math.round(headingDeg)}°` : ""}` +
+                 `${speed != null ? ` · ${Number(speed).toFixed(1)} kn` : ""}`;
+      // Bump marker size to 20px to accommodate the arrow without
+      // clipping; CSS controls per-marker sizing on the button el.
+      el.style.width = "20px";
+      el.style.height = "20px";
     }
 
     // Remove markers that are no longer in the entity set.
