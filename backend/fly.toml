@@ -53,12 +53,13 @@ primary_region = "dfw"
 
 [[vm]]
   size = "shared-cpu-1x"
-  # 256mb was OOM-killing uvicorn within ~12 min of AISStream ingest because
-  # engine.observations held every observation in memory unbounded. 512mb
-  # keeps us within Fly's free hobby allowance (3x shared-cpu-1x@256mb ~=
-  # 1x shared-cpu-1x@768mb of credit; we're at 512mb). Real fix is bounding
-  # the in-memory cache (filed as a follow-up); this is the immediate
-  # stabilization.
-  memory = "512mb"
+  # 256mb → 512mb after observations dict OOM (see git log).
+  # 512mb → 1024mb (Phase 4.3): rasterio/GDAL + 4096^2 float32 CFAR tile
+  # arrays + the live AIS engine state would not coexist under 1 GB. Each
+  # tile peaks ~225 MB; with the integral images plus the rest of the
+  # process we sit ~600 MB while detecting and stay under headroom.
+  # Without this, the machine OOM-kills mid-detection or right at boot
+  # when the now-larger DB state loads.
+  memory = "1024mb"
   cpu_kind = "shared"
   cpus = 1
