@@ -17,9 +17,46 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 
-// OpenFreeMap dark style — fully free, no API key, vector tiles.
-// Falls back to a minimal gray raster if OFM is ever down.
-const STYLE_URL = "https://tiles.openfreemap.org/styles/dark";
+// Two basemap options. User can flip between them at runtime.
+//   dark — OpenFreeMap vector (free, no key). Clean operator UI for triage.
+//   satellite — Esri World Imagery raster (free, attribution required).
+//     Same provider Maxar uses for its Vivid product. Imagery is months
+//     to years old (NOT real-time satellite — see operator notes).
+const BASEMAPS = {
+  dark: {
+    label: "Dark",
+    style: "https://tiles.openfreemap.org/styles/dark",
+  },
+  satellite: {
+    label: "Satellite",
+    style: {
+      version: 8,
+      sources: {
+        "esri-world-imagery": {
+          type: "raster",
+          tiles: [
+            "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+          ],
+          tileSize: 256,
+          maxzoom: 19,
+          attribution:
+            "Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ, GeoEye, Earthstar Geographics, USGS, AeroGRID, IGN, IGP",
+        },
+      },
+      layers: [
+        {
+          id: "esri-world-imagery-layer",
+          type: "raster",
+          source: "esri-world-imagery",
+        },
+      ],
+      glyphs:
+        "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
+    },
+  },
+};
+const DEFAULT_BASEMAP = "satellite";
+const BASEMAP_STORAGE_KEY = "ss-basemap";
 
 // Default view: Texas shoreline AOI center + zoom that shows Galveston Bay
 // to Brownsville on a typical screen.
@@ -53,6 +90,17 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
   const fitDoneRef = useRef(false);          // only auto-fit once on first data
   const [ready, setReady] = useState(false);
 
+  // Basemap pick — persisted across sessions.
+  const [basemap, setBasemap] = useState(() => {
+    if (typeof window === "undefined") return DEFAULT_BASEMAP;
+    try {
+      const saved = window.localStorage.getItem(BASEMAP_STORAGE_KEY);
+      return saved && BASEMAPS[saved] ? saved : DEFAULT_BASEMAP;
+    } catch {
+      return DEFAULT_BASEMAP;
+    }
+  });
+
   // ------------------------------------------------------------------
   // Initialize the map exactly once.
   // ------------------------------------------------------------------
@@ -61,7 +109,7 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
 
     const map = new maplibregl.Map({
       container: containerRef.current,
-      style: STYLE_URL,
+      style: BASEMAPS[basemap].style,
       center: DEFAULT_CENTER,
       zoom: DEFAULT_ZOOM,
       attributionControl: { compact: true },
@@ -73,49 +121,42 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
     map.addControl(new maplibregl.ScaleControl({ unit: "nautical" }), "bottom-left");
 
-    map.on("load", () => {
-      // Pre-create the track source + layers so the selection-change effect
-      // just calls setData(). Empty FeatureCollection until something is
-      // selected and its track lands.
-      if (!map.getSource(TRACK_SOURCE_ID)) {
-        map.addSource(TRACK_SOURCE_ID, {
-          type: "geojson",
-          data: { type: "FeatureCollection", features: [] },
-        });
-        // Track polyline. Color is set per-render via setPaintProperty.
-        map.addLayer({
-          id: TRACK_LAYER_ID,
-          type: "line",
-          source: TRACK_SOURCE_ID,
-          filter: ["==", "$type", "LineString"],
-          paint: {
-            "line-color": "#5fd093",
-            "line-width": 2,
-            "line-opacity": 0.85,
-          },
-          layout: {
-            "line-cap": "round",
-            "line-join": "round",
-          },
-        });
-        // Small dot at every observation along the track. Helps operators
-        // see how recently the vessel reported (denser dots = chattier AIS).
-        map.addLayer({
-          id: TRACK_HEAD_LAYER_ID,
-          type: "circle",
-          source: TRACK_SOURCE_ID,
-          filter: ["==", "$type", "Point"],
-          paint: {
-            "circle-color": "#5fd093",
-            "circle-radius": 2.5,
-            "circle-opacity": 0.7,
-            "circle-stroke-color": "#040810",
-            "circle-stroke-width": 0.5,
-          },
-        });
-      }
-      setReady(true);
-    });
+    // setStyle() wipes all sources/layers, so re-attach them whenever a
+    // new style finishes loading. Same code path used on initial load.
+    const ensureTrackLayers = () => {
+      if (map.getSource(TRACK_SOURCE_ID)) return;
+      map.addSource(TRACK_SOURCE_ID, {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      map.addLayer({
+        id: TRACK_LAYER_ID,
+        type: "line",
+        source: TRACK_SOURCE_ID,
+        filter: ["==", "$type", "LineString"],
+        paint: {
+          "line-color": "#5fd093",
+          "line-width": 2,
+          "line-opacity": 0.85,
+        },
+        layout: { "line-cap": "round", "line-join": "round" },
+      });
+      map.addLayer({
+        id: TRACK_HEAD_LAYER_ID,
+        type: "circle",
+        source: TRACK_SOURCE_ID,
+        filter: ["==", "$type", "Point"],
+        paint: {
+          "circle-color": "#5fd093",
+          "circle-radius": 2.5,
+          "circle-opacity": 0.7,
+          "circle-stroke-color": "#040810",
+          "circle-stroke-width": 0.5,
+        },
+      });
+    };
+    map.on("style.load", ensureTrackLayers);
+    map.on("load", () => setReady(true));
     map.on("error", (e) => {
       // OpenFreeMap occasionally returns 503 during deploys; degrade silently.
       // eslint-disable-next-line no-console
@@ -133,6 +174,22 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
       fitDoneRef.current = false;
     };
   }, []);
+
+  // ------------------------------------------------------------------
+  // Apply the chosen basemap. setStyle() wipes layers; the 'style.load'
+  // listener above re-adds the track source/layers. Markers are DOM
+  // elements layered on top of the canvas, so they survive style swaps.
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    map.setStyle(BASEMAPS[basemap].style);
+    try {
+      window.localStorage.setItem(BASEMAP_STORAGE_KEY, basemap);
+    } catch {
+      // localStorage may be disabled in some contexts; silently ignore.
+    }
+  }, [basemap]);
 
   // ------------------------------------------------------------------
   // Sync markers whenever entities change. Reuse existing marker DOM
@@ -309,7 +366,6 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
 
   return (
     <div
-      ref={containerRef}
       style={{
         position: "relative",
         flex: 1,
@@ -317,6 +373,53 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
         overflow: "hidden",
         minHeight: 0,
       }}
-    />
+    >
+      <div
+        ref={containerRef}
+        style={{ position: "absolute", inset: 0 }}
+      />
+      {/* Basemap picker. Top-left so it doesn't collide with the
+          NavigationControl (top-right) or the ScaleControl (bottom-left). */}
+      <div
+        style={{
+          position: "absolute",
+          top: 8,
+          left: 8,
+          display: "flex",
+          gap: 1,
+          background: "rgba(4,8,16,0.78)",
+          border: "1px solid rgba(255,255,255,0.18)",
+          borderRadius: 4,
+          overflow: "hidden",
+          fontFamily:
+            "'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace",
+          fontSize: 11,
+          letterSpacing: "0.06em",
+          zIndex: 1,
+        }}
+      >
+        {Object.entries(BASEMAPS).map(([key, def]) => {
+          const active = key === basemap;
+          return (
+            <button
+              key={key}
+              type="button"
+              onClick={() => setBasemap(key)}
+              style={{
+                appearance: "none",
+                border: "none",
+                cursor: "pointer",
+                padding: "6px 10px",
+                background: active ? "rgba(95,208,147,0.18)" : "transparent",
+                color: active ? "#cdf2dd" : "rgba(255,255,255,0.7)",
+                textTransform: "uppercase",
+              }}
+            >
+              {def.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
   );
 }
