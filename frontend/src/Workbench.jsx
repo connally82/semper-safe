@@ -77,6 +77,10 @@ const DOMAINS = {
       // (that's "AIS gap"), not blue (that's "underway"). Glow on so
       // the eye picks it out of a dense vessel cluster at port approach.
       loitering_vessel: { color: "#c08bdc", label: "LOITERING",        glow: true },
+      // Cyan-pink for SPOOFED — visually distinct from every other
+      // anomaly so an operator can scan a dense map and pick out
+      // "the vessel that's lying about its position" instantly.
+      ais_spoofed:      { color: "#ff5cd2", label: "AIS SPOOFED",      glow: true },
     },
     actionLabel: {
       task_sar_satellite: "Task SAR satellite",

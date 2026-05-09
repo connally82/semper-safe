@@ -79,6 +79,38 @@ LOITERING_SPEED_KN = 0.5
 LOITERING_DISTANCE_M = 100.0
 LOITERING_THRESHOLD = timedelta(hours=6)
 
+# AIS spoofing detection. Sanctioned tankers, illegal-fishing operators,
+# and surveillance vessels routinely spoof AIS — falsifying position,
+# MMSI, or ship_type. Three signals are easy to catch from the message
+# stream alone:
+#
+#   1. **Implausible speed.** Position jumps that imply >SPOOF_MAX_SPEED_KN
+#      between consecutive reports. The fastest commercial cargo cruises
+#      at ~24 kn. Even a stratified-charged offshore patrol boat tops out
+#      around 60 kn. We use 80 kn as a generous floor to ensure we're only
+#      flagging clearly-bogus jumps and not GPS jitter or slow first-fix
+#      acquisition. (Caveat: legitimate "AIS off, then on with stale
+#      cached position" can also produce a teleport — combined with the
+#      `dt > 0` and `dt < 1h` window this is rare.)
+#
+#   2. **Lat/lon at (0, 0).** ITU-R M.1371 defines (lat=91°, lon=181°)
+#      as "not available", but malfunctioning transmitters and some
+#      spoof tools default to literal (0, 0) — the so-called
+#      "Null Island" cluster. Filtered upstream in aisstream.py for
+#      Texas-AOI ingest, but we belt-and-suspenders here for any
+#      out-of-band sources.
+#
+#   3. **MMSI of all zeros / non-ITU prefix.** ITU-R M.1371 reserves
+#      MMSI prefixes by maritime ID country code. MMSI=0 or
+#      111111111 / 999999999 are common spoofing tells.
+#
+# We start with (1) — the cleanest, most operationally interesting signal.
+# (2) and (3) are a Phase 5 follow-up; the message ingestor would benefit
+# from them more than the fusion engine.
+SPOOF_MAX_SPEED_KN = 80.0
+SPOOF_MIN_DT_S = 5.0       # below this, GPS reporting jitter dominates
+SPOOF_MAX_DT_S = 3600.0    # above 1h, position changes mean nothing
+
 
 def gap_threshold_for(ent: Entity) -> timedelta:
     """Pick the AIS gap threshold appropriate for the entity's last-known
@@ -195,6 +227,64 @@ class FusionEngine:
 
         ent = self.entities[eid]
         prev_geom = ent.geom
+        prev_t = ent.last_seen
+
+        # AIS spoof detection: compute implied speed from prev → new
+        # position. We do this BEFORE updating ent.geom/last_seen so the
+        # old reference point is still intact. A teleport doesn't reset
+        # the entity to spoofed forever — only THIS message is rejected:
+        # ent.geom stays at the prior position, ent.last_seen advances so
+        # the gap sweeper doesn't also trigger, and we increment a
+        # rolling spoof_count on attrs. After SPOOF_FLAG_COUNT spoofy
+        # messages within the window, the entity gets re-typed.
+        # (Single GPS glitches happen; persistent ones are a real attack.)
+        spoofed_this_msg = False
+        if prev_geom is not None and prev_t is not None:
+            dt = (obs.t - prev_t).total_seconds()
+            if SPOOF_MIN_DT_S < dt < SPOOF_MAX_DT_S:
+                d_km = haversine_km(prev_geom, obs.geom)
+                speed_kn = (d_km / dt) * 3600.0 / 1.852  # km/s → kn
+                if speed_kn > SPOOF_MAX_SPEED_KN:
+                    spoofed_this_msg = True
+                    ent.attrs.setdefault("spoof_events", []).append({
+                        "t": obs.t.isoformat(),
+                        "implied_kn": round(speed_kn, 1),
+                        "from": {"lon": prev_geom.lon, "lat": prev_geom.lat},
+                        "to": {"lon": obs.geom.lon, "lat": obs.geom.lat},
+                    })
+                    # Trim the rolling window — keep only the last 10 events.
+                    ent.attrs["spoof_events"] = ent.attrs["spoof_events"][-10:]
+                    audit_log.append(
+                        actor="system",
+                        event_type="ais_spoof_suspected",
+                        payload={"entity_id": eid, "mmsi": ent.attrs.get("mmsi"),
+                                 "implied_kn": round(speed_kn, 1),
+                                 "dt_s": round(dt, 1),
+                                 "distance_km": round(d_km, 1)},
+                    )
+
+        if spoofed_this_msg:
+            # Don't overwrite the trustworthy prior position with the
+            # implausible one. Advance last_seen so the gap detector sees
+            # we're still hearing from the MMSI; flip type if we've now
+            # accumulated enough spoof events.
+            ent.last_seen = obs.t
+            n = len(ent.attrs.get("spoof_events", []))
+            if n >= 2 and ent.type == EntityType.VESSEL:
+                ent.type = EntityType.AIS_SPOOFED
+                ent.priority_score = 0.7   # higher than loitering, lower than dark
+                ent.notes = (f"AIS spoofing suspected — {n} implausible-speed "
+                             f"reports in the rolling window.")
+                audit_log.append(
+                    actor="system",
+                    event_type="entity_reclassified",
+                    payload={"entity_id": eid, "to": "ais_spoofed",
+                             "spoof_event_count": n},
+                )
+                self._make_recommendation(ent)
+            store.put_entity(ent, domain=DOMAIN)
+            return ent
+
         ent.geom = obs.geom
         ent.last_seen = obs.t
         ent.observation_ids.append(obs.obs_id)
@@ -459,6 +549,14 @@ class FusionEngine:
                 "pilot wait), illegal fishing, or transfer activity. "
                 "Inspect vessel attrs (nav_status, ship_type, destination) "
                 "before tasking surface assets."
+            )
+        elif ent.type == EntityType.AIS_SPOOFED:
+            action = ActionType.TASK_SAR_SAT
+            rationale = (
+                "AIS reporting implausible-speed teleports (multiple events "
+                "in rolling window). Position cannot be trusted. Recommend "
+                "tasking next SAR pass to obtain a non-cooperative fix and "
+                "alert Coast Guard if confirmed off the reported track."
             )
 
         rec = Recommendation(
