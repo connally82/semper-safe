@@ -55,11 +55,13 @@ primary_region = "dfw"
   size = "shared-cpu-1x"
   # 256mb → 512mb after observations dict OOM (see git log).
   # 512mb → 1024mb (Phase 4.3): rasterio/GDAL + 4096^2 float32 CFAR tile
-  # arrays + the live AIS engine state would not coexist under 1 GB. Each
-  # tile peaks ~225 MB; with the integral images plus the rest of the
-  # process we sit ~600 MB while detecting and stay under headroom.
-  # Without this, the machine OOM-kills mid-detection or right at boot
-  # when the now-larger DB state loads.
-  memory = "1024mb"
+  # arrays + the live AIS engine state would not coexist under 1 GB.
+  # 1024mb → 2048mb (Phase 4.x): even at TILE_PX=1024 the SAR auto-process
+  # loop OOMs on a 1 GB VM once the in-memory engine grows past ~700 entities
+  # and ~7000 recommendations. CFAR on a 1024² VV+VH+integral-image set
+  # costs ~225 MB while live AIS + bootstrap state already occupies ~700 MB.
+  # 2 GB gives clean headroom and lets us re-enable SAR_AUTO_PROCESS.
+  # See task #23 in the project tasks for the original incident.
+  memory = "2048mb"
   cpu_kind = "shared"
   cpus = 1

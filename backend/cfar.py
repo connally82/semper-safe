@@ -197,3 +197,93 @@ def detect_vessels(amplitude: np.ndarray,
     """End-to-end CFAR + clustering. Returns plausible vessel detections."""
     mask = cfar_detect(amplitude, cfg=cfg)
     return cluster_detections(mask, amplitude, cfg=cfg)
+
+
+def detect_vessels_in_stripes(
+    read_stripe,
+    height: int,
+    width: int,
+    cfg: CfarConfig | None = None,
+    stripe_height: int = 512,
+) -> list[Cluster]:
+    """Streaming variant — run CFAR on row-stripes with halo overlap.
+
+    Why this exists:
+      cfar_detect builds an integral image the size of the input. For a
+      4096² tile that's ~64 MB just for the integral, plus the float32
+      copy + cumsum + bool mask — peak ~200-250 MB per band. With VV+VH
+      and the live in-memory engine state this OOMs a 1 GB Fly VM and
+      stresses a 2 GB one. Processing stripe-by-stripe caps peak memory
+      at O(stripe_height × width) regardless of tile size.
+
+    How it works:
+      - Each stripe covers rows [r0:r1) of the source.
+      - We read `halo` extra rows on top and bottom (clamped at array
+        edges) so the cumulative-sum's reflect-pad uses REAL data inside
+        the stripe rather than synthetic data, eliminating boundary bias.
+      - Run cfar_detect over the read stripe (halo + central + halo).
+      - Keep only clusters whose centroid is in the *central* slice;
+        clusters in the halo region are re-detected by the adjacent
+        stripe's central slice. This gives clean, dedupe-free coverage.
+
+    Caller contract:
+      - `read_stripe(r0, r1)` returns the amplitude array for full-width
+        rows r0..r1 (exclusive). Caller delegates to rasterio (or a
+        memory mock in tests) — cfar.py stays I/O-free.
+      - Returned clusters carry centroid/bbox in the FULL-ARRAY space
+        (not stripe-local), so callers can geocode normally.
+
+    Memory budget:
+      - At stripe_height=512, width=4096: stripe ≈ 2 MB uint16 / 8 MB
+        float32; integral image ≈ 8 MB; CFAR peak ≈ 25 MB.
+      - That's ~10× lower than the full-tile path at 4096².
+    """
+    cfg = cfg or CfarConfig()
+    if height <= 0 or width <= 0:
+        return []
+
+    # Halo size: cfar_detect's outer window is (guard+train) on each side,
+    # so a halo of (guard+train) is the minimum needed to make CFAR's
+    # reflect-pad never read across the central-stripe boundary.
+    halo = cfg.guard_size + cfg.train_size
+
+    # Avoid degenerate one-stripe case shrinking below cfar's needs.
+    min_stripe = 2 * halo + cfg.guard_size + 1
+    if stripe_height < min_stripe:
+        stripe_height = min_stripe
+
+    out: list[Cluster] = []
+    for r0 in range(0, height, stripe_height):
+        r1 = min(r0 + stripe_height, height)
+        read_r0 = max(0, r0 - halo)
+        read_r1 = min(height, r1 + halo)
+        arr = read_stripe(read_r0, read_r1)
+        if arr is None or arr.size == 0:
+            continue
+        # Cheap "no-data" gate — skip stripes that are over-land outside
+        # the swath. Same threshold as the full-tile path used to use.
+        if float(arr.mean()) < 5.0:
+            continue
+
+        local_clusters = detect_vessels(arr, cfg=cfg)
+        # `arr` rows correspond to source rows [read_r0..read_r1). The
+        # central slice in sub-array coords is [r0-read_r0 .. r1-read_r0).
+        central_lo = r0 - read_r0
+        central_hi = r1 - read_r0
+        offset = read_r0
+        for c in local_clusters:
+            if c.centroid_row < central_lo or c.centroid_row >= central_hi:
+                # Cluster lives in this stripe's halo — the adjacent stripe
+                # will catch it inside its own central slice.
+                continue
+            out.append(Cluster(
+                centroid_row=c.centroid_row + offset,
+                centroid_col=c.centroid_col,
+                n_pixels=c.n_pixels,
+                bbox=(c.bbox[0] + offset, c.bbox[1],
+                      c.bbox[2] + offset, c.bbox[3]),
+                rcs_db=c.rcs_db,
+                length_px=c.length_px,
+                width_px=c.width_px,
+            ))
+    return out

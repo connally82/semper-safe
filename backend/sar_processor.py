@@ -17,8 +17,10 @@ Design choices:
     suppression but adds complexity; Phase 4.x can pick that up.
   - Open via /vsizip+/vsis3/ so the .SAFE.zip never lands on local disk.
     GDAL handles HTTP range reads through R2's S3-compatible API.
-  - Process in 4096×4096 tiles to keep peak memory bounded (~250 MB per
-    tile float32 + integral images). Fits comfortably under 1 GB Fly VM.
+  - Process in TILE_PX × TILE_PX tiles. Streaming CFAR
+    (cfar.detect_vessels_in_stripes) reads each tile in 512-row stripes
+    with halo overlap, capping peak memory at ~25 MB per band regardless
+    of tile_px. Was 1024 (band-aid for 1 GB VM), now 2048 with streaming.
   - Geocode via the geolocationGridPoint elements in the SAFE annotation
     XML (210 GCPs on a regular grid for IW GRDH). Use bilinear
     interpolation rather than the GeoTIFF's CRS — the COG TIFFs Copernicus
@@ -48,7 +50,7 @@ from urllib.request import Request, urlopen
 
 import numpy as np
 
-from cfar import CfarConfig, detect_vessels
+from cfar import CfarConfig, detect_vessels, detect_vessels_in_stripes
 import fixed_structures
 import land_mask
 
@@ -58,17 +60,16 @@ log = logging.getLogger("sar_processor")
 # ---------------------------------------------------------------------- knobs
 
 # Tile size — bigger tiles waste memory; smaller tiles add HTTP round-trips.
-# Sized to fit per-tile peak memory + the live AIS engine state under 1 GB.
-# CFAR's integral-image arrays scale O(tile_px^2 * 8 bytes), so:
-#   4096 tile → ~500 MB peak per tile (OOM on 1 GB Fly VM)
-#   2048 tile → ~130 MB peak per tile (OOM observed on 2026-05-08 with
-#              live AIS + audit archive coexisting — total anon-rss 848 MB)
-#   1024 tile → ~35 MB peak per tile (fits comfortably; ~4x more tiles
-#              but each is ~4x faster, so net wall clock ≈ unchanged)
-# At 10 m/pixel IW GRDH, each 1024 tile covers ~10 km × 10 km — still
-# plenty of context for the CFAR clutter estimate (training annulus is
-# only ~140 m).
-TILE_PX = 1024
+# History (see git log):
+#   4096 tile + full-tile CFAR → ~500 MB peak per tile (OOM on 1 GB VM)
+#   2048 tile + full-tile CFAR → ~130 MB peak (OOM 2026-05-08 with live AIS)
+#   1024 tile + full-tile CFAR → ~35 MB peak (band-aid)
+# 2026-05-09: streaming CFAR (cfar.detect_vessels_in_stripes) caps peak
+# memory at O(stripe_height * tile_px), independent of tile_px. We're
+# back to 2048 — fewer scene-edge artefacts than 1024 without going all
+# the way to 4096 where the per-tile HTTP read latency starts to bite.
+# At 10 m/pixel IW GRDH, each 2048 tile covers ~20 km × 20 km.
+TILE_PX = 2048
 
 # Buffer to drop near tile edges (CFAR's reflect padding biases the clutter
 # estimate within ~train+guard pixels of the boundary).
@@ -391,30 +392,46 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
                 c1 = min(c0 + tile_px, W)
                 if (r1 - r0) < 256 or (c1 - c0) < 256:
                     continue
-                window = Window(c0, r0, c1 - c0, r1 - r0)
-                arr = src.read(1, window=window)
-                # No-data tiles (over-land outside swath) — skip.
-                if float(arr.mean()) < 5.0:
-                    continue
+                tile_h = r1 - r0
+                tile_w = c1 - c0
+                # Streaming CFAR: read VV stripes on demand via a closure.
+                # Each stripe is at most ~50 MB even on huge tiles; the
+                # full-tile float32 + integral images that used to OOM the
+                # 1 GB VM never coexist anymore. See cfar.detect_vessels_in_stripes.
+                def _read_vv_stripe(s0: int, s1: int,
+                                     _src=src, _r0=r0, _c0=c0, _w=tile_w):
+                    return _src.read(1, window=Window(_c0, _r0 + s0,
+                                                      _w, s1 - s0))
+
+                tile_dets = detect_vessels_in_stripes(
+                    _read_vv_stripe, height=tile_h, width=tile_w,
+                    cfg=cfg_cfar,
+                )
                 n_tiles += 1
-                tile_dets = detect_vessels(arr, cfg=cfg_cfar)
                 n_raw += len(tile_dets)
-                # Read the matching VH window once per tile so we can
-                # sample at every detection centroid without re-reading.
-                # If VH is unavailable, vh_arr stays None — ratio falls
-                # through to null and we skip the discrimination filter.
+                # Read the matching VH window once per tile only if there
+                # were any candidate detections — otherwise we'd be paying
+                # 2 MB per empty tile for nothing. If VH is unavailable,
+                # vh_arr stays None and the ratio filter is skipped.
                 vh_arr = None
                 if vh_src is not None and tile_dets:
                     try:
-                        vh_arr = vh_src.read(1, window=window)
+                        vh_arr = vh_src.read(
+                            1,
+                            window=Window(c0, r0, tile_w, tile_h),
+                        )
                     except Exception as exc:  # noqa: BLE001
-                        log.warning("[%s] VH read failed at %s (%s) — "
-                                    "tile in VV-only", scene_id, window, exc)
+                        log.warning("[%s] VH read failed at tile (%d,%d) %dx%d (%s) — "
+                                    "tile in VV-only", scene_id, r0, c0,
+                                    tile_h, tile_w, exc)
                 for d in tile_dets:
+                    # Streaming clusters carry tile-local row/col coords —
+                    # same EDGE_GUARD logic still applies relative to the
+                    # tile bounds.
                     if (d.centroid_row < EDGE_GUARD_PX or
                             d.centroid_col < EDGE_GUARD_PX or
-                            (arr.shape[0] - d.centroid_row) < EDGE_GUARD_PX or
-                            (arr.shape[1] - d.centroid_col) < EDGE_GUARD_PX):
+                            (tile_h - d.centroid_row) < EDGE_GUARD_PX or
+                            (tile_w - d.centroid_col) < EDGE_GUARD_PX):
                         continue
                     sr = r0 + d.centroid_row
                     sc = c0 + d.centroid_col
@@ -453,7 +470,17 @@ def process_scene(scene_id: str, *, pfa: float = DEFAULT_PFA,
                         r_lo = max(0, rr - ws); r_hi = min(h_h, rr + ws + 1)
                         c_lo = max(0, cc - ws); c_hi = min(h_w, cc + ws + 1)
                         vh_patch = vh_arr[r_lo:r_hi, c_lo:c_hi]
-                        vv_patch = arr[r_lo:r_hi, c_lo:c_hi]
+                        # Streaming refactor: arr (full VV tile) no longer
+                        # exists. Read the matching 5×5 VV patch directly
+                        # — a 50-byte HTTP range read, essentially free.
+                        try:
+                            vv_patch = src.read(
+                                1,
+                                window=Window(c0 + c_lo, r0 + r_lo,
+                                              c_hi - c_lo, r_hi - r_lo),
+                            )
+                        except Exception:  # noqa: BLE001
+                            vv_patch = np.zeros_like(vh_patch)
                         if vh_patch.size:
                             # GRDH amplitude → intensity = amp²; ratio_dB
                             # = 10*log10(VV²/VH²) = 20*log10(VV/VH).
