@@ -1368,6 +1368,36 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
         </button>
       </div>
 
+      {/* Anomaly banner — top-center. Shows a chip per anomaly category
+          with live counts. Click any chip to fit-bounds-zoom to those
+          entities. Pure derived state from the entities prop — no
+          additional fetches. */}
+      {renderEntities.length > 0 && (
+        <AnomalyBanner
+          entities={renderEntities}
+          cfg={cfg}
+          onZoomTo={(type) => {
+            const map = mapRef.current;
+            if (!map) return;
+            const matches = renderEntities.filter((e) => e.type === type);
+            if (matches.length === 0) return;
+            if (matches.length === 1) {
+              map.flyTo({ center: [matches[0].lon, matches[0].lat], zoom: 11, duration: 800 });
+              onSelect(matches[0].id);
+              return;
+            }
+            const lons = matches.map((e) => e.lon);
+            const lats = matches.map((e) => e.lat);
+            const minLon = Math.min(...lons), maxLon = Math.max(...lons);
+            const minLat = Math.min(...lats), maxLat = Math.max(...lats);
+            map.fitBounds(
+              [[minLon, minLat], [maxLon, maxLat]],
+              { padding: 80, duration: 800, maxZoom: 9 },
+            );
+          }}
+        />
+      )}
+
       {/* System pulse — single-glance freshness panel, bottom-right.
           Polls /maritime/realtime every 30 s. Each sensor row shows
           a colored dot keyed to "how stale is this", a label, and a
@@ -1388,6 +1418,125 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
           onLive={() => setScrubMinutes(0)}
         />
       )}
+    </div>
+  );
+}
+
+// AnomalyBanner — top-center chip strip showing live counts per anomaly
+// type. Each chip is keyed to typeMeta.color for visual continuity with
+// the markers on the map. Click a chip to zoom to those entities.
+//
+// Why these specific types: they're the four maritime anomaly classes
+// in fusion.py — dark_vessel (no AIS), ais_gap (lost AIS), loitering_vessel
+// (AIS but stationary >threshold), ais_spoofed (AIS but lying). Together
+// they describe every way a real-world target deviates from "normal AIS
+// transponder reporting position truthfully."
+//
+// "vessel" itself is shown last as a neutral count so the operator sees
+// the denominator — useful at a glance to know e.g. "5 dark out of 264
+// total" rather than "5 dark in some unknown fleet size."
+function AnomalyBanner({ entities, cfg, onZoomTo }) {
+  // Order matters — most operationally-urgent first.
+  const anomalyTypes = [
+    "dark_vessel",
+    "ais_spoofed",
+    "loitering_vessel",
+    "ais_gap",
+  ];
+  const counts = {};
+  for (const t of anomalyTypes) counts[t] = 0;
+  let totalVessels = 0;
+  for (const e of entities) {
+    if (e.type in counts) counts[e.type] += 1;
+    if (e.type === "vessel") totalVessels += 1;
+  }
+  const totalAnomalies = anomalyTypes.reduce((s, t) => s + counts[t], 0);
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        top: 8,
+        left: "50%",
+        transform: "translateX(-50%)",
+        display: "flex",
+        gap: 6,
+        background: "rgba(4,8,16,0.78)",
+        border: "1px solid rgba(255,255,255,0.18)",
+        borderRadius: 4,
+        padding: "5px 6px",
+        fontFamily:
+          "'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace",
+        fontSize: 11,
+        letterSpacing: "0.06em",
+        zIndex: 1,
+      }}
+    >
+      {anomalyTypes.map((t) => {
+        const meta = cfg.typeMeta[t];
+        if (!meta) return null;
+        const n = counts[t];
+        const dim = n === 0;
+        return (
+          <button
+            key={t}
+            type="button"
+            onClick={() => onZoomTo(t)}
+            disabled={n === 0}
+            title={
+              n === 0
+                ? `No ${meta.label.toLowerCase()} right now`
+                : `Zoom to ${n} ${meta.label.toLowerCase()}`
+            }
+            style={{
+              appearance: "none",
+              background: dim ? "transparent" : `${meta.color}26`, // 15% alpha
+              border: `1px solid ${dim ? "rgba(255,255,255,0.10)" : meta.color}`,
+              color: dim ? "rgba(255,255,255,0.4)" : "#f0f4ff",
+              borderRadius: 3,
+              padding: "4px 8px",
+              cursor: n === 0 ? "default" : "pointer",
+              textTransform: "uppercase",
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+            }}
+          >
+            <span
+              style={{
+                width: 7,
+                height: 7,
+                borderRadius: "50%",
+                background: meta.color,
+                opacity: dim ? 0.4 : 1,
+                boxShadow: dim ? "none" : `0 0 6px ${meta.color}`,
+              }}
+            />
+            <span style={{ fontVariantNumeric: "tabular-nums",
+                           color: dim ? "inherit" : meta.color,
+                           fontWeight: 600 }}>
+              {n}
+            </span>
+            <span>{meta.label}</span>
+          </button>
+        );
+      })}
+      <div
+        style={{
+          alignSelf: "center",
+          padding: "0 8px 0 4px",
+          color: "rgba(255,255,255,0.55)",
+          borderLeft: "1px solid rgba(255,255,255,0.18)",
+          marginLeft: 2,
+        }}
+      >
+        <span style={{ fontVariantNumeric: "tabular-nums" }}>{totalAnomalies}</span>
+        {" / "}
+        <span style={{ fontVariantNumeric: "tabular-nums" }}>
+          {totalVessels + totalAnomalies}
+        </span>
+        {" anomalous"}
+      </div>
     </div>
   );
 }
