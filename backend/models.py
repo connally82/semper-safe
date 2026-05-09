@@ -40,6 +40,7 @@ class EntityType(str, Enum):
     VESSEL = "vessel"
     DARK_VESSEL = "dark_vessel"
     AIS_GAP = "ais_gap"
+    LOITERING_VESSEL = "loitering_vessel"   # AIS-cooperative but stationary >N hours
     DEBRIS = "debris"
     # Wildfire
     HOTSPOT = "hotspot"             # single thermal anomaly, unconfirmed

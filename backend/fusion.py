@@ -52,6 +52,33 @@ FISHING_NAV_STATES = {7}                              # 7=engaged in fishing
 SAR_AIS_MATCH_RADIUS_KM = 1.5               # how close a SAR blob must be to an AIS report
 SAR_AIS_MATCH_WINDOW = timedelta(minutes=20)
 
+# Loitering detection thresholds. A cooperative AIS-reporting vessel that
+# stays in essentially the same place for hours on end is anomalous in a
+# way different from "AIS dropout" — it's NOT going dark, it's just not
+# moving. Pattern matches narcotics handoffs, illegal fishing, smuggling
+# rendezvous, and intentionally-stationary surveillance vessels.
+#
+# How we detect it: every observation refreshes ent.attrs['last_motion_at']
+# whenever speed_kn exceeds LOITERING_SPEED_KN OR the position has moved
+# more than LOITERING_DISTANCE_M since the entity's last reference point.
+# detect_loitering() flips entities whose last_motion_at is older than
+# LOITERING_THRESHOLD into type=LOITERING_VESSEL. A subsequent move resets
+# them to VESSEL.
+#
+# Tuning notes:
+#   - 0.5 kn floor is below the AIS minimum-resolvable speed (Class A
+#     reports speed in 0.1 kn steps; Class B in 1 kn steps), so a true
+#     drifter shows speed=0. Real underway traffic is >2 kn even at idle.
+#   - 6 hours is long enough to exclude routine port loitering (line
+#     handlers, pilot waits, customs) but short enough to catch operational
+#     anomalies before they finish.
+#   - 100 m moves: AIS position jitter is typically ~10 m at GPS-good
+#     conditions and bumps to ~50 m near tall structures (Galveston piers)
+#     so 100 m is a comfortable gate.
+LOITERING_SPEED_KN = 0.5
+LOITERING_DISTANCE_M = 100.0
+LOITERING_THRESHOLD = timedelta(hours=6)
+
 
 def gap_threshold_for(ent: Entity) -> timedelta:
     """Pick the AIS gap threshold appropriate for the entity's last-known
@@ -148,7 +175,14 @@ class FusionEngine:
                 confidence=0.99,                # cooperative target
                 priority_score=0.05,
                 observation_ids=[obs.obs_id],
-                attrs={"mmsi": mmsi, **obs.attrs},
+                # Seed last_motion_at to obs.t so brand-new entities don't
+                # immediately get flagged as loitering — the timer starts now.
+                attrs={"mmsi": mmsi,
+                       "last_motion_at": obs.t.isoformat(),
+                       "loitering_anchor": {"lon": obs.geom.lon,
+                                            "lat": obs.geom.lat,
+                                            "t": obs.t.isoformat()},
+                       **obs.attrs},
             )
             self.entities[eid] = ent
             store.put_entity(ent, domain=DOMAIN)
@@ -160,6 +194,7 @@ class FusionEngine:
             return ent
 
         ent = self.entities[eid]
+        prev_geom = ent.geom
         ent.geom = obs.geom
         ent.last_seen = obs.t
         ent.observation_ids.append(obs.obs_id)
@@ -172,6 +207,44 @@ class FusionEngine:
         ):
             if telemetry_key in obs.attrs:
                 ent.attrs[telemetry_key] = obs.attrs[telemetry_key]
+        # Loitering tracker: bump last_motion_at any time the vessel reports
+        # real movement — either by speed-over-ground OR by absolute position
+        # drift from the loitering anchor. Two signals because (a) GPS-stale
+        # AIS messages sometimes report 0 kn while the actual position keeps
+        # moving and (b) some Class B transceivers under-report SOG.
+        moved = False
+        speed = obs.attrs.get("speed_kn")
+        if isinstance(speed, (int, float)) and speed >= LOITERING_SPEED_KN:
+            moved = True
+        anchor = ent.attrs.get("loitering_anchor")
+        if anchor is not None:
+            dist_km = haversine_km(
+                Geom(lon=anchor["lon"], lat=anchor["lat"]),
+                obs.geom,
+            )
+            if dist_km * 1000.0 >= LOITERING_DISTANCE_M:
+                moved = True
+        else:
+            # Back-compat for entities that existed before this attr was added.
+            if prev_geom is not None and haversine_km(prev_geom, obs.geom) * 1000.0 \
+                    >= LOITERING_DISTANCE_M:
+                moved = True
+        if moved:
+            ent.attrs["last_motion_at"] = obs.t.isoformat()
+            ent.attrs["loitering_anchor"] = {
+                "lon": obs.geom.lon, "lat": obs.geom.lat, "t": obs.t.isoformat(),
+            }
+            # Demotion: a moving vessel can't be loitering. Reset type if it
+            # was previously flagged.
+            if ent.type == EntityType.LOITERING_VESSEL:
+                ent.type = EntityType.VESSEL
+                ent.priority_score = 0.05
+                audit_log.append(
+                    actor="system",
+                    event_type="entity_reclassified",
+                    payload={"entity_id": eid, "to": "vessel",
+                             "reason": "motion_resumed"},
+                )
         # If a previously-dark vessel reappears on AIS, downgrade priority
         if ent.type == EntityType.AIS_GAP:
             ent.type = EntityType.VESSEL
@@ -319,6 +392,53 @@ class FusionEngine:
                 flagged.append(ent)
         return flagged
 
+    # --- loitering detection -----------------------------------------
+    def detect_loitering(self, now: datetime) -> list[Entity]:
+        """Sweep entities; flip cooperative VESSEL entities that haven't
+        moved in LOITERING_THRESHOLD into LOITERING_VESSEL. The
+        last_motion_at attr is bumped during ingest whenever the vessel
+        reports speed >= LOITERING_SPEED_KN or its position drifts beyond
+        LOITERING_DISTANCE_M from the anchor — see _ingest_ais.
+
+        Skipped for AIS_GAP / DARK_VESSEL / non-vessel types — those have
+        their own classifications and we don't want to clobber them with a
+        weaker signal.
+        """
+        flagged: list[Entity] = []
+        for ent in list(self.entities.values()):
+            if ent.type != EntityType.VESSEL:
+                continue
+            last_motion_iso = ent.attrs.get("last_motion_at")
+            if not last_motion_iso:
+                continue
+            try:
+                last_motion = datetime.fromisoformat(last_motion_iso)
+            except ValueError:
+                continue
+            stationary_for = now - last_motion
+            if stationary_for < LOITERING_THRESHOLD:
+                continue
+            ent.type = EntityType.LOITERING_VESSEL
+            # Higher priority than benign vessel, lower than dark — this
+            # is a "watch closely" classification, not a "dispatch now" one.
+            ent.priority_score = 0.6
+            hours = round(stationary_for.total_seconds() / 3600.0, 1)
+            ent.notes = (f"Stationary {hours}h. Last motion "
+                         f"{last_motion.isoformat()}. Anchor "
+                         f"({ent.geom.lon:.4f}, {ent.geom.lat:.4f}).")
+            ent.attrs["loitering_hours"] = hours
+            store.put_entity(ent, domain=DOMAIN)
+            audit_log.append(
+                actor="system",
+                event_type="entity_reclassified",
+                payload={"entity_id": ent.entity_id, "to": "loitering_vessel",
+                         "stationary_hours": hours,
+                         "last_motion_at": last_motion.isoformat()},
+            )
+            self._make_recommendation(ent)
+            flagged.append(ent)
+        return flagged
+
     # --- recommendations ---------------------------------------------
     def _make_recommendation(self, ent: Entity) -> Recommendation:
         if ent.type == EntityType.DARK_VESSEL:
@@ -331,9 +451,15 @@ class FusionEngine:
             rationale = ("AIS dropout exceeds threshold. Watch for resumption "
                          "or correlate with next SAR pass. No surface dispatch "
                          "without corroboration.")
-        else:
+        elif ent.type == EntityType.LOITERING_VESSEL:
             action = ActionType.LOG_ONLY
-            rationale = "Routine."
+            rationale = (
+                "Cooperative AIS target stationary past loitering threshold. "
+                "Pattern is consistent with operational pause (anchorage, "
+                "pilot wait), illegal fishing, or transfer activity. "
+                "Inspect vessel attrs (nav_status, ship_type, destination) "
+                "before tasking surface assets."
+            )
 
         rec = Recommendation(
             rec_id=f"rec_{uuid.uuid4().hex[:10]}",

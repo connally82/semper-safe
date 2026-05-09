@@ -70,9 +70,13 @@ const DOMAINS = {
         color: "#f0a830", aspect: 0.8 },
     ],
     typeMeta: {
-      vessel:      { color: "#6b8db8", label: "VESSEL",       glow: false },
-      ais_gap:     { color: "#f0a830", label: "AIS GAP",      glow: true },
-      dark_vessel: { color: "#ff5c5c", label: "DARK VESSEL",  glow: true },
+      vessel:           { color: "#6b8db8", label: "VESSEL",           glow: false },
+      ais_gap:          { color: "#f0a830", label: "AIS GAP",          glow: true },
+      dark_vessel:      { color: "#ff5c5c", label: "DARK VESSEL",      glow: true },
+      // Distinct purple — not red (that's "dark vessel"), not orange
+      // (that's "AIS gap"), not blue (that's "underway"). Glow on so
+      // the eye picks it out of a dense vessel cluster at port approach.
+      loitering_vessel: { color: "#c08bdc", label: "LOITERING",        glow: true },
     },
     actionLabel: {
       task_sar_satellite: "Task SAR satellite",

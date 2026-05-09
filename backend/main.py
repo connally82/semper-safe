@@ -166,6 +166,14 @@ async def _gap_sweeper_loop(cancel: asyncio.Event) -> None:
             except Exception as exc:  # noqa: BLE001
                 log.exception("gap sweep crashed: %s", exc)
             try:
+                # Loitering reclassification — same threadpool offload as
+                # detect_gaps. Cheap (one O(N) pass over self.entities).
+                await asyncio.to_thread(
+                    maritime.detect_loitering, datetime.now(timezone.utc),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("loitering sweep crashed: %s", exc)
+            try:
                 evicted = await asyncio.to_thread(_evict_stale_in_memory_obs)
                 if evicted:
                     log.debug("evicted %d stale in-memory observations", evicted)
