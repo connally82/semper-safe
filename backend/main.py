@@ -677,11 +677,24 @@ class DecisionRequest(BaseModel):
 
 @app.get("/health")
 def health():
+    # IMPORTANT: keep this endpoint cheap. Fly's edge proxy hits it every
+    # 30 s with a 5–15 s timeout; if it ever takes longer than the
+    # timeout, the proxy de-registers the machine and we end up with
+    # "no known healthy instances" loops that can't recover until the
+    # audit table is cheap to scan again.
+    #
+    # Earlier version called len(audit_log.all()), which on the
+    # _PostgresAuditLog backend materialized the entire 100K+-row audit
+    # table over the Neon round-trip. It worked fine when the table was
+    # small and quietly broke once the AISStream worker had been adding
+    # observation rows for a few hours. audit_log.count() goes to a
+    # SELECT COUNT(*) — constant-time on the network payload, regardless
+    # of audit size.
     return {
         "ok": True,
         "domains": ["maritime", "wildfire"],
         "audit_head": audit_log.head(),
-        "audit_entries": len(audit_log.all()),
+        "audit_entries": audit_log.count(),
     }
 
 

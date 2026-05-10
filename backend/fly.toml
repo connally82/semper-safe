@@ -42,13 +42,18 @@ primary_region = "dfw"
 
   # 180s grace covers the cold-start case where DB is empty and the
   # seed scenario writes ~1,800 audit entries to Neon (each is a
-  # network round trip). Subsequent restarts skip the seed and boot
-  # in under 5 seconds.
+  # network round trip). Warm boots load 700+ entities + 7000+
+  # recommendations from Neon (~70s); the grace covers that too.
+  # Timeout 5s → 15s after a recurring incident where /health timed
+  # out under load (the earlier impl was O(N) on audit_log; that's
+  # fixed in code, but a wider timeout means a single slow Postgres
+  # round-trip during failover doesn't immediately mark the machine
+  # critical and trigger the proxy to drop traffic.
   [[http_service.checks]]
     grace_period = "180s"
     interval = "30s"
     method = "GET"
-    timeout = "5s"
+    timeout = "15s"
     path = "/health"
 
 [[vm]]

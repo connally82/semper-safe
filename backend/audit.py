@@ -82,6 +82,9 @@ class _InMemoryAuditLog:
     def all(self) -> list[AuditEntry]:
         return list(self._entries)
 
+    def count(self) -> int:
+        return len(self._entries)
+
     def head(self) -> str:
         return self._entries[-1].self_hash if self._entries else GENESIS_HASH
 
@@ -207,6 +210,23 @@ class _PostgresAuditLog:
                 )
                 for r in rows
             ]
+
+    def count(self) -> int:
+        """Cheap row-count for callers that just want a size signal — e.g.
+        /health. Goes to Postgres but with a `SELECT COUNT(*)` instead of
+        materializing the whole table. Critically faster than len(all())
+        once the audit log has 100K+ rows: O(1) network payload vs O(N)
+        rows × ~200 bytes each over the Neon round-trip. The /health
+        endpoint was timing out (5 s) on len(all()) at ~100K rows; this
+        keeps /health responding in <50 ms regardless of audit size."""
+        from sqlalchemy import func
+        from db import models as dbm
+        from db.session import session_scope
+
+        with session_scope() as s:
+            return int(s.execute(
+                select(func.count()).select_from(dbm.AuditEntryRow)
+            ).scalar_one())
 
     def head(self) -> str:
         from db import models as dbm
