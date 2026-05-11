@@ -563,6 +563,21 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
   const fitDoneRef = useRef(false);          // only auto-fit once on first data
   const [ready, setReady] = useState(false);
 
+  // ─── Scrub state + renderEntities — MUST be declared up here ────────
+  // Multiple downstream effects (watchlist toasts, anomaly trails,
+  // candidate halos, dispatch rings, etc) reference `renderEntities`
+  // in their dependency arrays. JS `const` declarations are in the
+  // temporal dead zone until their line executes, so referencing them
+  // earlier throws a ReferenceError on initial render → blank document
+  // → black screen. Keeping the declaration above all effects that
+  // depend on it is the durable fix; previously this lived ~1300
+  // lines down and broke the app on every Vercel deploy after the
+  // watchlist effect was added.
+  const [scrubMinutes, setScrubMinutes] = useState(0);
+  const [scrubSnapshot, setScrubSnapshot] = useState(null);
+  const [scrubLoading, setScrubLoading] = useState(false);
+  const renderEntities = scrubSnapshot ?? entities;
+
   // Anomaly state tracker. Per-entity-id record of the LAST observed
   // type, so we can detect transitions (vessel → dark_vessel, etc) on
   // every entities prop change without re-firing on stable state.
@@ -897,23 +912,8 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
     }
   });
 
-  // Time-scrub state. scrubMinutes==0 means "live / now"; positive values
-  // step backward in time (T-1, T-2, ... T-60). When scrubbing we hide the
-  // live `entities` prop and render a snapshot from /maritime/timeline.
-  const [scrubMinutes, setScrubMinutes] = useState(0);
-  const [scrubSnapshot, setScrubSnapshot] = useState(null);
-  const [scrubLoading, setScrubLoading] = useState(false);
-
-  // Source the markers either from live `entities` (now) or the
-  // snapshot fetched for the scrubbed-to time. Hoisted up here from
-  // below the scrub-fetch effect because several effects further down
-  // (watchlist toasts, anomaly trails, etc) reference `renderEntities`
-  // in their dependency arrays. Hoist required: const variables are in
-  // the temporal dead zone until their declaration line is hit, so
-  // referencing them earlier throws a ReferenceError on initial render
-  // (= black screen). Symptom seen 2026-05-11 after the watchlist
-  // effect was added before this declaration.
-  const renderEntities = scrubSnapshot ?? entities;
+  // (scrub state + renderEntities are declared at the very top of the
+  // component now — see the comment up there explaining why.)
 
   // Raw track for the selected entity (full Postgres history). Re-derived
   // into GeoJSON features whenever scrubMinutes changes so the polyline
