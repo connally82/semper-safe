@@ -708,6 +708,104 @@ function NearbyCandidatesSection({ entity, allEntities, onSelect, cfg }) {
   );
 }
 
+// DispatchSection — sits inside the recommendation block. The
+// "compliance story" surface: operator files a formal dispatch, the
+// backend appends a hash-chained audit entry, the proof receipt
+// renders inline next to the button.
+function DispatchSection({ entity, cfg, apiBase }) {
+  const [busy, setBusy] = useState(false);
+  const [receipt, setReceipt] = useState(null);
+  const [err, setErr] = useState(null);
+
+  if (!entity) return null;
+  const defaultAction = entity.recommendation
+    ? entity.recommendation.action
+    : "log_only";
+
+  const file = async () => {
+    setBusy(true); setErr(null);
+    try {
+      const r = await fetch(`${apiBase}/maritime/dispatches`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          operator: cfg.operator,
+          entity_id: entity.id,
+          action_type: defaultAction,
+          notes: "operator-initiated dispatch",
+        }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      setReceipt(data);
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (receipt) {
+    return (
+      <div style={{
+        marginTop: 12, padding: "10px 12px",
+        border: `1px solid ${PALETTE.good}40`,
+        background: PALETTE.good + "10",
+        fontFamily: "'IBM Plex Mono', monospace", fontSize: 11,
+        color: PALETTE.good, letterSpacing: "0.05em",
+        lineHeight: 1.6,
+      }}>
+        <div>● DISPATCH FILED · seq #{receipt.audit_seq}</div>
+        <div style={{
+          fontSize: 10, color: PALETTE.muted, marginTop: 4,
+          wordBreak: "break-all",
+        }}>
+          hash: {receipt.audit_hash}
+        </div>
+        <div style={{ fontSize: 10, color: PALETTE.muted }}>
+          {receipt.dispatched_at?.slice(11, 19)}Z · {receipt.operator}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ marginTop: 12 }}>
+      <button
+        type="button"
+        disabled={busy}
+        onClick={file}
+        style={{
+          appearance: "none",
+          border: `1px solid ${PALETTE.alert}`,
+          background: PALETTE.alert + "1a",
+          color: PALETTE.alert,
+          padding: "6px 12px",
+          borderRadius: 3,
+          fontFamily: "'IBM Plex Mono', monospace",
+          fontSize: 10,
+          letterSpacing: "0.18em",
+          cursor: busy ? "default" : "pointer",
+          textTransform: "uppercase",
+          fontWeight: 600,
+          width: "100%",
+        }}
+      >
+        {busy ? "filing…" : "▸ file dispatch · audit-logged"}
+      </button>
+      {err && (
+        <div style={{
+          marginTop: 6,
+          fontFamily: "'IBM Plex Mono', monospace", fontSize: 10,
+          color: PALETTE.alert,
+        }}>
+          error: {err}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function LineagePanel({ entity, allEntities, onSelect, decisions, onApprove, onReject, cfg }) {
   if (!entity) {
     return (
@@ -926,6 +1024,27 @@ function LineagePanel({ entity, allEntities, onSelect, decisions, onApprove, onR
               <button onClick={() => onReject(entity.id)} style={btn(PALETTE.muted)}>REJECT</button>
             </div>
           )}
+          {/* Always-available formal dispatch action — independent of
+              the pending-recommendation accept/reject flow. Hash-chained
+              into the audit log for compliance. */}
+          <DispatchSection entity={entity} cfg={cfg} apiBase={API_BASE} />
+        </div>
+      )}
+
+      {/* For entities with no engine recommendation (e.g. routine
+          cooperative vessels selected for inspection), still expose
+          the dispatch action — sometimes operators just want to file
+          a "checked this vessel" record. */}
+      {!entity.recommendation && SUSPECT_TYPES.has(entity.type) && (
+        <div style={{
+          padding: "16px 18px", borderTop: `1px solid ${PALETTE.borderStrong}`,
+          background: PALETTE.surface2,
+        }}>
+          <div style={{
+            fontFamily: "'IBM Plex Mono', monospace", fontSize: 9,
+            color: PALETTE.muted, letterSpacing: "0.2em",
+          }}>OPERATOR DISPATCH</div>
+          <DispatchSection entity={entity} cfg={cfg} apiBase={API_BASE} />
         </div>
       )}
     </div>

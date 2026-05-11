@@ -104,6 +104,26 @@ const CONVOY_SOURCE_ID = "ss-convoys";
 const CONVOY_LINE_LAYER_ID = "ss-convoys-line";
 const CONVOY_HULL_LAYER_ID = "ss-convoys-hull";
 
+// Custom AOI drawing — the operator clicks polygon corners to define
+// an arbitrary area of interest. Vessels inside get a highlight + count.
+const AOI_DRAW_SOURCE_ID = "ss-aoi-draw";
+const AOI_DRAW_FILL_LAYER_ID = "ss-aoi-draw-fill";
+const AOI_DRAW_LINE_LAYER_ID = "ss-aoi-draw-line";
+const AOI_DRAW_VERTEX_LAYER_ID = "ss-aoi-draw-vertex";
+
+// Ray-casting point-in-polygon. Coordinates in [lon, lat] order.
+function _pointInPolygon(lon, lat, polygon) {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i][0], yi = polygon[i][1];
+    const xj = polygon[j][0], yj = polygon[j][1];
+    const intersect = (yi > lat) !== (yj > lat)
+      && lon < ((xj - xi) * (lat - yi)) / (yj - yi) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
 const SUSPECT_TYPES_MAP = new Set([
   "dark_vessel", "ais_gap", "loitering_vessel", "ais_spoofed",
 ]);
@@ -355,6 +375,18 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
     try { window.localStorage.setItem(SOUND_STORAGE_KEY, on ? "1" : "0"); }
     catch { /* localStorage may be disabled */ }
   };
+
+  // AOI drawing state.
+  //   aoiMode: 'idle' | 'drawing' | 'fixed'
+  //   aoiPoints: [[lon,lat], ...] — closed polygon when in 'fixed' mode,
+  //              in-progress vertex list when 'drawing'.
+  const [aoiMode, setAoiMode] = useState("idle");
+  const [aoiPoints, setAoiPoints] = useState([]);
+  // Ref mirrors so map event listeners (set up once) can read fresh state.
+  const aoiModeRef = useRef(aoiMode);
+  const aoiPointsRef = useRef(aoiPoints);
+  useEffect(() => { aoiModeRef.current = aoiMode; }, [aoiMode]);
+  useEffect(() => { aoiPointsRef.current = aoiPoints; }, [aoiPoints]);
 
   // Basemap pick — persisted across sessions.
   const [basemap, setBasemap] = useState(() => {
@@ -748,9 +780,56 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
       });
     };
 
+    // AOI draw layers — a fill + outline for the polygon and a circle
+    // layer for the vertices the operator has clicked so far.
+    const ensureAoiLayers = () => {
+      if (map.getSource(AOI_DRAW_SOURCE_ID)) return;
+      map.addSource(AOI_DRAW_SOURCE_ID, {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      map.addLayer({
+        id: AOI_DRAW_FILL_LAYER_ID,
+        type: "fill",
+        source: AOI_DRAW_SOURCE_ID,
+        filter: ["==", "$type", "Polygon"],
+        paint: {
+          "fill-color": "#f0c930",
+          "fill-opacity": 0.08,
+        },
+      });
+      map.addLayer({
+        id: AOI_DRAW_LINE_LAYER_ID,
+        type: "line",
+        source: AOI_DRAW_SOURCE_ID,
+        filter: ["any",
+          ["==", "$type", "Polygon"],
+          ["==", "$type", "LineString"],
+        ],
+        paint: {
+          "line-color": "#f0c930",
+          "line-width": 1.5,
+          "line-dasharray": [2, 2],
+        },
+      });
+      map.addLayer({
+        id: AOI_DRAW_VERTEX_LAYER_ID,
+        type: "circle",
+        source: AOI_DRAW_SOURCE_ID,
+        filter: ["==", "$type", "Point"],
+        paint: {
+          "circle-color": "#040810",
+          "circle-radius": 4,
+          "circle-stroke-color": "#f0c930",
+          "circle-stroke-width": 1.5,
+        },
+      });
+    };
+
     map.on("style.load", ensureTrackLayers);
     map.on("style.load", ensureCandidateLayers);
     map.on("style.load", ensureConvoyLayers);
+    map.on("style.load", ensureAoiLayers);
     map.on("style.load", ensureSarLayers);
 
     // Click → popup. Detections are densely packed so attach to the
@@ -959,6 +1038,31 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
         .setHTML(html)
         .addTo(map);
     };
+
+    // AOI draw interaction: hijack generic map clicks while drawing.
+    // We attach to map.on("click") (not a specific layer) but bail out
+    // immediately if aoiModeRef.current !== 'drawing'. Layer-specific
+    // click handlers still run normally because they're more specific.
+    map.on("click", (e) => {
+      if (aoiModeRef.current !== "drawing") return;
+      const pts = aoiPointsRef.current.slice();
+      pts.push([e.lngLat.lng, e.lngLat.lat]);
+      setAoiPoints(pts);
+    });
+    map.on("dblclick", (e) => {
+      if (aoiModeRef.current !== "drawing") return;
+      // Suppress MapLibre's default dblclick zoom while finalizing.
+      e.preventDefault();
+      const pts = aoiPointsRef.current.slice();
+      // Last single-click might have just added the duplicate vertex —
+      // ignore the trailing dblclick coordinate.
+      if (pts.length < 3) {
+        setAoiMode("idle");
+        setAoiPoints([]);
+        return;
+      }
+      setAoiMode("fixed");
+    });
 
     map.on("click", SAR_DETECTIONS_LAYER_ID, popupForDetection);
     map.on("click", SAR_SCENES_FILL_LAYER_ID, popupForScene);
@@ -1366,6 +1470,77 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
     }, 500);
     return () => clearInterval(interval);
   }, [toasts.length]);
+
+  // AOI draw layer — re-render the in-progress polyline (while
+  // 'drawing') or the closed polygon (while 'fixed') on every state
+  // change. Vertex points are always emitted as additional Point
+  // features so the operator sees where they've clicked.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const src = map.getSource(AOI_DRAW_SOURCE_ID);
+    if (!src) return;
+    if (aoiMode === "idle" || aoiPoints.length === 0) {
+      src.setData({ type: "FeatureCollection", features: [] });
+      return;
+    }
+    const features = aoiPoints.map((p) => ({
+      type: "Feature",
+      geometry: { type: "Point", coordinates: p },
+      properties: {},
+    }));
+    if (aoiMode === "drawing" && aoiPoints.length >= 2) {
+      features.push({
+        type: "Feature",
+        geometry: { type: "LineString", coordinates: aoiPoints },
+        properties: {},
+      });
+    }
+    if (aoiMode === "fixed" && aoiPoints.length >= 3) {
+      // Close the polygon ring.
+      features.push({
+        type: "Feature",
+        geometry: {
+          type: "Polygon",
+          coordinates: [[...aoiPoints, aoiPoints[0]]],
+        },
+        properties: {},
+      });
+    }
+    src.setData({ type: "FeatureCollection", features });
+  }, [aoiPoints, aoiMode, ready]);
+
+  // Escape clears AOI drawing or the fixed AOI itself.
+  useEffect(() => {
+    if (aoiMode === "idle") return;
+    const handler = (e) => {
+      if (e.key === "Escape") {
+        setAoiMode("idle");
+        setAoiPoints([]);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [aoiMode]);
+
+  // Map cursor changes to crosshair while drawing.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const canvas = map.getCanvas();
+    canvas.style.cursor = aoiMode === "drawing" ? "crosshair" : "";
+    return () => { canvas.style.cursor = ""; };
+  }, [aoiMode, ready]);
+
+  // Count entities inside the fixed AOI — used by the floating
+  // result chip below.
+  const aoiCount = useMemo(() => {
+    if (aoiMode !== "fixed" || aoiPoints.length < 3) return 0;
+    return renderEntities.filter(
+      (e) => typeof e.lon === "number" && typeof e.lat === "number" &&
+             _pointInPolygon(e.lon, e.lat, aoiPoints),
+    ).length;
+  }, [aoiMode, aoiPoints, renderEntities]);
 
   // ------------------------------------------------------------------
   // Convoy lines: group entities by attrs.convoy_id (backend-tagged by
@@ -1802,7 +1977,92 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
         >
           {viirsMode === "off" ? "VIIRS" : "DNB"}
         </button>
+        <button
+          type="button"
+          title={
+            aoiMode === "idle"
+              ? "Draw a custom area of interest — click corners, double-click to finish"
+              : aoiMode === "drawing"
+                ? `Click corners on the map (${aoiPoints.length} so far) · double-click to finish · Esc to cancel`
+                : "Clear the drawn AOI"
+          }
+          onClick={() => {
+            if (aoiMode === "idle") {
+              setAoiPoints([]);
+              setAoiMode("drawing");
+            } else {
+              setAoiMode("idle");
+              setAoiPoints([]);
+            }
+          }}
+          style={{
+            appearance: "none",
+            border: "none",
+            borderLeft: "1px solid rgba(255,255,255,0.18)",
+            cursor: "pointer",
+            padding: "6px 10px",
+            background:
+              aoiMode === "idle" ? "transparent" : "rgba(240,201,48,0.28)",
+            color:
+              aoiMode === "idle" ? "rgba(255,255,255,0.7)" : "#ffe7a8",
+            textTransform: "uppercase",
+            minWidth: 64,
+          }}
+        >
+          {aoiMode === "idle" ? "+ AOI"
+           : aoiMode === "drawing" ? `drawing (${aoiPoints.length})`
+           : "✕ AOI"}
+        </button>
       </div>
+
+      {/* AOI result chip — appears once the polygon is closed, shows
+          how many entities fall inside. Sits LEFT side (right-side
+          is reserved for the toast stack) and BELOW the basemap toggle
+          row. */}
+      {aoiMode === "fixed" && aoiPoints.length >= 3 && (
+        <div style={{
+          position: "absolute",
+          top: 52,
+          left: 12,
+          background: "rgba(4,8,16,0.86)",
+          border: "1px solid #f0c930",
+          borderRadius: 4,
+          padding: "8px 12px",
+          fontFamily: "'IBM Plex Mono', monospace",
+          fontSize: 11,
+          letterSpacing: "0.06em",
+          color: "#ffe7a8",
+          zIndex: 2,
+          display: "flex", flexDirection: "column", gap: 2,
+        }}>
+          <div style={{ fontSize: 9, letterSpacing: "0.16em", opacity: 0.7 }}>
+            CUSTOM AOI · {aoiPoints.length} VERTICES
+          </div>
+          <div style={{ fontSize: 14, fontWeight: 600,
+                        fontVariantNumeric: "tabular-nums" }}>
+            {aoiCount} entit{aoiCount === 1 ? "y" : "ies"} inside
+          </div>
+          <button
+            type="button"
+            onClick={() => { setAoiMode("idle"); setAoiPoints([]); }}
+            style={{
+              appearance: "none",
+              border: "1px solid rgba(255,255,255,0.2)",
+              background: "transparent",
+              color: "rgba(255,255,255,0.7)",
+              borderRadius: 3,
+              padding: "3px 6px",
+              fontFamily: "inherit",
+              fontSize: 9,
+              cursor: "pointer",
+              marginTop: 4,
+              letterSpacing: "0.12em",
+            }}
+          >
+            CLEAR
+          </button>
+        </div>
+      )}
 
       {/* Anomaly banner — top-center. Shows a chip per anomaly category
           with live counts. Click any chip to fit-bounds-zoom to those
@@ -2047,8 +2307,84 @@ function AnomalyBanner({ entities, cfg, onZoomTo }) {
         </span>
         {" anomalous"}
       </div>
+      <button
+        type="button"
+        onClick={() => _downloadAnomaliesCsv(entities, anomalyTypes)}
+        disabled={totalAnomalies === 0}
+        title={totalAnomalies === 0
+          ? "No anomalies to export"
+          : `Download ${totalAnomalies} anomalies as CSV`}
+        style={{
+          appearance: "none",
+          background: totalAnomalies === 0 ? "transparent" : "rgba(255,255,255,0.04)",
+          border: `1px solid ${totalAnomalies === 0
+            ? "rgba(255,255,255,0.10)" : "rgba(255,255,255,0.3)"}`,
+          color: totalAnomalies === 0 ? "rgba(255,255,255,0.4)" : "#f0f4ff",
+          borderRadius: 3,
+          padding: "4px 8px",
+          cursor: totalAnomalies === 0 ? "default" : "pointer",
+          textTransform: "uppercase",
+          fontFamily: "'IBM Plex Mono', monospace",
+          fontSize: 10,
+          letterSpacing: "0.12em",
+          fontWeight: 600,
+        }}
+      >
+        ⬇ csv
+      </button>
     </div>
   );
+}
+
+// CSV export — dumps the current anomaly entities to a downloadable
+// file. Useful for the "send me a report" demo moment and as a real
+// operational tool (operators routinely paste these into briefings).
+// Client-side only via Blob+URL.createObjectURL; no backend trip.
+function _downloadAnomaliesCsv(entities, anomalyTypes) {
+  const anomSet = new Set(anomalyTypes);
+  const rows = entities.filter((e) => anomSet.has(e.type) ||
+                                       (e.attrs && e.attrs.convoy_id));
+  if (rows.length === 0) return;
+  const headers = [
+    "entity_id", "type", "name", "mmsi", "lon", "lat",
+    "first_seen", "last_seen", "speed_kn", "heading",
+    "priority", "confidence", "convoy_id", "loitering_hours",
+    "spoof_event_count", "notes",
+  ];
+  const escape = (v) => {
+    if (v == null) return "";
+    const s = String(v);
+    if (/[,"\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  };
+  const lines = [headers.join(",")];
+  for (const e of rows) {
+    const a = e.attrs || {};
+    lines.push([
+      e.id, e.type, e.name || "", a.mmsi || "",
+      e.lon, e.lat,
+      e.first_seen || "", e.last_seen || "",
+      a.speed_kn ?? "", a.heading ?? "",
+      e.priority ?? "", e.confidence ?? "",
+      a.convoy_id || "",
+      a.loitering_hours ?? "",
+      (a.spoof_events && a.spoof_events.length) || "",
+      (e.notes || "").replace(/\n/g, " "),
+    ].map(escape).join(","));
+  }
+  const csv = lines.join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `semper-safe-anomalies-${stamp}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  // Free the object-URL on the next tick — safe since the browser
+  // already initiated the download.
+  setTimeout(() => URL.revokeObjectURL(url), 250);
 }
 
 // ToastStack — corner notification stream. Surfaces new anomaly

@@ -683,6 +683,25 @@ class DecisionRequest(BaseModel):
     reason: str | None = None
 
 
+class DispatchRequest(BaseModel):
+    """Body for POST /maritime/dispatches.
+
+    A 'dispatch' is operator-initiated, separate from the engine's
+    recommendation acceptance flow: even when there's no pending
+    recommendation, the operator can still file a dispatch ('I'm
+    sending the cutter regardless') and have it audit-logged.
+
+    action_type values are free-form for now — the frontend constrains
+    them to a small enum (DISPATCH_PATROL, ALERT_COAST_GUARD,
+    TASK_SAR_SAT, LOG_ONLY) but the backend stores whatever it gets so
+    custom dispatch reasons aren't rejected mid-incident.
+    """
+    operator: str
+    entity_id: str
+    action_type: str
+    notes: str | None = None
+
+
 @app.get("/health")
 def health():
     # IMPORTANT: keep this endpoint cheap. Fly's edge proxy hits it every
@@ -1028,6 +1047,52 @@ def maritime_reject(eid: str, body: DecisionRequest):
     if not affected:
         raise HTTPException(404, "no pending recommendations")
     return {"rejected": [r.model_dump() for r in affected]}
+
+
+@app.post("/maritime/dispatches", status_code=201)
+def maritime_file_dispatch(body: DispatchRequest):
+    """File a formal dispatch — appends a 'dispatch_filed' audit entry
+    and returns the resulting audit hash as a verifiable proof token.
+
+    Why separate from approve/reject:
+      - approve/reject act on an existing engine recommendation; they
+        require a PENDING rec to exist for the entity.
+      - dispatch is the operator's own act-of-record. It works whether
+        or not the engine has a recommendation pending, captures a
+        free-form notes field, and is intentionally the SAME audit-
+        chain mechanism the rest of the system uses (no separate
+        dispatches table), so the integrity story is one chain to
+        verify, not two.
+
+    Returns: { audit_seq, audit_hash, prev_hash, dispatched_at }
+    Frontend renders the hash inline next to the FILE DISPATCH button
+    so the operator sees their action's proof immediately.
+    """
+    ent = maritime.entities.get(body.entity_id)
+    if ent is None:
+        raise HTTPException(404, "entity not found")
+
+    entry = audit_log.append(
+        actor=body.operator,
+        event_type="dispatch_filed",
+        payload={
+            "entity_id": body.entity_id,
+            "entity_type": ent.type.value,
+            "action_type": body.action_type,
+            "notes": body.notes or "",
+            "entity_name": ent.attrs.get("name"),
+            "entity_mmsi": ent.attrs.get("mmsi"),
+        },
+    )
+    return {
+        "audit_seq": entry.seq,
+        "audit_hash": entry.self_hash,
+        "prev_hash": entry.prev_hash,
+        "dispatched_at": entry.t.isoformat(),
+        "operator": body.operator,
+        "entity_id": body.entity_id,
+        "action_type": body.action_type,
+    }
 
 
 # Wildfire domain
