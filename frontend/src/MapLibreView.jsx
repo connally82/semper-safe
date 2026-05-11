@@ -666,6 +666,26 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
   //              in-progress vertex list when 'drawing'.
   const [aoiMode, setAoiMode] = useState("idle");
   const [aoiPoints, setAoiPoints] = useState([]);
+
+  // Saved AOI presets — operator can name + save a drawn polygon and
+  // recall it instantly. Stored in localStorage as [{id, name,
+  // points, created_at}]. Limit 12 entries to keep the picker manageable.
+  const SAVED_AOI_STORAGE_KEY = "ss-saved-aois";
+  const SAVED_AOI_MAX = 12;
+  const [savedAois, setSavedAois] = useState(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = window.localStorage.getItem(SAVED_AOI_STORAGE_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch { return []; }
+  });
+  const persistSavedAois = (next) => {
+    setSavedAois(next);
+    try {
+      window.localStorage.setItem(SAVED_AOI_STORAGE_KEY, JSON.stringify(next));
+    } catch {}
+  };
+  const [savedAoisPickerOpen, setSavedAoisPickerOpen] = useState(false);
   // Ref mirrors so map event listeners (set up once) can read fresh state.
   const aoiModeRef = useRef(aoiMode);
   const aoiPointsRef = useRef(aoiPoints);
@@ -3062,7 +3082,8 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
           letterSpacing: "0.06em",
           color: "#ffe7a8",
           zIndex: 2,
-          display: "flex", flexDirection: "column", gap: 2,
+          display: "flex", flexDirection: "column", gap: 4,
+          minWidth: 220,
         }}>
           <div style={{ fontSize: 9, letterSpacing: "0.16em", opacity: 0.7 }}>
             CUSTOM AOI · {aoiPoints.length} VERTICES
@@ -3071,25 +3092,160 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
                         fontVariantNumeric: "tabular-nums" }}>
             {aoiCount} entit{aoiCount === 1 ? "y" : "ies"} inside
           </div>
+          <div style={{ display: "flex", gap: 4, marginTop: 4, flexWrap: "wrap" }}>
+            <button
+              type="button"
+              disabled={savedAois.length >= SAVED_AOI_MAX}
+              onClick={() => {
+                const name = window.prompt(
+                  `Save AOI as (max ${SAVED_AOI_MAX} presets):`,
+                  `AOI ${savedAois.length + 1}`);
+                if (!name) return;
+                const next = [...savedAois, {
+                  id: `aoi_${Date.now()}`,
+                  name: name.slice(0, 32),
+                  points: aoiPoints.slice(),
+                  created_at: new Date().toISOString(),
+                }];
+                persistSavedAois(next);
+              }}
+              title={savedAois.length >= SAVED_AOI_MAX
+                ? `Limit reached — delete a preset to save another`
+                : `Save this polygon as a preset`}
+              style={{
+                appearance: "none",
+                border: "1px solid #f0c930",
+                background: "rgba(240,201,48,0.18)",
+                color: "#ffe7a8",
+                borderRadius: 3,
+                padding: "3px 8px",
+                fontFamily: "inherit",
+                fontSize: 9,
+                cursor: savedAois.length >= SAVED_AOI_MAX ? "default" : "pointer",
+                letterSpacing: "0.12em",
+                opacity: savedAois.length >= SAVED_AOI_MAX ? 0.5 : 1,
+              }}
+            >
+              💾 SAVE
+            </button>
+            <button
+              type="button"
+              onClick={() => { setAoiMode("idle"); setAoiPoints([]); }}
+              style={{
+                appearance: "none",
+                border: "1px solid rgba(255,255,255,0.2)",
+                background: "transparent",
+                color: "rgba(255,255,255,0.7)",
+                borderRadius: 3,
+                padding: "3px 8px",
+                fontFamily: "inherit",
+                fontSize: 9,
+                cursor: "pointer",
+                letterSpacing: "0.12em",
+              }}
+            >
+              CLEAR
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Saved-AOIs picker — small floating menu below the AOI toggle.
+          Always present when there's >= 1 saved preset, regardless of
+          current draw state, so the operator can recall a saved view
+          even without an active polygon. */}
+      {savedAois.length > 0 && (
+        <div style={{
+          position: "absolute",
+          top: 52,
+          left: aoiMode === "fixed" && aoiPoints.length >= 3 ? 246 : 12,
+          background: "rgba(4,8,16,0.86)",
+          border: "1px solid rgba(255,255,255,0.18)",
+          borderRadius: 4,
+          padding: "6px 8px",
+          fontFamily: "'IBM Plex Mono', monospace",
+          fontSize: 10,
+          color: "rgba(255,255,255,0.85)",
+          zIndex: 2,
+          minWidth: 140,
+        }}>
           <button
             type="button"
-            onClick={() => { setAoiMode("idle"); setAoiPoints([]); }}
+            onClick={() => setSavedAoisPickerOpen(o => !o)}
             style={{
               appearance: "none",
-              border: "1px solid rgba(255,255,255,0.2)",
               background: "transparent",
+              border: "none",
               color: "rgba(255,255,255,0.7)",
-              borderRadius: 3,
-              padding: "3px 6px",
               fontFamily: "inherit",
               fontSize: 9,
+              letterSpacing: "0.16em",
+              textTransform: "uppercase",
               cursor: "pointer",
-              marginTop: 4,
-              letterSpacing: "0.12em",
+              padding: 0,
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              width: "100%",
+              justifyContent: "space-between",
             }}
           >
-            CLEAR
+            <span>📁 saved AOIs · {savedAois.length}</span>
+            <span>{savedAoisPickerOpen ? "▾" : "▸"}</span>
           </button>
+          {savedAoisPickerOpen && (
+            <div style={{ marginTop: 6, display: "flex",
+                          flexDirection: "column", gap: 2 }}>
+              {savedAois.map((aoi) => (
+                <div key={aoi.id} style={{ display: "flex", gap: 4 }}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAoiPoints(aoi.points.slice());
+                      setAoiMode("fixed");
+                      setSavedAoisPickerOpen(false);
+                    }}
+                    title={`${aoi.points.length} vertices · saved ${aoi.created_at?.slice(0, 16) || ""}`}
+                    style={{
+                      flex: 1,
+                      appearance: "none",
+                      background: "rgba(255,255,255,0.04)",
+                      border: "1px solid rgba(255,255,255,0.15)",
+                      color: "#f0f4ff",
+                      fontFamily: "inherit",
+                      fontSize: 10,
+                      padding: "3px 6px",
+                      cursor: "pointer",
+                      textAlign: "left",
+                      borderRadius: 2,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    ↺ {aoi.name}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => persistSavedAois(
+                      savedAois.filter((x) => x.id !== aoi.id))}
+                    title="Delete preset"
+                    style={{
+                      appearance: "none",
+                      background: "transparent",
+                      border: "1px solid rgba(255,255,255,0.15)",
+                      color: "rgba(255,255,255,0.5)",
+                      fontFamily: "inherit",
+                      fontSize: 10,
+                      padding: "3px 6px",
+                      cursor: "pointer",
+                      borderRadius: 2,
+                    }}
+                  >×</button>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 

@@ -1275,6 +1275,42 @@ def maritime_daily_brief():
     )
 
 
+@app.get("/maritime/entities/{eid}/audit")
+def maritime_entity_audit(eid: str, limit: int = 100):
+    """Audit-chain entries tagged to a specific entity.
+
+    Filters audit_log.all() to entries whose payload references the
+    entity_id. Useful for surfacing the complete lifecycle of an
+    anomaly — creation, reclassifications, recommendations, decisions,
+    dispatches — in one place on the side panel.
+
+    Bounded by `limit` (default 100, most recent first). The audit log
+    is hot-archived to R2 once it grows past a few hundred entries, so
+    deep history may not be in the live table — but for an entity that
+    only just emerged today this covers the full chain.
+    """
+    entries = audit_log.all()
+    matches = []
+    for e in entries:
+        payload = e.payload or {}
+        if payload.get("entity_id") == eid:
+            matches.append({
+                "seq": e.seq,
+                "t": e.t.isoformat(),
+                "actor": e.actor,
+                "event_type": e.event_type,
+                "payload": payload,
+                "self_hash": e.self_hash,
+                "prev_hash": e.prev_hash,
+            })
+    matches.reverse()
+    return {
+        "entity_id": eid,
+        "n_total_matches": len(matches),
+        "entries": matches[:limit],
+    }
+
+
 @app.get("/maritime/onshore_assets")
 def maritime_onshore_assets():
     """Return the static onshore-asset catalog (USCG stations, Navy

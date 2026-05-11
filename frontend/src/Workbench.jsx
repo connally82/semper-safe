@@ -713,6 +713,163 @@ function NearbyCandidatesSection({ entity, allEntities, onSelect, cfg }) {
   );
 }
 
+// EntityAuditPanel — fetches and renders every audit-chain entry
+// tagged to the selected entity. Lifecycle view: creation,
+// reclassifications, recommendations, dispatches, decisions all in
+// one chronological list with audit hashes.
+//
+// Fetches on entity change with an AbortController; renders a compact
+// timeline that the operator can scan without opening the bottom
+// audit feed. Truncates the display to 10 most recent entries with a
+// summary count — full chain is still in the global audit feed.
+function EntityAuditPanel({ entity, apiBase }) {
+  const [entries, setEntries] = useState(null);
+  const [err, setErr] = useState(null);
+  useEffect(() => {
+    if (!entity?.id) { setEntries(null); return; }
+    const ctrl = new AbortController();
+    fetch(`${apiBase}/maritime/entities/${entity.id}/audit?limit=50`,
+          { signal: ctrl.signal })
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => {
+        if (!data) { setErr("audit fetch failed"); return; }
+        setEntries(data.entries || []);
+      })
+      .catch((e) => {
+        if (e.name === "AbortError") return;
+        setErr(String(e.message || e));
+      });
+    return () => ctrl.abort();
+  }, [entity?.id, apiBase]);
+
+  const eventColor = (et) => {
+    if (et === "entity_created") return PALETTE.good;
+    if (et === "entity_reclassified") return PALETTE.warn;
+    if (et === "recommendation_made") return PALETTE.alert;
+    if (et === "decision") return "#76e0d2";
+    if (et === "dispatch_filed") return PALETTE.good;
+    if (et === "ais_spoof_suspected") return "#ff5cd2";
+    if (et === "convoy_detected") return "#5dd6c4";
+    return PALETTE.muted;
+  };
+
+  if (entries === null && !err) {
+    return (
+      <div style={{
+        padding: "10px 18px", borderTop: `1px solid ${PALETTE.border}`,
+        fontFamily: "'IBM Plex Mono', monospace", fontSize: 10,
+        color: PALETTE.muted, letterSpacing: "0.15em",
+      }}>ENTITY AUDIT · LOADING…</div>
+    );
+  }
+  if (err) {
+    return (
+      <div style={{
+        padding: "10px 18px", borderTop: `1px solid ${PALETTE.border}`,
+        fontFamily: "'IBM Plex Sans', sans-serif", fontSize: 11,
+        color: PALETTE.muted, fontStyle: "italic",
+      }}>Entity audit unavailable — {err}</div>
+    );
+  }
+  if (entries.length === 0) {
+    return (
+      <div style={{
+        padding: "10px 18px", borderTop: `1px solid ${PALETTE.border}`,
+        fontFamily: "'IBM Plex Sans', sans-serif", fontSize: 11,
+        color: PALETTE.muted, fontStyle: "italic",
+      }}>
+        No audit entries reference this entity yet. New ones appear
+        as the engine reclassifies, makes recommendations, or you
+        file dispatches.
+      </div>
+    );
+  }
+
+  const summarize = (e) => {
+    const p = e.payload || {};
+    switch (e.event_type) {
+      case "entity_created":
+        return `Created as ${p.type || "?"}` + (p.via ? ` via ${p.via}` : "");
+      case "entity_reclassified":
+        return `→ ${p.to || "?"}` +
+               (p.reason ? ` (${p.reason})` : "") +
+               (p.stationary_hours != null ? ` · ${p.stationary_hours}h stationary` : "") +
+               (p.implied_kn != null ? ` · ${p.implied_kn} kn implied` : "") +
+               (p.declared_port ? ` · declared ${p.declared_port}` : "");
+      case "recommendation_made":
+        return `Recommendation · ${p.action || "?"}`;
+      case "decision":
+        return `Decision · ${p.decision || "?"}` +
+               (p.reason ? ` (${p.reason})` : "");
+      case "dispatch_filed":
+        return `Dispatch · ${p.action_type || "?"}` +
+               (p.notes ? ` (${p.notes})` : "");
+      case "ais_spoof_suspected":
+        return `Spoof event · implied ${p.implied_kn ?? "?"} kn over ${p.dt_s ?? "?"}s`;
+      case "convoy_detected":
+        return `Joined convoy · ${p.n_members ?? "?"} members`;
+      case "observation_associated":
+        return `Observation linked (${p.method || "?"})`;
+      default:
+        return e.event_type;
+    }
+  };
+
+  return (
+    <div style={{
+      padding: "10px 18px",
+      borderTop: `1px solid ${PALETTE.border}`,
+    }}>
+      <div style={{
+        fontFamily: "'IBM Plex Mono', monospace", fontSize: 9,
+        color: PALETTE.muted, letterSpacing: "0.2em",
+        marginBottom: 6,
+      }}>
+        ENTITY AUDIT CHAIN · {entries.length} EVENT{entries.length === 1 ? "" : "S"}
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+        {entries.slice(0, 10).map((e) => (
+          <div key={e.seq} style={{
+            display: "grid",
+            gridTemplateColumns: "44px 1fr auto",
+            gap: 8, alignItems: "baseline",
+            fontFamily: "'IBM Plex Mono', monospace", fontSize: 10,
+          }}>
+            <span style={{ color: PALETTE.muted }}>
+              {e.t.slice(11, 19)}Z
+            </span>
+            <span>
+              <span style={{
+                color: eventColor(e.event_type), fontWeight: 500,
+              }}>{summarize(e)}</span>
+              {e.actor !== "system" && (
+                <span style={{ color: PALETTE.dim, marginLeft: 6 }}>
+                  · {e.actor}
+                </span>
+              )}
+            </span>
+            <span style={{
+              color: PALETTE.dim, fontVariantNumeric: "tabular-nums",
+              fontSize: 9,
+            }}>
+              #{e.self_hash.slice(0, 8)}
+            </span>
+          </div>
+        ))}
+      </div>
+      {entries.length > 10 && (
+        <div style={{
+          marginTop: 6, fontSize: 9, color: PALETTE.muted,
+          fontFamily: "'IBM Plex Mono', monospace",
+          fontStyle: "italic",
+        }}>
+          + {entries.length - 10} earlier — see the global AUDIT STREAM panel
+        </div>
+      )}
+    </div>
+  );
+}
+
 // MobileDrawer — wraps the side panel as a bottom drawer when the
 // viewport is too narrow for a sidebar (<900px). Shows a peek-tab
 // when collapsed (with the current entity name as a hint) and
@@ -909,15 +1066,49 @@ function OpticalChipSection({ entity, apiBase }) {
 // "compliance story" surface: operator files a formal dispatch, the
 // backend appends a hash-chained audit entry, the proof receipt
 // renders inline next to the button.
+// Per-anomaly-type default dispatch action. Reflects the operational
+// pattern an experienced watch officer would reach for first:
+//   - dark_vessel → task SAR (we need a non-cooperative re-fix)
+//   - ais_spoofed → alert Coast Guard (lying about position, dispatch)
+//   - port_skipping → dispatch patrol aircraft (off-route, intercept window)
+//   - loitering_vessel → log only (observe-then-decide)
+//   - ais_gap → log only (passive watch for resumption)
+//   - convoys (no dedicated type) → log only via the fallthrough.
+const DEFAULT_DISPATCH_ACTION = {
+  dark_vessel: "task_sar_satellite",
+  ais_spoofed: "alert_coast_guard",
+  port_skipping: "dispatch_patrol_aircraft",
+  loitering_vessel: "log_only",
+  ais_gap: "log_only",
+  vessel: "log_only",
+};
+const DISPATCH_ACTION_CHOICES = [
+  { value: "task_sar_satellite",      label: "Task SAR satellite" },
+  { value: "dispatch_patrol_aircraft", label: "Dispatch patrol aircraft" },
+  { value: "alert_coast_guard",       label: "Alert Coast Guard" },
+  { value: "log_only",                label: "Log only — no dispatch" },
+];
+
 function DispatchSection({ entity, cfg, apiBase }) {
   const [busy, setBusy] = useState(false);
   const [receipt, setReceipt] = useState(null);
   const [err, setErr] = useState(null);
 
-  if (!entity) return null;
-  const defaultAction = entity.recommendation
-    ? entity.recommendation.action
+  // Pick the smartest default: engine recommendation if there is one,
+  // otherwise the per-anomaly-type template.
+  const templateDefault = entity
+    ? (entity.recommendation?.action
+       || DEFAULT_DISPATCH_ACTION[entity.type]
+       || "log_only")
     : "log_only";
+  const [actionType, setActionType] = useState(templateDefault);
+  const [notes, setNotes] = useState("");
+
+  // Re-seed the action_type when the selected entity changes — the
+  // operator shouldn't carry a previous entity's choice into a new one.
+  useEffect(() => { setActionType(templateDefault); setNotes(""); setReceipt(null); }, [entity?.id]);
+
+  if (!entity) return null;
 
   const file = async () => {
     setBusy(true); setErr(null);
@@ -928,8 +1119,8 @@ function DispatchSection({ entity, cfg, apiBase }) {
         body: JSON.stringify({
           operator: cfg.operator,
           entity_id: entity.id,
-          action_type: defaultAction,
-          notes: "operator-initiated dispatch",
+          action_type: actionType,
+          notes: notes || "operator-initiated dispatch",
         }),
       });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -979,7 +1170,56 @@ function DispatchSection({ entity, cfg, apiBase }) {
   }
 
   return (
-    <div style={{ marginTop: 12 }}>
+    <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+      {/* Action picker — defaults to the per-anomaly-type template
+          (or engine recommendation if present) but the operator can
+          override before filing. */}
+      <label style={{
+        fontFamily: "'IBM Plex Mono', monospace", fontSize: 9,
+        color: PALETTE.muted, letterSpacing: "0.18em",
+      }}>
+        ACTION
+      </label>
+      <select
+        value={actionType}
+        onChange={(e) => setActionType(e.target.value)}
+        style={{
+          appearance: "none",
+          background: PALETTE.surface2 || "#1a2330",
+          border: `1px solid ${PALETTE.border}`,
+          color: PALETTE.text,
+          fontFamily: "'IBM Plex Mono', monospace",
+          fontSize: 11,
+          padding: "5px 8px",
+          borderRadius: 3,
+        }}
+      >
+        {DISPATCH_ACTION_CHOICES.map((c) => (
+          <option key={c.value} value={c.value}>{c.label}</option>
+        ))}
+      </select>
+      <label style={{
+        fontFamily: "'IBM Plex Mono', monospace", fontSize: 9,
+        color: PALETTE.muted, letterSpacing: "0.18em",
+      }}>
+        NOTES (optional)
+      </label>
+      <input
+        type="text"
+        value={notes}
+        onChange={(e) => setNotes(e.target.value)}
+        placeholder="free-form context"
+        style={{
+          appearance: "none",
+          background: PALETTE.surface2 || "#1a2330",
+          border: `1px solid ${PALETTE.border}`,
+          color: PALETTE.text,
+          fontFamily: "'IBM Plex Sans', sans-serif",
+          fontSize: 11,
+          padding: "5px 8px",
+          borderRadius: 3,
+        }}
+      />
       <button
         type="button"
         disabled={busy}
@@ -997,11 +1237,20 @@ function DispatchSection({ entity, cfg, apiBase }) {
           cursor: busy ? "default" : "pointer",
           textTransform: "uppercase",
           fontWeight: 600,
-          width: "100%",
+          marginTop: 2,
         }}
       >
         {busy ? "filing…" : "▸ file dispatch · audit-logged"}
       </button>
+      {actionType !== templateDefault && (
+        <div style={{
+          fontFamily: "'IBM Plex Mono', monospace", fontSize: 9,
+          color: PALETTE.muted, marginTop: -2,
+          letterSpacing: "0.08em",
+        }}>
+          (overriding template default {templateDefault})
+        </div>
+      )}
       {err && (
         <div style={{
           marginTop: 6,
@@ -1288,6 +1537,8 @@ function LineagePanel({ entity, pinnedEntity, allEntities, onSelect, onPin, onUn
           ))}
         </div>
       </div>
+
+      <EntityAuditPanel entity={entity} apiBase={API_BASE} />
 
       {SUSPECT_TYPES.has(entity.type) && (
         <NearbyCandidatesSection
