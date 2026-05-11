@@ -1275,6 +1275,35 @@ def maritime_daily_brief():
     )
 
 
+@app.get("/maritime/onshore_assets")
+def maritime_onshore_assets():
+    """Return the static onshore-asset catalog (USCG stations, Navy
+    facilities) as GeoJSON for the frontend overlay layer.
+
+    Static data — assets don't move at human-decision time scales.
+    Cache header lets the browser hold it for an hour.
+    """
+    from fastapi.responses import JSONResponse
+    import onshore_assets
+
+    features = [
+        {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [a["lon"], a["lat"]]},
+            "properties": {
+                "name": a["name"],
+                "type": a["type"],
+                "note": a.get("note", ""),
+            },
+        }
+        for a in onshore_assets.list_assets()
+    ]
+    return JSONResponse(
+        {"type": "FeatureCollection", "features": features},
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
 @app.get("/maritime/dispatches/recent")
 def maritime_recent_dispatches(hours: int = 24):
     """Return positions of dispatch_filed audit entries in the last

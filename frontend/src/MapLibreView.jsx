@@ -125,6 +125,14 @@ const TRACK_SOURCE_ID = "ss-selected-track";
 const TRACK_LAYER_ID = "ss-selected-track-line";
 const TRACK_HEAD_LAYER_ID = "ss-selected-track-head";
 
+// Pinned-for-comparison entity track — mirrors the SELECTED track but
+// in amber so the two tracks are visually distinguishable when an
+// operator is comparing trajectories.
+const PINNED_TRACK_SOURCE_ID = "ss-pinned-track";
+const PINNED_TRACK_LAYER_ID = "ss-pinned-track-line";
+const PINNED_HEAD_LAYER_ID = "ss-pinned-track-head";
+const PINNED_TRACK_COLOR = "#ffd897";
+
 // Candidate-hull halos — when an anomaly entity is selected, the 5-km
 // neighborhood of AIS-cooperative vessels gets ringed on the map so
 // the operator sees the side-panel "candidate hulls" list spatially.
@@ -168,6 +176,24 @@ const WORKLOAD_SOURCE_ID = "ss-workload-heatmap";
 const WORKLOAD_LAYER_ID = "ss-workload-heatmap-layer";
 const WORKLOAD_STORAGE_KEY = "ss-workload-heatmap";
 const WORKLOAD_REFRESH_MS = 90 * 1000;   // dispatches are rare; 90s is plenty
+
+// Onshore assets — USCG stations + Navy facilities. Static data;
+// fetched once on toggle-on.
+const ASSETS_SOURCE_ID = "ss-onshore-assets";
+const ASSETS_LAYER_ID = "ss-onshore-assets-layer";
+const ASSETS_LABEL_LAYER_ID = "ss-onshore-assets-label";
+const ASSETS_STORAGE_KEY = "ss-onshore-assets";
+
+// Active-dispatch state — once an operator files a dispatch, the
+// responsible entity stays ringed on the map for ACTIVE_DISPATCH_TTL_MS.
+// Lets the operator visually track 'what I'm currently watching' as
+// the underlying anomaly state changes (e.g. a dark vessel that's now
+// been AIS-matched still reads as 'under dispatch').
+const ACTIVE_DISPATCH_TTL_MS = 4 * 60 * 60 * 1000;   // 4 hours
+const ACTIVE_DISPATCH_STORAGE_KEY = "ss-active-dispatches";
+const ACTIVE_DISPATCH_SOURCE_ID = "ss-active-dispatch";
+const ACTIVE_DISPATCH_RING_LAYER_ID = "ss-active-dispatch-ring";
+const ACTIVE_DISPATCH_LABEL_LAYER_ID = "ss-active-dispatch-label";
 
 // Cap how many trails we fetch — saves the backend from N parallel
 // /entities/{id}/track hits when there are 50+ anomalies on the map.
@@ -502,7 +528,7 @@ function _playDarkVesselPing() {
   }
 }
 
-export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
+export default function MapLibreView({ entities, selectedId, pinnedId, onSelect, cfg }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const markersRef = useRef(new Map());      // id → maplibregl.Marker
@@ -572,6 +598,67 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
     try { window.localStorage.setItem(WORKLOAD_STORAGE_KEY, on ? "1" : "0"); }
     catch {}
   };
+  const [assetsOn, setAssetsOn] = useState(() => {
+    if (typeof window === "undefined") return false;
+    try { return window.localStorage.getItem(ASSETS_STORAGE_KEY) === "1"; }
+    catch { return false; }
+  });
+  const persistAssets = (on) => {
+    setAssetsOn(on);
+    try { window.localStorage.setItem(ASSETS_STORAGE_KEY, on ? "1" : "0"); }
+    catch {}
+  };
+
+  // Active dispatches — { entity_id, dispatched_at_ms, action_type }[].
+  // Loaded from localStorage so a reload doesn't lose tracking. The
+  // DispatchSection component (in Workbench.jsx) dispatches a
+  // `ss-dispatch-filed` window event after a successful POST; we
+  // listen for it here and append.
+  const [activeDispatches, setActiveDispatches] = useState(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = window.localStorage.getItem(ACTIVE_DISPATCH_STORAGE_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      const cutoff = Date.now() - ACTIVE_DISPATCH_TTL_MS;
+      return parsed.filter((d) => d.dispatched_at_ms > cutoff);
+    } catch { return []; }
+  });
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        ACTIVE_DISPATCH_STORAGE_KEY, JSON.stringify(activeDispatches),
+      );
+    } catch {}
+  }, [activeDispatches]);
+
+  useEffect(() => {
+    const handler = (e) => {
+      const d = e.detail || {};
+      if (!d.entity_id) return;
+      setActiveDispatches((cur) => {
+        // Dedupe — refile of same entity replaces the timestamp.
+        const filtered = cur.filter((x) => x.entity_id !== d.entity_id);
+        return [...filtered, {
+          entity_id: d.entity_id,
+          dispatched_at_ms: Date.now(),
+          action_type: d.action_type || "log_only",
+          audit_seq: d.audit_seq,
+        }];
+      });
+    };
+    window.addEventListener("ss-dispatch-filed", handler);
+    return () => window.removeEventListener("ss-dispatch-filed", handler);
+  }, []);
+
+  // Periodic TTL sweep — evict expired dispatches every 60 s.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const cutoff = Date.now() - ACTIVE_DISPATCH_TTL_MS;
+      setActiveDispatches((cur) => cur.filter((d) => d.dispatched_at_ms > cutoff));
+    }, 60_000);
+    return () => window.clearInterval(id);
+  }, []);
 
   // AOI drawing state.
   //   aoiMode: 'idle' | 'drawing' | 'fixed'
@@ -1087,7 +1174,45 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
       });
     };
 
+    // Pinned-track layer — amber-tinted twin of TRACK_LAYER for the
+    // pinned comparison entity. Drawn the same way so the operator
+    // can compare two trajectories side by side.
+    const ensurePinnedTrackLayers = () => {
+      if (map.getSource(PINNED_TRACK_SOURCE_ID)) return;
+      map.addSource(PINNED_TRACK_SOURCE_ID, {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      map.addLayer({
+        id: PINNED_TRACK_LAYER_ID,
+        type: "line",
+        source: PINNED_TRACK_SOURCE_ID,
+        filter: ["==", "$type", "LineString"],
+        paint: {
+          "line-color": PINNED_TRACK_COLOR,
+          "line-width": 2,
+          "line-opacity": 0.85,
+          "line-dasharray": [4, 2],
+        },
+        layout: { "line-cap": "round", "line-join": "round" },
+      });
+      map.addLayer({
+        id: PINNED_HEAD_LAYER_ID,
+        type: "circle",
+        source: PINNED_TRACK_SOURCE_ID,
+        filter: ["==", "$type", "Point"],
+        paint: {
+          "circle-color": PINNED_TRACK_COLOR,
+          "circle-radius": 2.5,
+          "circle-opacity": 0.85,
+          "circle-stroke-color": "#040810",
+          "circle-stroke-width": 0.5,
+        },
+      });
+    };
+
     map.on("style.load", ensureTrackLayers);
+    map.on("style.load", ensurePinnedTrackLayers);
     map.on("style.load", ensureCandidateLayers);
     map.on("style.load", ensureConvoyLayers);
     map.on("style.load", ensureAoiLayers);
@@ -1132,8 +1257,100 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
       });
     };
 
+    // Onshore assets — anchor icon for USCG, star for Navy. Visibility
+    // toggled via the ASSETS chip; data fetched once on toggle-on.
+    const ensureAssetLayers = () => {
+      if (map.getSource(ASSETS_SOURCE_ID)) return;
+      map.addSource(ASSETS_SOURCE_ID, {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      map.addLayer({
+        id: ASSETS_LAYER_ID,
+        type: "circle",
+        source: ASSETS_SOURCE_ID,
+        layout: { visibility: "none" },
+        paint: {
+          "circle-color": [
+            "match", ["get", "type"],
+            "uscg", "#5fd093",     // USCG green
+            "navy", "#7ab8ff",     // Navy blue
+            "#a8a8b8",
+          ],
+          "circle-radius": 6,
+          "circle-stroke-color": "#040810",
+          "circle-stroke-width": 1.5,
+          "circle-opacity": 0.95,
+        },
+      });
+      map.addLayer({
+        id: ASSETS_LABEL_LAYER_ID,
+        type: "symbol",
+        source: ASSETS_SOURCE_ID,
+        layout: {
+          visibility: "none",
+          "text-field": ["get", "name"],
+          "text-font": ["Open Sans Regular"],
+          "text-size": 10,
+          "text-anchor": "left",
+          "text-offset": [0.8, 0],
+          "text-allow-overlap": false,
+        },
+        paint: {
+          "text-color": "#f0f4ff",
+          "text-halo-color": "#040810",
+          "text-halo-width": 1.5,
+        },
+      });
+    };
+
+    // Active-dispatch rings — yellow ring + "DISPATCHED" label around
+    // every entity the operator has filed a dispatch on in the last
+    // 4 h. The ring uses a different style than candidate halos so
+    // they don't visually conflict.
+    const ensureActiveDispatchLayers = () => {
+      if (map.getSource(ACTIVE_DISPATCH_SOURCE_ID)) return;
+      map.addSource(ACTIVE_DISPATCH_SOURCE_ID, {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      map.addLayer({
+        id: ACTIVE_DISPATCH_RING_LAYER_ID,
+        type: "circle",
+        source: ACTIVE_DISPATCH_SOURCE_ID,
+        paint: {
+          "circle-color": "rgba(0,0,0,0)",
+          "circle-radius": 16,
+          "circle-stroke-color": "#ffd897",
+          "circle-stroke-width": 2.5,
+          "circle-stroke-opacity": 0.85,
+        },
+      });
+      map.addLayer({
+        id: ACTIVE_DISPATCH_LABEL_LAYER_ID,
+        type: "symbol",
+        source: ACTIVE_DISPATCH_SOURCE_ID,
+        layout: {
+          "text-field": ["get", "label"],
+          "text-font": ["Open Sans Regular"],
+          "text-size": 9.5,
+          "text-anchor": "top",
+          "text-offset": [0, 1.6],
+          "text-allow-overlap": false,
+          "text-letter-spacing": 0.08,
+        },
+        paint: {
+          "text-color": "#ffd897",
+          "text-halo-color": "#040810",
+          "text-halo-width": 1.6,
+        },
+      });
+    };
+
     map.on("style.load", ensureHeatmapLayers);
     map.on("style.load", ensureWorkloadLayers);
+    map.on("style.load", ensureAssetLayers);
+    map.on("style.load", ensureActiveDispatchLayers);
     map.on("style.load", ensureSarLayers);
 
     // Click → popup. Detections are densely packed so attach to the
@@ -1373,6 +1590,35 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
         return;
       }
       setAoiMode("fixed");
+    });
+
+    const popupForAsset = (e) => {
+      const f = e.features?.[0];
+      if (!f) return;
+      const p = f.properties || {};
+      const html = `
+        <div style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;
+                    font-size:11px;letter-spacing:0.04em;color:#040810;
+                    min-width:220px;">
+          <div style="font-weight:bold;text-transform:uppercase;
+                      margin-bottom:4px;color:${p.type === 'navy' ? '#1a4f8e' : '#1a5f6e'};">
+            ${p.type === 'navy' ? 'US NAVY' : 'US COAST GUARD'}
+          </div>
+          <div style="font-weight:600;font-size:12px;">${p.name || ''}</div>
+          ${p.note ? `<div style="margin-top:6px;color:#555;font-size:10px;
+                                  line-height:1.4;">${p.note}</div>` : ''}
+        </div>`;
+      new maplibregl.Popup({ closeButton: true, maxWidth: "280px" })
+        .setLngLat(f.geometry.coordinates)
+        .setHTML(html)
+        .addTo(map);
+    };
+    map.on("click", ASSETS_LAYER_ID, popupForAsset);
+    map.on("mouseenter", ASSETS_LAYER_ID, () => {
+      map.getCanvas().style.cursor = "pointer";
+    });
+    map.on("mouseleave", ASSETS_LAYER_ID, () => {
+      map.getCanvas().style.cursor = "";
     });
 
     map.on("click", SAR_DETECTIONS_LAYER_ID, popupForDetection);
@@ -1689,6 +1935,56 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
   }, [selectedId, ready, entitiesById, cfg]);
 
   // ------------------------------------------------------------------
+  // Pinned-track render — same shape as the selected-track effect but
+  // tied to pinnedId. Clears the pinned source when there's no pin.
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const src = map.getSource(PINNED_TRACK_SOURCE_ID);
+    if (!src) return;
+    if (!pinnedId || pinnedId === selectedId) {
+      // Don't draw the pinned track twice if it equals the selection.
+      src.setData({ type: "FeatureCollection", features: [] });
+      return;
+    }
+    const ctrl = new AbortController();
+    fetchTrack(cfg.apiPath, pinnedId, ctrl.signal)
+      .then((data) => {
+        if (ctrl.signal.aborted) return;
+        const points = (data.track || []).filter(
+          (p) => typeof p.lon === "number" && typeof p.lat === "number",
+        );
+        if (points.length < 2) {
+          src.setData({ type: "FeatureCollection", features: [] });
+          return;
+        }
+        const features = [{
+          type: "Feature",
+          geometry: {
+            type: "LineString",
+            coordinates: points.map((p) => [p.lon, p.lat]),
+          },
+          properties: {},
+        }];
+        for (const p of points) {
+          features.push({
+            type: "Feature",
+            geometry: { type: "Point", coordinates: [p.lon, p.lat] },
+            properties: {},
+          });
+        }
+        src.setData({ type: "FeatureCollection", features });
+      })
+      .catch((err) => {
+        if (err.name === "AbortError") return;
+        // eslint-disable-next-line no-console
+        console.warn("pinned track fetch failed:", err);
+      });
+    return () => ctrl.abort();
+  }, [pinnedId, selectedId, ready, cfg]);
+
+  // ------------------------------------------------------------------
   // Auto-zoom on select: when the operator picks an entity from the
   // queue OR clicks one on the map, smoothly fly to it at vessel-
   // visible zoom (z=13 ≈ 1 px = ~10 m at this latitude — matches the
@@ -1983,6 +2279,65 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
       );
     }
   }, [renderEntities, heatmapOn, ready]);
+
+  // ------------------------------------------------------------------
+  // Active dispatch rings — recompute features whenever the dispatch
+  // list OR the entity list changes (we need the entity's current
+  // position to draw the ring at the right place).
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const src = map.getSource(ACTIVE_DISPATCH_SOURCE_ID);
+    if (!src) return;
+    const features = [];
+    for (const d of activeDispatches) {
+      const ent = entitiesById.get(d.entity_id);
+      if (!ent) continue;
+      if (typeof ent.lon !== "number" || typeof ent.lat !== "number") continue;
+      const ageMin = Math.max(0, Math.round(
+        (Date.now() - d.dispatched_at_ms) / 60_000));
+      const ageStr = ageMin < 60 ? `${ageMin}m` : `${(ageMin / 60).toFixed(1)}h`;
+      features.push({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: [ent.lon, ent.lat] },
+        properties: {
+          entity_id: d.entity_id,
+          label: `DISPATCHED · ${ageStr} ago`,
+        },
+      });
+    }
+    src.setData({ type: "FeatureCollection", features });
+  }, [activeDispatches, entitiesById, ready]);
+
+  // ------------------------------------------------------------------
+  // Onshore assets — fetched once on toggle-on. The catalog is static
+  // (USCG stations, Navy facilities don't move) so we keep the data
+  // in the source forever and just flip visibility on toggle.
+  // ------------------------------------------------------------------
+  const assetsLoadedRef = useRef(false);
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    if (map.getLayer(ASSETS_LAYER_ID)) {
+      const v = assetsOn ? "visible" : "none";
+      map.setLayoutProperty(ASSETS_LAYER_ID, "visibility", v);
+      map.setLayoutProperty(ASSETS_LABEL_LAYER_ID, "visibility", v);
+    }
+    if (!assetsOn || assetsLoadedRef.current) return;
+    const ctrl = new AbortController();
+    fetch(`${API_BASE}/maritime/onshore_assets`, { signal: ctrl.signal })
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => {
+        if (!data) return;
+        const src = map.getSource(ASSETS_SOURCE_ID);
+        if (!src) return;
+        src.setData(data);
+        assetsLoadedRef.current = true;
+      })
+      .catch(() => {});
+    return () => ctrl.abort();
+  }, [assetsOn, ready]);
 
   // ------------------------------------------------------------------
   // Operator-workload heatmap — periodically pulls the recent-dispatch
@@ -2598,6 +2953,26 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
           }}
         >
           ▓ ops
+        </button>
+        <button
+          type="button"
+          title="Toggle onshore-asset overlay — USCG stations + Navy facilities"
+          onClick={() => persistAssets(!assetsOn)}
+          style={{
+            appearance: "none",
+            border: "none",
+            borderLeft: "1px solid rgba(255,255,255,0.18)",
+            cursor: "pointer",
+            padding: "6px 10px",
+            background: assetsOn ? "rgba(95,208,147,0.22)" : "transparent",
+            color: assetsOn ? "#cdf2dd" : "rgba(255,255,255,0.7)",
+            textTransform: "uppercase",
+            minWidth: 64,
+            fontSize: 10,
+            letterSpacing: "0.08em",
+          }}
+        >
+          ⚓ assets
         </button>
 
         {/* Anomaly trail window — 1h / 6h / 24h. Filters the per-
@@ -3446,8 +3821,45 @@ function _classify(age, t) {
   return "down";
 }
 
+// Rolling buffer of vessel-count samples. Persisted to localStorage so
+// the sparkline survives a page reload. 120 samples × 30 s = ~1 hour
+// of history when the panel has been polling steadily.
+const PULSE_HISTORY_KEY = "ss-pulse-history";
+const PULSE_HISTORY_MAX = 120;
+
+// Tiny inline SVG sparkline from a [{t, v}] series. Returns null
+// when there are too few samples to draw anything meaningful.
+function _Sparkline({ samples, color, width = 80, height = 18 }) {
+  if (!samples || samples.length < 2) return null;
+  const vs = samples.map((s) => s.v).filter((v) => Number.isFinite(v));
+  if (vs.length < 2) return null;
+  const min = Math.min(...vs);
+  const max = Math.max(...vs);
+  const span = Math.max(1, max - min);
+  const pts = samples.map((s, i) => {
+    const x = (i / (samples.length - 1)) * width;
+    const y = height - ((s.v - min) / span) * (height - 2) - 1;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  return (
+    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`}
+         style={{ display: "inline-block", verticalAlign: "middle" }}>
+      <polyline points={pts.join(" ")}
+                fill="none" stroke={color} strokeWidth="1.2"
+                strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 function SystemPulse({ apiBase, onSensorAlarm }) {
   const [pulse, setPulse] = useState(null);
+  const [history, setHistory] = useState(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = window.localStorage.getItem(PULSE_HISTORY_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch { return []; }
+  });
   const prevHealthRef = useRef({});
   useEffect(() => {
     let cancelled = false;
@@ -3457,7 +3869,25 @@ function SystemPulse({ apiBase, onSensorAlarm }) {
         const r = await fetch(`${apiBase}/maritime/realtime`, { signal: ctrl.signal });
         if (!r.ok) throw new Error(`http ${r.status}`);
         const data = await r.json();
-        if (!cancelled) setPulse(data);
+        if (!cancelled) {
+          setPulse(data);
+          // Append to the rolling AIS-vessel-count history. Persist
+          // every sample so the sparkline survives reloads.
+          const n = data?.ais?.detail?.n_vessels;
+          if (Number.isFinite(n)) {
+            setHistory((cur) => {
+              const next = [...cur, { t: Date.now(), v: n }];
+              if (next.length > PULSE_HISTORY_MAX) {
+                next.splice(0, next.length - PULSE_HISTORY_MAX);
+              }
+              try {
+                window.localStorage.setItem(
+                  PULSE_HISTORY_KEY, JSON.stringify(next));
+              } catch {}
+              return next;
+            });
+          }
+        }
       } catch (err) {
         if (err.name === "AbortError") return;
         // eslint-disable-next-line no-console
@@ -3538,6 +3968,34 @@ function SystemPulse({ apiBase, onSensorAlarm }) {
         color={_statusColor(ais.age_seconds, PULSE_THRESHOLDS_S.ais)}
         detail={`${ais.detail?.n_vessels ?? 0} vessels`}
       />
+      {/* Vessel-count trend sparkline — only render once we have a
+          meaningful window of samples. Delta compares the latest
+          sample against the earliest in the buffer. */}
+      {history.length >= 6 && (() => {
+        const first = history[0].v;
+        const last = history[history.length - 1].v;
+        const deltaPct = first > 0 ? ((last - first) / first) * 100 : 0;
+        const spanMin = Math.round((history[history.length - 1].t - history[0].t) / 60_000);
+        const arrow = Math.abs(deltaPct) < 1.0
+          ? "≈"
+          : (deltaPct > 0 ? "▲" : "▼");
+        const sign = deltaPct > 0 ? "+" : "";
+        return (
+          <div style={{
+            display: "flex", alignItems: "center", gap: 8,
+            padding: "0 0 4px 16px",
+            fontSize: 10, color: "rgba(255,255,255,0.6)",
+          }}>
+            <_Sparkline samples={history} color="#5fd093" width={100} height={16} />
+            <span style={{ fontVariantNumeric: "tabular-nums" }}>
+              {arrow} {sign}{deltaPct.toFixed(1)}%
+            </span>
+            <span style={{ fontSize: 9, opacity: 0.7 }}>
+              · {spanMin} min
+            </span>
+          </div>
+        );
+      })()}
       <PulseRow
         label="Buoys"
         seconds={buoys.age_seconds}

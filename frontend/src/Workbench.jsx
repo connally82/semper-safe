@@ -713,6 +713,102 @@ function NearbyCandidatesSection({ entity, allEntities, onSelect, cfg }) {
   );
 }
 
+// MobileDrawer — wraps the side panel as a bottom drawer when the
+// viewport is too narrow for a sidebar (<900px). Shows a peek-tab
+// when collapsed (with the current entity name as a hint) and
+// slides up to fill ~75% of the viewport when expanded. Tap the
+// handle or outside to close.
+function MobileDrawer({ open, onToggle, entity, cfg, children }) {
+  const meta = entity ? cfg.typeMeta[entity.type] : null;
+  return (
+    <>
+      {open && (
+        <div
+          onClick={onToggle}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.45)",
+            zIndex: 50,
+          }}
+        />
+      )}
+      <div
+        style={{
+          position: "fixed",
+          left: 0,
+          right: 0,
+          bottom: 0,
+          height: open ? "78vh" : 44,
+          background: PALETTE.surface,
+          borderTop: `1px solid ${PALETTE.borderStrong || PALETTE.border}`,
+          boxShadow: "0 -8px 28px rgba(0,0,0,0.45)",
+          transition: "height 220ms ease-out",
+          zIndex: 60,
+          display: "flex",
+          flexDirection: "column",
+          overflow: "hidden",
+        }}
+      >
+        {/* Handle / peek tab */}
+        <button
+          type="button"
+          onClick={onToggle}
+          style={{
+            appearance: "none",
+            background: "transparent",
+            border: "none",
+            borderBottom: open ? `1px solid ${PALETTE.border}` : "none",
+            padding: "8px 18px",
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            cursor: "pointer",
+            color: PALETTE.text,
+            textAlign: "left",
+            fontFamily: "'IBM Plex Mono', monospace",
+          }}
+        >
+          <div style={{
+            width: 36, height: 3, borderRadius: 2,
+            background: PALETTE.muted, marginRight: 8,
+          }} />
+          <span style={{
+            fontSize: 10, letterSpacing: "0.16em",
+            color: PALETTE.muted, textTransform: "uppercase",
+          }}>
+            {open ? "tap to close" : (entity ? "entity" : "select an entity")}
+          </span>
+          {entity && (
+            <span style={{
+              fontFamily: "'IBM Plex Sans', sans-serif",
+              fontSize: 12, color: PALETTE.text, fontWeight: 500,
+              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+              flex: 1, minWidth: 0,
+            }}>
+              {entity.name || "unidentified"}
+              {meta && (
+                <span style={{
+                  marginLeft: 8, fontSize: 9, color: meta.color,
+                  letterSpacing: "0.12em", fontFamily: "'IBM Plex Mono', monospace",
+                  textTransform: "uppercase",
+                }}>
+                  · {meta.label}
+                </span>
+              )}
+            </span>
+          )}
+        </button>
+        {open && (
+          <div style={{ flex: 1, overflowY: "auto" }}>
+            {children}
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
 // OpticalChipSection — embeds the most recent Sentinel-2 RGB chip
 // centered on whatever the operator has selected. Lets you actually
 // SEE the spot on the map (down to 10 m S2 resolution; vessels show
@@ -839,6 +935,18 @@ function DispatchSection({ entity, cfg, apiBase }) {
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const data = await r.json();
       setReceipt(data);
+      // Bubble the dispatch to anyone who's listening (MapLibreView
+      // listens for this and adds the entity to the active-dispatch
+      // ring layer for 4 hours).
+      try {
+        window.dispatchEvent(new CustomEvent("ss-dispatch-filed", {
+          detail: {
+            entity_id: entity.id,
+            action_type: data.action_type,
+            audit_seq: data.audit_seq,
+          },
+        }));
+      } catch { /* CustomEvent unsupported — non-fatal */ }
     } catch (e) {
       setErr(String(e.message || e));
     } finally {
@@ -907,7 +1015,7 @@ function DispatchSection({ entity, cfg, apiBase }) {
   );
 }
 
-function LineagePanel({ entity, allEntities, onSelect, decisions, onApprove, onReject, cfg }) {
+function LineagePanel({ entity, pinnedEntity, allEntities, onSelect, onPin, onUnpin, decisions, onApprove, onReject, cfg }) {
   if (!entity) {
     return (
       <div style={{
@@ -991,8 +1099,104 @@ function LineagePanel({ entity, allEntities, onSelect, decisions, onApprove, onR
           {entity.vtype && <Tag>{entity.vtype.toUpperCase()}</Tag>}
           {entity.attrs && entity.attrs.frp_mw &&
             <Tag color={cfg.accent}>FRP {entity.attrs.frp_mw} MW</Tag>}
+          {/* Pin button — saves this entity for side-by-side comparison */}
+          {onPin && pinnedEntity?.id !== entity.id && (
+            <button
+              type="button"
+              onClick={() => onPin(entity.id)}
+              title="Pin this entity for comparison against another"
+              style={{
+                appearance: "none",
+                background: "rgba(255,200,80,0.12)",
+                border: "1px solid rgba(255,200,80,0.4)",
+                color: "#ffd897",
+                fontFamily: "'IBM Plex Mono', monospace",
+                fontSize: 9,
+                letterSpacing: "0.18em",
+                padding: "2px 7px",
+                cursor: "pointer",
+                textTransform: "uppercase",
+              }}
+            >
+              📌 pin
+            </button>
+          )}
+          {onPin && pinnedEntity?.id === entity.id && (
+            <button
+              type="button"
+              onClick={() => onUnpin && onUnpin()}
+              title="Unpin"
+              style={{
+                appearance: "none",
+                background: "rgba(255,200,80,0.28)",
+                border: "1px solid #ffd897",
+                color: "#ffd897",
+                fontFamily: "'IBM Plex Mono', monospace",
+                fontSize: 9,
+                letterSpacing: "0.18em",
+                padding: "2px 7px",
+                cursor: "pointer",
+                textTransform: "uppercase",
+              }}
+            >
+              📌 pinned · unpin
+            </button>
+          )}
         </div>
       </div>
+
+      {/* Pinned-for-comparison strip — visible whenever a separate
+          entity is pinned. Click to switch focus to it. */}
+      {pinnedEntity && pinnedEntity.id !== entity.id && (
+        <div style={{
+          padding: "10px 18px",
+          borderBottom: `1px solid ${PALETTE.border}`,
+          background: "rgba(255,200,80,0.06)",
+          display: "flex", alignItems: "center", gap: 10,
+        }}>
+          <span style={{ fontSize: 18, lineHeight: 1 }}>📌</span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{
+              fontFamily: "'IBM Plex Mono', monospace", fontSize: 9,
+              color: "#ffd897", letterSpacing: "0.2em",
+            }}>PINNED · COMPARISON</div>
+            <div style={{
+              fontSize: 12, fontWeight: 500, marginTop: 2,
+              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+            }}>
+              {pinnedEntity.name || (
+                <span style={{ color: PALETTE.muted, fontStyle: "italic" }}>
+                  unidentified
+                </span>
+              )}
+              <span style={{
+                fontFamily: "'IBM Plex Mono', monospace", fontSize: 10,
+                marginLeft: 6, opacity: 0.65,
+              }}>
+                · {cfg.typeMeta[pinnedEntity.type]?.label || pinnedEntity.type}
+              </span>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => onSelect && onSelect(pinnedEntity.id)}
+            style={{
+              appearance: "none",
+              background: "transparent",
+              border: "1px solid rgba(255,200,80,0.5)",
+              color: "#ffd897",
+              fontFamily: "'IBM Plex Mono', monospace",
+              fontSize: 9,
+              letterSpacing: "0.12em",
+              padding: "3px 8px",
+              cursor: "pointer",
+              textTransform: "uppercase",
+            }}
+          >
+            focus →
+          </button>
+        </div>
+      )}
 
       <div style={{
         padding: "14px 18px", borderBottom: `1px solid ${PALETTE.border}`,
@@ -1504,6 +1708,30 @@ export default function Workbench() {
   const selectedId = selection[domainKey];
   const selected = sortedEntities.find(e => e.id === selectedId);
 
+  // Pinned-for-comparison entity. Separate from the regular selection
+  // so the operator can hold one anomaly in view while exploring
+  // another. The pin survives focus changes; only Unpin clears it.
+  const [pinned, setPinned] = useState({ maritime: null, wildfire: null });
+  const pinnedId = pinned[domainKey];
+  const pinnedEntity = sortedEntities.find(e => e.id === pinnedId);
+
+  // Responsive: under 900 px viewport the side panel collapses into a
+  // bottom drawer. State decides whether the drawer is currently
+  // expanded or just showing the peek tab.
+  const [narrow, setNarrow] = useState(() =>
+    typeof window !== "undefined" && window.innerWidth < 900);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  useEffect(() => {
+    const onResize = () => setNarrow(window.innerWidth < 900);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  // When the operator selects a new entity, auto-open the drawer so
+  // they see the detail without an extra tap.
+  useEffect(() => {
+    if (narrow && selectedId) setDrawerOpen(true);
+  }, [selectedId, narrow]);
+
   const handleDecision = useCallback(async (id, decision) => {
     if (decisions[id]) return;
     setDecisions(d => ({ ...d, [id]: decision }));
@@ -1577,18 +1805,44 @@ export default function Workbench() {
           <MapLibreView
             entities={sortedEntities}
             selectedId={selectedId}
+            pinnedId={pinnedId}
             onSelect={(id) => setSelection(s => ({ ...s, [domainKey]: id }))}
             cfg={cfg}
           />
-          <LineagePanel
-            entity={selected}
-            allEntities={sortedEntities}
-            onSelect={(id) => setSelection(s => ({ ...s, [domainKey]: id }))}
-            decisions={decisions}
-            onApprove={(id) => handleDecision(id, "approved")}
-            onReject={(id) => handleDecision(id, "rejected")}
-            cfg={cfg}
-          />
+          {narrow ? (
+            <MobileDrawer
+              open={drawerOpen}
+              onToggle={() => setDrawerOpen(o => !o)}
+              entity={selected}
+              cfg={cfg}
+            >
+              <LineagePanel
+                entity={selected}
+                pinnedEntity={pinnedEntity}
+                allEntities={sortedEntities}
+                onSelect={(id) => setSelection(s => ({ ...s, [domainKey]: id }))}
+                onPin={(id) => setPinned(p => ({ ...p, [domainKey]: id }))}
+                onUnpin={() => setPinned(p => ({ ...p, [domainKey]: null }))}
+                decisions={decisions}
+                onApprove={(id) => handleDecision(id, "approved")}
+                onReject={(id) => handleDecision(id, "rejected")}
+                cfg={cfg}
+              />
+            </MobileDrawer>
+          ) : (
+            <LineagePanel
+              entity={selected}
+              pinnedEntity={pinnedEntity}
+              allEntities={sortedEntities}
+              onSelect={(id) => setSelection(s => ({ ...s, [domainKey]: id }))}
+              onPin={(id) => setPinned(p => ({ ...p, [domainKey]: id }))}
+              onUnpin={() => setPinned(p => ({ ...p, [domainKey]: null }))}
+              decisions={decisions}
+              onApprove={(id) => handleDecision(id, "approved")}
+              onReject={(id) => handleDecision(id, "rejected")}
+              cfg={cfg}
+            />
+          )}
         </div>
         <AuditFeed entries={allAudit} />
       </div>
