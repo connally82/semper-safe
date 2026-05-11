@@ -708,6 +708,102 @@ function NearbyCandidatesSection({ entity, allEntities, onSelect, cfg }) {
   );
 }
 
+// OpticalChipSection — embeds the most recent Sentinel-2 RGB chip
+// centered on whatever the operator has selected. Lets you actually
+// SEE the spot on the map (down to 10 m S2 resolution; vessels show
+// up as bright 1-2 pixel returns over water) rather than just
+// reading attrs. Backed by GET /maritime/optical_chip?lat=&lon=
+// which finds the most recent cloud-free S2 scene and renders a
+// JPEG chip from it.
+//
+// Returns null silently when the backend says no S2 scene is
+// available — the panel just shows the rest of the entity info
+// without a placeholder, since the alternative ('no imagery found')
+// is noise the operator can't act on.
+function OpticalChipSection({ entity, apiBase }) {
+  const [state, setState] = useState({ url: null, err: null, loading: true });
+  useEffect(() => {
+    if (!entity || typeof entity.lon !== "number" || typeof entity.lat !== "number") {
+      setState({ url: null, err: null, loading: false });
+      return;
+    }
+    setState((s) => ({ ...s, loading: true }));
+    const ctrl = new AbortController();
+    const url = `${apiBase}/maritime/optical_chip?lat=${entity.lat}&lon=${entity.lon}`;
+    fetch(url, { signal: ctrl.signal })
+      .then(async (r) => {
+        if (r.status === 404 || r.status === 202) {
+          setState({ url: null, err: r.status === 202 ? "scene_pending"
+                                                       : "no_recent_scene",
+                     loading: false });
+          return;
+        }
+        if (!r.ok) {
+          setState({ url: null, err: `HTTP ${r.status}`, loading: false });
+          return;
+        }
+        const blob = await r.blob();
+        setState({ url: URL.createObjectURL(blob), err: null, loading: false });
+      })
+      .catch((err) => {
+        if (err.name === "AbortError") return;
+        setState({ url: null, err: String(err.message || err), loading: false });
+      });
+    return () => ctrl.abort();
+  }, [entity?.id, entity?.lon, entity?.lat, apiBase]);
+
+  // Clean up the object URL when the chip changes / panel unmounts.
+  useEffect(() => {
+    return () => {
+      if (state.url) URL.revokeObjectURL(state.url);
+    };
+  }, [state.url]);
+
+  if (state.loading) {
+    return (
+      <div style={{
+        padding: "10px 18px", borderTop: `1px solid ${PALETTE.border}`,
+        fontFamily: "'IBM Plex Mono', monospace", fontSize: 10,
+        color: PALETTE.muted, letterSpacing: "0.15em",
+      }}>OPTICAL CHIP · LOADING…</div>
+    );
+  }
+  if (!state.url) {
+    // No recent chip available. Render a brief explainer instead of
+    // hiding entirely so the operator knows the system tried.
+    return (
+      <div style={{
+        padding: "10px 18px", borderTop: `1px solid ${PALETTE.border}`,
+        fontFamily: "'IBM Plex Sans', sans-serif", fontSize: 11,
+        color: PALETTE.muted, fontStyle: "italic", lineHeight: 1.4,
+      }}>
+        No recent cloud-free Sentinel-2 chip available for this point.
+        Next S2 pass typically within 2–5 days.
+      </div>
+    );
+  }
+  return (
+    <div style={{
+      padding: "10px 18px", borderTop: `1px solid ${PALETTE.border}`,
+    }}>
+      <div style={{
+        fontFamily: "'IBM Plex Mono', monospace", fontSize: 9,
+        color: PALETTE.muted, letterSpacing: "0.2em", marginBottom: 6,
+      }}>OPTICAL IMAGERY · SENTINEL-2 · 10 M GSD</div>
+      <img
+        src={state.url}
+        alt="Sentinel-2 chip"
+        style={{
+          width: "100%",
+          display: "block",
+          border: `1px solid ${PALETTE.border}`,
+          borderRadius: 3,
+        }}
+      />
+    </div>
+  );
+}
+
 // DispatchSection — sits inside the recommendation block. The
 // "compliance story" surface: operator files a formal dispatch, the
 // backend appends a hash-chained audit entry, the proof receipt
@@ -938,6 +1034,11 @@ function LineagePanel({ entity, allEntities, onSelect, decisions, onApprove, onR
           {entity.notes}
         </div>
       )}
+
+      {/* Optical chip — actual Sentinel-2 imagery of the selected
+          vessel's location. Renders inline for ANY selected entity,
+          not just SAR detections. */}
+      <OpticalChipSection entity={entity} apiBase={API_BASE} />
 
       <div style={{ padding: "14px 18px", flex: 1, overflowY: "auto" }}>
         <div style={{

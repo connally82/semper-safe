@@ -54,6 +54,41 @@ const BASEMAPS = {
         "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
     },
   },
+  // EOX Sentinel-2 Cloudless mosaic — a global true-color composite
+  // assembled from the cleanest Sentinel-2 captures of the past year,
+  // served as 10 m WMTS tiles. Free, public, no key needed. Much
+  // closer to "I can see vessels and structures" than the Esri layer
+  // (which is a generic basemap blend), and aligns visually with the
+  // S2 chip popups we already serve for SAR detections.
+  s2cloudless: {
+    label: "Sentinel-2",
+    style: {
+      version: 8,
+      sources: {
+        "eox-s2cloudless": {
+          type: "raster",
+          tiles: [
+            "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2024_3857/default/g/{z}/{y}/{x}.jpg",
+          ],
+          tileSize: 256,
+          maxzoom: 17,
+          attribution:
+            "Sentinel-2 cloudless &mdash; <a href='https://s2maps.eu'>s2maps.eu</a> " +
+            "by <a href='https://eox.at'>EOX IT Services GmbH</a> " +
+            "(Contains modified Copernicus Sentinel data 2023 &amp; 2024)",
+        },
+      },
+      layers: [
+        {
+          id: "eox-s2cloudless-layer",
+          type: "raster",
+          source: "eox-s2cloudless",
+        },
+      ],
+      glyphs:
+        "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
+    },
+  },
 };
 const DEFAULT_BASEMAP = "satellite";
 const BASEMAP_STORAGE_KEY = "ss-basemap";
@@ -1350,6 +1385,32 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
 
     return () => ctrl.abort();
   }, [selectedId, ready, entitiesById, cfg]);
+
+  // ------------------------------------------------------------------
+  // Auto-zoom on select: when the operator picks an entity from the
+  // queue OR clicks one on the map, smoothly fly to it at vessel-
+  // visible zoom (z=13 ≈ 1 px = ~10 m at this latitude — matches the
+  // S2 GSD, so a vessel is about 1-2 pixels). Only re-zooms if the
+  // current zoom is well below z=13, so an operator who has already
+  // zoomed in further doesn't get yanked back out.
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready || !selectedId) return;
+    const ent = entitiesById.get(selectedId);
+    if (!ent || typeof ent.lon !== "number" || typeof ent.lat !== "number") return;
+    if (map.getZoom() >= 12.5) {
+      // Already close enough — just pan smoothly.
+      map.easeTo({ center: [ent.lon, ent.lat], duration: 600 });
+    } else {
+      map.flyTo({
+        center: [ent.lon, ent.lat],
+        zoom: 13,
+        duration: 900,
+        essential: true,   // respect prefers-reduced-motion but still fly
+      });
+    }
+  }, [selectedId, ready, entitiesById]);
 
   // ------------------------------------------------------------------
   // Candidate-hull halos: when an anomaly is selected, ring the 5-km
