@@ -279,12 +279,82 @@ function entityRadius(type) {
   return 6;
 }
 
+// Anomaly transitions worth alerting on. A vessel newly entering any
+// of these states gets a toast (and dark_vessel gets a sound).
+const ANOMALY_ALERT_TYPES = new Set([
+  "dark_vessel", "ais_spoofed", "loitering_vessel", "ais_gap",
+]);
+
+// localStorage keys for user preferences.
+const SOUND_STORAGE_KEY = "ss-sound-alerts";
+const TOAST_TTL_MS = 6000;
+const TOAST_MAX_VISIBLE = 5;
+
+// Web Audio synth ping for new dark-vessel detections. Two short tones
+// (660 Hz → 880 Hz) over ~250 ms — distinct enough to register over
+// ambient room noise, subtle enough that the operator isn't ducking.
+// Lazily-instantiated AudioContext (browsers require a user gesture
+// to create one; we defer until the first ping attempt).
+let _audioCtx = null;
+function _playDarkVesselPing() {
+  try {
+    if (!_audioCtx) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      _audioCtx = new Ctx();
+    }
+    const now = _audioCtx.currentTime;
+    const tones = [
+      { freq: 660, start: now + 0.0, duration: 0.12 },
+      { freq: 880, start: now + 0.14, duration: 0.14 },
+    ];
+    for (const t of tones) {
+      const osc = _audioCtx.createOscillator();
+      const gain = _audioCtx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = t.freq;
+      gain.gain.setValueAtTime(0.0001, t.start);
+      gain.gain.exponentialRampToValueAtTime(0.18, t.start + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t.start + t.duration);
+      osc.connect(gain).connect(_audioCtx.destination);
+      osc.start(t.start);
+      osc.stop(t.start + t.duration + 0.01);
+    }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn("dark-vessel ping failed:", err);
+  }
+}
+
 export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const markersRef = useRef(new Map());      // id → maplibregl.Marker
   const fitDoneRef = useRef(false);          // only auto-fit once on first data
   const [ready, setReady] = useState(false);
+
+  // Anomaly state tracker. Per-entity-id record of the LAST observed
+  // type, so we can detect transitions (vessel → dark_vessel, etc) on
+  // every entities prop change without re-firing on stable state.
+  // First pass is special-cased: we initialize the map silently so we
+  // don't toast every dark vessel that was already present at load.
+  const lastTypeRef = useRef(new Map());
+  const initializedRef = useRef(false);
+  const [toasts, setToasts] = useState([]);
+  const [soundEnabled, setSoundEnabled] = useState(() => {
+    if (typeof window === "undefined") return true;
+    try {
+      const v = window.localStorage.getItem(SOUND_STORAGE_KEY);
+      return v === null ? true : v === "1";
+    } catch {
+      return true;
+    }
+  });
+  const persistSound = (on) => {
+    setSoundEnabled(on);
+    try { window.localStorage.setItem(SOUND_STORAGE_KEY, on ? "1" : "0"); }
+    catch { /* localStorage may be disabled */ }
+  };
 
   // Basemap pick — persisted across sessions.
   const [basemap, setBasemap] = useState(() => {
@@ -836,10 +906,71 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
         .setHTML(html)
         .addTo(map);
     };
+    const popupForConvoy = (e) => {
+      const f = e.features?.[0];
+      if (!f) return;
+      const p = f.properties || {};
+      let members = [];
+      try {
+        members = JSON.parse(p.members_json || "[]");
+      } catch { members = []; }
+      const rows = members.map((m) => {
+        const ident = m.name || (m.mmsi ? `MMSI ${m.mmsi}` : "unidentified");
+        const speed = m.speed_kn != null
+          ? `${Number(m.speed_kn).toFixed(1)} kn`
+          : "—";
+        const hdg = m.heading != null
+          ? `${Math.round(Number(m.heading))}°`
+          : "—";
+        return `<div style="display:grid;grid-template-columns:1fr 70px 50px;
+                gap:8px;padding:3px 0;border-top:1px solid #d8e1ec;">
+                  <span style="overflow:hidden;text-overflow:ellipsis;
+                               white-space:nowrap;">${ident}</span>
+                  <span style="text-align:right;color:#555;">${speed}</span>
+                  <span style="text-align:right;color:#555;">${hdg}</span>
+                </div>`;
+      }).join("");
+      const html = `
+        <div style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;
+                    font-size:11px;letter-spacing:0.04em;color:#040810;
+                    min-width:260px;">
+          <div style="font-weight:bold;text-transform:uppercase;
+                      margin-bottom:4px;color:#1a5f6e;">
+            CONVOY · ${members.length} VESSELS IN FORMATION
+          </div>
+          <div style="color:#666;font-size:10px;margin-bottom:6px;">
+            ${(p.convoy_id || "").replace("convoy_", "head MMSI ")}
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 70px 50px;
+                      gap:8px;font-size:9px;color:#999;text-transform:uppercase;
+                      letter-spacing:0.1em;padding-bottom:2px;">
+            <span>vessel</span><span style="text-align:right;">speed</span>
+            <span style="text-align:right;">hdg</span>
+          </div>
+          ${rows}
+          <div style="margin-top:8px;padding-top:6px;border-top:1px solid #1a5f6e;
+                      color:#1a5f6e;font-weight:600;">
+            Recommendation: track all members. Confirm formation intent
+            via next SAR pass before tasking surface interdiction.
+          </div>
+        </div>`;
+      new maplibregl.Popup({ closeButton: true, maxWidth: "340px" })
+        .setLngLat(e.lngLat)
+        .setHTML(html)
+        .addTo(map);
+    };
+
     map.on("click", SAR_DETECTIONS_LAYER_ID, popupForDetection);
     map.on("click", SAR_SCENES_FILL_LAYER_ID, popupForScene);
     map.on("click", S2_SCENES_FILL_LAYER_ID, popupForS2Scene);
     map.on("click", BUOYS_LAYER_ID, popupForBuoy);
+    map.on("click", CONVOY_LINE_LAYER_ID, popupForConvoy);
+    map.on("mouseenter", CONVOY_LINE_LAYER_ID, () => {
+      map.getCanvas().style.cursor = "pointer";
+    });
+    map.on("mouseleave", CONVOY_LINE_LAYER_ID, () => {
+      map.getCanvas().style.cursor = "";
+    });
     map.on("mouseenter", BUOYS_LAYER_ID, () => { map.getCanvas().style.cursor = "pointer"; });
     map.on("mouseleave", BUOYS_LAYER_ID, () => { map.getCanvas().style.cursor = ""; });
     map.on("mouseenter", SAR_DETECTIONS_LAYER_ID, () => {
@@ -1176,6 +1307,67 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
   }, [selectedId, ready, entitiesById, renderEntities]);
 
   // ------------------------------------------------------------------
+  // Anomaly state-transition watcher — drives both the audio ping for
+  // new dark vessels and the corner toast stream for any new anomaly
+  // classification. First entities-prop arrival silently seeds
+  // lastTypeRef so we don't get a wall of toasts at page load.
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const typeMap = lastTypeRef.current;
+    if (!initializedRef.current) {
+      // Seed silently — every entity gets its current type recorded with
+      // no toast/ping. Subsequent ticks compare against this baseline.
+      for (const e of renderEntities) typeMap.set(e.id, e.type);
+      if (renderEntities.length > 0) initializedRef.current = true;
+      return;
+    }
+    const newToasts = [];
+    let anyNewDarkVessel = false;
+    for (const e of renderEntities) {
+      const prev = typeMap.get(e.id);
+      if (prev === e.type) continue;
+      typeMap.set(e.id, e.type);
+      if (!ANOMALY_ALERT_TYPES.has(e.type)) continue;
+      // Skip the case where prev is undefined AND type is ais_gap — the
+      // gap sweeper creates these continuously as the AIS feed naturally
+      // drops connections; toasting every gap floods the UI. Dark vessel,
+      // spoofed, loitering all warrant the toast even if it's a fresh
+      // entity (those are interesting on first appearance).
+      if (prev === undefined && e.type === "ais_gap") continue;
+      const meta = cfg.typeMeta[e.type];
+      if (!meta) continue;
+      newToasts.push({
+        id: `${e.id}_${e.type}_${Date.now()}`,
+        entity_id: e.id,
+        name: e.name,
+        mmsi: e.mmsi,
+        from: prev,
+        to: e.type,
+        meta,
+        ts: Date.now(),
+      });
+      if (e.type === "dark_vessel") anyNewDarkVessel = true;
+    }
+    if (newToasts.length > 0) {
+      setToasts((cur) => [...newToasts, ...cur].slice(0, TOAST_MAX_VISIBLE));
+    }
+    if (anyNewDarkVessel && soundEnabled) {
+      _playDarkVesselPing();
+    }
+  }, [renderEntities, cfg, soundEnabled]);
+
+  // Auto-dismiss toasts after TOAST_TTL_MS. Single interval scans the
+  // list and culls anything past its TTL.
+  useEffect(() => {
+    if (toasts.length === 0) return;
+    const interval = setInterval(() => {
+      const now = Date.now();
+      setToasts((cur) => cur.filter((t) => now - t.ts < TOAST_TTL_MS));
+    }, 500);
+    return () => clearInterval(interval);
+  }, [toasts.length]);
+
+  // ------------------------------------------------------------------
   // Convoy lines: group entities by attrs.convoy_id (backend-tagged by
   // detect_convoys), then emit one LineString per convoy connecting
   // its members in MMSI order. Each member also gets a Point feature
@@ -1213,7 +1405,24 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
           type: "LineString",
           coordinates: members.map((m) => [m.lon, m.lat]),
         },
-        properties: { convoy_id: cid, n_members: members.length },
+        properties: {
+          convoy_id: cid,
+          n_members: members.length,
+          // Stringify member metadata onto the feature so the line's
+          // click handler (registered once at map init time) can render
+          // a member list without a stale closure over renderEntities.
+          // MapLibre passes properties through as JSON-flat values, so
+          // a JSON string is the lingua franca.
+          members_json: JSON.stringify(members.map((m) => ({
+            id: m.id,
+            mmsi: m.mmsi || null,
+            name: m.name || null,
+            speed_kn: m.attrs && m.attrs.speed_kn != null
+              ? m.attrs.speed_kn : null,
+            heading: m.attrs && m.attrs.heading != null
+              ? m.attrs.heading : null,
+          }))),
+        },
       });
       for (const m of members) {
         features.push({
@@ -1606,7 +1815,12 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
           onZoomTo={(type) => {
             const map = mapRef.current;
             if (!map) return;
-            const matches = renderEntities.filter((e) => e.type === type);
+            // Synthetic 'convoy' type — matches any entity with attrs.convoy_id.
+            // Convoys aren't an entity type per se but a contextual grouping,
+            // so the chip filter is a different predicate.
+            const matches = type === "convoy"
+              ? renderEntities.filter((e) => e.attrs && e.attrs.convoy_id)
+              : renderEntities.filter((e) => e.type === type);
             if (matches.length === 0) return;
             if (matches.length === 1) {
               map.flyTo({ center: [matches[0].lon, matches[0].lat], zoom: 11, duration: 800 });
@@ -1619,11 +1833,23 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
             const minLat = Math.min(...lats), maxLat = Math.max(...lats);
             map.fitBounds(
               [[minLon, minLat], [maxLon, maxLat]],
-              { padding: 80, duration: 800, maxZoom: 9 },
+              { padding: 80, duration: 800, maxZoom: 11 },
             );
           }}
         />
       )}
+
+      {/* Toast stream — top-right corner. Transient cards announcing
+          new anomaly transitions (vessel → dark_vessel etc). Auto-dismiss
+          after 6 s, max 5 visible. Plus a small mute toggle for the
+          dark-vessel audio ping. */}
+      <ToastStack
+        toasts={toasts}
+        soundEnabled={soundEnabled}
+        onToggleSound={() => persistSound(!soundEnabled)}
+        onClick={(t) => onSelect(t.entity_id)}
+        cfg={cfg}
+      />
 
       {/* System pulse — single-glance freshness panel, bottom-right.
           Polls /maritime/realtime every 30 s. Each sensor row shows
@@ -1693,7 +1919,12 @@ function AnomalyBanner({ entities, cfg, onZoomTo }) {
     <div
       style={{
         position: "absolute",
-        top: 8,
+        // Dropped from top: 8 → top: 52 so the chip row sits BELOW the
+        // basemap / SAR / S2 / BUOY / GOES / AIS / VIIRS toggle bar that
+        // also lives at top: 8 — previously the centered banner overlapped
+        // the right half of the toggles when the window was narrower than
+        // ~1500 px.
+        top: 52,
         left: "50%",
         transform: "translateX(-50%)",
         display: "flex",
@@ -1765,21 +1996,7 @@ function AnomalyBanner({ entities, cfg, onZoomTo }) {
         type="button"
         onClick={() => {
           if (nConvoys === 0) return;
-          // Zoom to all convoy members combined — the easy demo gesture.
-          // The on-map line layer (CONVOY_SOURCE_ID) shows everyone at once.
-          const all = [];
-          for (const members of convoyMembers.values()) {
-            for (const m of members) all.push(m);
-          }
-          // Re-use onZoomTo with a sentinel — but onZoomTo expects a type
-          // string and looks up renderEntities. Inline the fitBounds here
-          // since the convoy chip wants a different filter ("has convoy_id").
-          if (all.length === 0) return;
-          // Build a synthetic anomaly type that the host can fitBounds on.
-          // Easier: just call onZoomTo("convoy") and let it return null;
-          // the operator will already see all convoy lines on the map.
-          // For first version, just rely on the on-map line — chip is
-          // an indicator with no zoom. (Wire fitBounds later if needed.)
+          onZoomTo("convoy");
         }}
         disabled={nConvoys === 0}
         title={nConvoys === 0
@@ -1830,6 +2047,140 @@ function AnomalyBanner({ entities, cfg, onZoomTo }) {
         </span>
         {" anomalous"}
       </div>
+    </div>
+  );
+}
+
+// ToastStack — corner notification stream. Surfaces new anomaly
+// transitions (vessel → dark/spoofed/loitering) in transient cards so
+// the operator can spot live state changes without staring at the
+// counter bar. Position: top-right, BELOW the entity-detail panel
+// header so it doesn't fight with the detail panel for space. The
+// stack stays slim (max 5 visible, auto-dismiss after 6 s) so it
+// can never wallpaper the map.
+function ToastStack({ toasts, soundEnabled, onToggleSound, onClick, cfg }) {
+  if (toasts.length === 0 && soundEnabled) {
+    // No active toasts AND sound is on: render nothing (keeps the
+    // corner quiet when the demo has nothing to say). When sound is
+    // muted we still show a tiny "muted" pill so the operator
+    // doesn't forget the toggle exists.
+    return null;
+  }
+  return (
+    <div style={{
+      position: "absolute",
+      top: 52,
+      right: 12,
+      display: "flex",
+      flexDirection: "column",
+      gap: 6,
+      maxWidth: 280,
+      zIndex: 2,
+      pointerEvents: "none",   // let map clicks through except on cards
+    }}>
+      {!soundEnabled && (
+        <button
+          type="button"
+          onClick={onToggleSound}
+          title="Unmute dark-vessel sound alerts"
+          style={{
+            pointerEvents: "auto",
+            alignSelf: "flex-end",
+            appearance: "none",
+            border: "1px solid rgba(255,255,255,0.18)",
+            background: "rgba(4,8,16,0.78)",
+            color: "rgba(255,255,255,0.55)",
+            borderRadius: 3,
+            padding: "3px 8px",
+            fontSize: 10,
+            fontFamily: "'IBM Plex Mono', monospace",
+            letterSpacing: "0.12em",
+            cursor: "pointer",
+            textTransform: "uppercase",
+          }}
+        >
+          🔇 muted
+        </button>
+      )}
+      {toasts.map((t) => {
+        const meta = t.meta || cfg.typeMeta[t.to] || {};
+        const label = meta.label || t.to;
+        const color = meta.color || "#5fd093";
+        return (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => onClick && onClick(t)}
+            style={{
+              pointerEvents: "auto",
+              appearance: "none",
+              textAlign: "left",
+              background: "rgba(4,8,16,0.88)",
+              border: `1px solid ${color}`,
+              borderLeft: `4px solid ${color}`,
+              borderRadius: 4,
+              padding: "8px 10px",
+              cursor: "pointer",
+              fontFamily: "'IBM Plex Sans', sans-serif",
+              color: "#f0f4ff",
+              display: "flex",
+              flexDirection: "column",
+              gap: 2,
+              boxShadow: `0 4px 12px rgba(0,0,0,0.4)`,
+              animation: "ss-toast-in 220ms ease-out",
+            }}
+          >
+            <div style={{
+              fontFamily: "'IBM Plex Mono', monospace",
+              fontSize: 9,
+              letterSpacing: "0.16em",
+              color: color,
+              fontWeight: 600,
+            }}>
+              {t.from ? `${t.from.toUpperCase()} → ${label}` : `NEW · ${label}`}
+            </div>
+            <div style={{ fontSize: 13, fontWeight: 500 }}>
+              {t.name || (
+                <span style={{ fontStyle: "italic", opacity: 0.7 }}>
+                  unidentified
+                </span>
+              )}
+              {t.mmsi && (
+                <span style={{
+                  fontFamily: "'IBM Plex Mono', monospace",
+                  fontSize: 11, marginLeft: 8, opacity: 0.6,
+                }}>
+                  MMSI {t.mmsi}
+                </span>
+              )}
+            </div>
+          </button>
+        );
+      })}
+      {toasts.length > 0 && soundEnabled && (
+        <button
+          type="button"
+          onClick={onToggleSound}
+          title="Mute dark-vessel sound alerts"
+          style={{
+            pointerEvents: "auto",
+            alignSelf: "flex-end",
+            appearance: "none",
+            border: "1px solid rgba(255,255,255,0.10)",
+            background: "transparent",
+            color: "rgba(255,255,255,0.45)",
+            borderRadius: 3,
+            padding: "1px 6px",
+            fontSize: 9,
+            fontFamily: "'IBM Plex Mono', monospace",
+            letterSpacing: "0.12em",
+            cursor: "pointer",
+            textTransform: "uppercase",
+          }}
+        >
+          🔊 sound on · mute
+        </button>
+      )}
     </div>
   );
 }
