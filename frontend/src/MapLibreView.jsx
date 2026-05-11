@@ -1668,7 +1668,58 @@ function AnomalyBanner({ entities, cfg, onZoomTo }) {
   );
 }
 
+// Replay knobs: start position and total animation duration. 60 minutes
+// from now down to 0 over ~12 seconds gives the operator a smooth 5x
+// realtime view of the last hour. Step size of 1 min == 12 ticks * 60
+// ticks/sec = a tick every 200 ms — fast enough to feel like animation,
+// slow enough for the /maritime/timeline backend to keep up (each call
+// is ~300 ms; we let stale fetches cancel in the existing useEffect).
+const REPLAY_FROM_MIN = 60;
+const REPLAY_DURATION_MS = 12_000;
+
 function ScrubBar({ minutes, loading, live, onChange, onLive }) {
+  const [playing, setPlaying] = useState(false);
+  const playStartRef = useRef(null);
+  const rafRef = useRef(null);
+
+  // Auto-replay: tick from REPLAY_FROM_MIN down to 0, then stop.
+  // Snapping back to live at the end is the natural "the demo is over,
+  // you're back in real time" gesture.
+  useEffect(() => {
+    if (!playing) return;
+    playStartRef.current = performance.now();
+    onChange(REPLAY_FROM_MIN);
+
+    const tick = (now) => {
+      const elapsed = now - playStartRef.current;
+      const progress = Math.min(1, elapsed / REPLAY_DURATION_MS);
+      // Linear decay from REPLAY_FROM_MIN → 0 over REPLAY_DURATION_MS.
+      const m = Math.round(REPLAY_FROM_MIN * (1 - progress));
+      onChange(m);
+      if (progress >= 1) {
+        setPlaying(false);
+        // Tail of the animation lands on live (minutes=0) — no need to
+        // call onLive explicitly, but do it so the "LIVE" pill flips
+        // green in the UI immediately.
+        onLive();
+        return;
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+  }, [playing, onChange, onLive]);
+
+  // Any manual scrub interrupts replay — feels right when an operator
+  // wants to zero in on a specific moment mid-animation.
+  const handleManual = (m) => {
+    if (playing) setPlaying(false);
+    onChange(m);
+  };
+
   const label = live
     ? "live · now"
     : `T-${minutes} min · ${new Date(Date.now() - minutes * 60_000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
@@ -1693,7 +1744,7 @@ function ScrubBar({ minutes, loading, live, onChange, onLive }) {
         letterSpacing: "0.06em",
         color: "rgba(255,255,255,0.85)",
         zIndex: 1,
-        minWidth: 360,
+        minWidth: 400,
       }}
     >
       <button
@@ -1717,13 +1768,34 @@ function ScrubBar({ minutes, loading, live, onChange, onLive }) {
       >
         live
       </button>
+      <button
+        type="button"
+        onClick={() => setPlaying((p) => !p)}
+        title={playing ? "stop replay" : "replay last 60 minutes"}
+        style={{
+          appearance: "none",
+          border: "1px solid rgba(255,255,255,0.25)",
+          background: playing ? "rgba(240,168,48,0.22)" : "rgba(255,255,255,0.04)",
+          color: playing ? "#ffd897" : "rgba(255,255,255,0.85)",
+          padding: "3px 8px",
+          borderRadius: 3,
+          fontSize: 10,
+          fontFamily: "inherit",
+          letterSpacing: "0.08em",
+          cursor: "pointer",
+          textTransform: "uppercase",
+          minWidth: 56,
+        }}
+      >
+        {playing ? "■ stop" : "▶ replay"}
+      </button>
       <input
         type="range"
         min={0}
         max={60}
         step={1}
         value={minutes}
-        onChange={(e) => onChange(Number(e.target.value))}
+        onChange={(e) => handleManual(Number(e.target.value))}
         // Slider is conceptually "minutes ago"; rendering it left=past,
         // right=now feels right when read like a timeline.
         style={{
