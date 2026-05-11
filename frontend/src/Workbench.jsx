@@ -969,7 +969,49 @@ function btn(color) {
   };
 }
 
+// AuditFeed — bottom-of-screen scrolling event log, hash-chained.
+// Tab strip lets the operator filter:
+//   ALL          — every event (default; matches the original behavior)
+//   DISPATCHES   — only operator decisions (event_type='decision'). This
+//                  is the "compliance story" view: every approve/reject
+//                  on a recommendation, the operator who made the call,
+//                  and the audit hash that proves it. Each dispatch row
+//                  is rendered with extra prominence (action pill,
+//                  operator highlight) so it reads more like a logbook.
+//   RECLASS      — only reclassifications (dark→matched, vessel→ais_gap,
+//                  vessel→loitering_vessel, vessel→ais_spoofed).
+//                  Operationally interesting: shows when the engine
+//                  changed its mind.
+const AUDIT_FILTERS = {
+  ALL: { label: "ALL", match: () => true },
+  DISPATCHES: { label: "DISPATCHES", match: (e) => e.event === "decision" },
+  RECLASS: {
+    label: "RECLASS",
+    match: (e) => e.event === "entity_reclassified",
+  },
+};
+
+function _decisionPill(text, color) {
+  return (
+    <span style={{
+      display: "inline-block",
+      padding: "1px 7px",
+      borderRadius: 2,
+      background: `${color}26`,
+      border: `1px solid ${color}`,
+      color,
+      fontFamily: "'IBM Plex Mono', monospace",
+      fontSize: 9,
+      letterSpacing: "0.12em",
+      fontWeight: 600,
+      textTransform: "uppercase",
+    }}>{text}</span>
+  );
+}
+
 function AuditFeed({ entries }) {
+  const [filter, setFilter] = useState("ALL");
+
   const eventColor = (et) => {
     if (et.includes("entity_created")) return PALETTE.good;
     if (et.includes("recommendation")) return PALETTE.alert;
@@ -979,10 +1021,13 @@ function AuditFeed({ entries }) {
     if (et.includes("domain_loaded")) return PALETTE.text;
     return PALETTE.muted;
   };
+
+  const visible = entries.filter(AUDIT_FILTERS[filter].match);
+
   return (
     <div style={{
       borderTop: `1px solid ${PALETTE.border}`, background: PALETTE.bg,
-      height: 160, display: "flex", flexDirection: "column",
+      height: 200, display: "flex", flexDirection: "column",
     }}>
       <div style={{
         padding: "8px 16px", borderBottom: `1px solid ${PALETTE.border}`,
@@ -996,6 +1041,41 @@ function AuditFeed({ entries }) {
           fontFamily: "'IBM Plex Mono', monospace", fontSize: 10,
           color: PALETTE.good,
         }}>● VERIFIED</span>
+        <div style={{ display: "flex", gap: 4, marginLeft: 8 }}>
+          {Object.entries(AUDIT_FILTERS).map(([k, def]) => {
+            const active = k === filter;
+            const count = entries.filter(def.match).length;
+            return (
+              <button
+                key={k}
+                type="button"
+                onClick={() => setFilter(k)}
+                style={{
+                  appearance: "none",
+                  border: `1px solid ${active ? PALETTE.accent || "#5dd6c4" : PALETTE.border}`,
+                  background: active ? `${PALETTE.accent || "#5dd6c4"}26` : "transparent",
+                  color: active ? "#cdf2dd" : PALETTE.muted,
+                  borderRadius: 3,
+                  padding: "2px 8px",
+                  fontFamily: "'IBM Plex Mono', monospace",
+                  fontSize: 9,
+                  letterSpacing: "0.12em",
+                  cursor: "pointer",
+                  textTransform: "uppercase",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                }}
+              >
+                <span>{def.label}</span>
+                <span style={{
+                  fontVariantNumeric: "tabular-nums",
+                  color: active ? "#cdf2dd" : PALETTE.dim,
+                }}>{count}</span>
+              </button>
+            );
+          })}
+        </div>
         <span style={{ flex: 1 }} />
         <span style={{
           fontFamily: "'IBM Plex Mono', monospace", fontSize: 10,
@@ -1003,26 +1083,83 @@ function AuditFeed({ entries }) {
         }}>↑ to oversight board · daily</span>
       </div>
       <div style={{ overflowY: "auto", flex: 1, padding: "4px 0" }}>
-        {entries.slice().reverse().map((e, i) => (
-          <div key={i} style={{
-            padding: "4px 16px", display: "grid",
-            gridTemplateColumns: "60px 80px 130px 1fr 110px",
-            gap: 14, alignItems: "center",
+        {visible.length === 0 && (
+          <div style={{
+            padding: "20px 16px",
             fontFamily: "'IBM Plex Mono', monospace", fontSize: 11,
-            color: PALETTE.text, borderBottom: `1px solid ${PALETTE.border}`,
+            color: PALETTE.muted, fontStyle: "italic",
           }}>
-            <span style={{ color: PALETTE.muted }}>#{e.seq.toString().padStart(4, "0")}</span>
-            <span style={{ color: PALETTE.muted }}>{e.t}Z</span>
-            <span style={{ color: PALETTE.dim }}>{e.actor}</span>
-            <span>
-              <span style={{ color: eventColor(e.event), fontWeight: 500 }}>{e.event}</span>
-              <span style={{ color: PALETTE.muted, marginLeft: 10 }}>{e.note}</span>
-            </span>
-            <span style={{ color: PALETTE.dim, textAlign: "right" }}>
-              {e.hash || `#${hashStr("seq" + e.seq).slice(0, 10)}`}
-            </span>
+            No matching events. {filter === "DISPATCHES"
+              && "Operator decisions will appear here as recommendations are approved/rejected."}
           </div>
-        ))}
+        )}
+        {visible.slice().reverse().map((e, i) => {
+          // Special-case DISPATCH rendering — the "compliance story" line:
+          // operator highlight, action pill, hash proof.
+          if (e.event === "decision" && filter !== "ALL") {
+            const payload = e.payload || {};
+            const decided = String(payload.decision || "").toLowerCase();
+            const pillColor =
+              decided === "approved" ? PALETTE.good
+              : decided === "rejected" ? PALETTE.alert
+              : PALETTE.warn;
+            return (
+              <div key={i} style={{
+                padding: "8px 16px", display: "grid",
+                gridTemplateColumns: "60px 90px 1fr 110px",
+                gap: 14, alignItems: "center",
+                fontFamily: "'IBM Plex Mono', monospace", fontSize: 11,
+                color: PALETTE.text,
+                borderBottom: `1px solid ${PALETTE.border}`,
+                background: PALETTE.surface2 + "30",
+              }}>
+                <span style={{ color: PALETTE.muted }}>#{e.seq.toString().padStart(4, "0")}</span>
+                <span style={{ color: PALETTE.muted }}>{e.t}Z</span>
+                <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  {_decisionPill(decided || "decision", pillColor)}
+                  <span style={{ color: PALETTE.text, fontWeight: 500 }}>
+                    {payload.entity_id || "—"}
+                  </span>
+                  <span style={{ color: PALETTE.dim }}>by</span>
+                  <span style={{ color: PALETTE.accent || "#5dd6c4" }}>{e.actor}</span>
+                  {payload.reason && (
+                    <span style={{
+                      color: PALETTE.muted, fontStyle: "italic",
+                      overflow: "hidden", textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}>
+                      · {payload.reason}
+                    </span>
+                  )}
+                </span>
+                <span style={{ color: PALETTE.dim, textAlign: "right" }}>
+                  {e.hash || `#${hashStr("seq" + e.seq).slice(0, 10)}`}
+                </span>
+              </div>
+            );
+          }
+          // Default row layout — matches the original AuditFeed shape.
+          return (
+            <div key={i} style={{
+              padding: "4px 16px", display: "grid",
+              gridTemplateColumns: "60px 80px 130px 1fr 110px",
+              gap: 14, alignItems: "center",
+              fontFamily: "'IBM Plex Mono', monospace", fontSize: 11,
+              color: PALETTE.text, borderBottom: `1px solid ${PALETTE.border}`,
+            }}>
+              <span style={{ color: PALETTE.muted }}>#{e.seq.toString().padStart(4, "0")}</span>
+              <span style={{ color: PALETTE.muted }}>{e.t}Z</span>
+              <span style={{ color: PALETTE.dim }}>{e.actor}</span>
+              <span>
+                <span style={{ color: eventColor(e.event), fontWeight: 500 }}>{e.event}</span>
+                <span style={{ color: PALETTE.muted, marginLeft: 10 }}>{e.note}</span>
+              </span>
+              <span style={{ color: PALETTE.dim, textAlign: "right" }}>
+                {e.hash || `#${hashStr("seq" + e.seq).slice(0, 10)}`}
+              </span>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -1139,8 +1276,16 @@ export default function Workbench() {
     const t = new Date().toISOString().slice(11, 19);
     setAuditExtras(a => [...a, {
       seq, t, actor: cfg.operator,
-      event: "operator_decision",
+      // Match the backend's audit event name ('decision') so the
+      // DISPATCHES filter in AuditFeed picks up this row too.
+      event: "decision",
       note: `${decision} · ${id.slice(0, 16)}`,
+      payload: {
+        rec_id: null,
+        entity_id: id,
+        decision,
+        reason: decision === "approved" ? "operator approved" : "operator rejected",
+      },
     }]);
     // Try to POST to live API; ignore failures (offline mode)
     if (conn.status === "live") {
