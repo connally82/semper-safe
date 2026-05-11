@@ -100,22 +100,22 @@ const DEFAULT_ZOOM = 5.5;
 
 const FIT_PADDING = 60;
 
-// Bounding box clamp for the first-data auto-fit. Backed-end entities
-// occasionally drift outside the operator's actual AOI — for example the
-// initial Madagascar demo seed left a handful of dark-vessel rows around
-// (48.2, -13.7) which would force the camera to span both continents and
-// shrink the Texas vessels to invisible specks. We only let the auto-fit
-// consider points inside this clamp; if a real entity is outside, that's
-// a data-cleanup problem, not a map UX problem.
-const FIT_CLAMP_MIN_LON = -98.5;
-const FIT_CLAMP_MAX_LON = -93.0;
-const FIT_CLAMP_MIN_LAT = 25.0;
-const FIT_CLAMP_MAX_LAT = 31.0;
-function _insideFitClamp(lon, lat) {
+// Bounding box clamps for the first-data auto-fit, keyed by the
+// domain's apiPath. Maritime clamps to the Texas Gulf AOI; wildfire
+// clamps to the Western US (California through Texas Panhandle).
+// _insideFitClamp(lon, lat, apiPath) picks the right one.
+const FIT_CLAMPS = {
+  "/maritime": { minLon: -98.5,  maxLon: -93.0,  minLat: 25.0, maxLat: 31.0 },
+  "/wildfire": { minLon: -125.0, maxLon: -100.0, minLat: 30.0, maxLat: 50.0 },
+};
+const FIT_CLAMP_FALLBACK = FIT_CLAMPS["/maritime"];
+
+function _insideFitClamp(lon, lat, apiPath) {
+  const c = FIT_CLAMPS[apiPath] || FIT_CLAMP_FALLBACK;
   return (
     typeof lon === "number" && typeof lat === "number"
-    && lon >= FIT_CLAMP_MIN_LON && lon <= FIT_CLAMP_MAX_LON
-    && lat >= FIT_CLAMP_MIN_LAT && lat <= FIT_CLAMP_MAX_LAT
+    && lon >= c.minLon && lon <= c.maxLon
+    && lat >= c.minLat && lat <= c.maxLat
   );
 }
 
@@ -201,6 +201,33 @@ const ASSETS_STORAGE_KEY = "ss-onshore-assets";
 const SANCTIONS_SOURCE_ID = "ss-sanctioned";
 const SANCTIONS_RING_LAYER_ID = "ss-sanctioned-ring";
 const SANCTIONS_LABEL_LAYER_ID = "ss-sanctioned-label";
+
+// ──── Wildfire prevention overlays (Phase 6) ──────────────────────
+// All only activate on the wildfire tab (cfg.apiPath === "/wildfire").
+// Mirrors the maritime SAR/S2/buoys pattern: dedicated MapLibre
+// source + fill/circle/symbol layers, refreshed on a per-feed
+// cadence.
+const NIFC_SOURCE_ID = "ss-nifc-incidents";
+const NIFC_INCIDENT_LAYER_ID = "ss-nifc-incidents-point";
+const NIFC_LABEL_LAYER_ID = "ss-nifc-incidents-label";
+const RFW_SOURCE_ID = "ss-rfw";
+const RFW_FILL_LAYER_ID = "ss-rfw-fill";
+const RFW_LINE_LAYER_ID = "ss-rfw-line";
+const RISK_GRID_SOURCE_ID = "ss-risk-grid";
+const RISK_GRID_LAYER_ID = "ss-risk-grid-heat";
+const STRIKE_SOURCE_ID = "ss-strikes";
+const STRIKE_LAYER_ID = "ss-strikes-point";
+const PREPOSITION_SOURCE_ID = "ss-preposition";
+const PREPOSITION_POINT_LAYER_ID = "ss-preposition-point";
+const PREPOSITION_LINE_LAYER_ID = "ss-preposition-line";
+const PREPOSITION_LABEL_LAYER_ID = "ss-preposition-label";
+const FIRE_ASSETS_SOURCE_ID = "ss-fire-assets";
+const FIRE_ASSETS_LAYER_ID = "ss-fire-assets-point";
+const FIRE_ASSETS_LABEL_LAYER_ID = "ss-fire-assets-label";
+
+// Refresh cadence for wildfire feeds — backend caches data on a 5-min
+// cycle so the client polls slightly less aggressively.
+const WILDFIRE_POLL_MS = 90 * 1000;
 
 // Watchlist — operator marks specific MMSIs as "watch closely".
 // Tracked in localStorage so it survives sessions. Watchlisted entities
@@ -1702,9 +1729,229 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
       });
     };
 
+    // ── Wildfire layers ──
+    const ensureWildfireLayers = () => {
+      // NIFC incident points (sized by acres)
+      if (!map.getSource(NIFC_SOURCE_ID)) {
+        map.addSource(NIFC_SOURCE_ID, {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+        map.addLayer({
+          id: NIFC_INCIDENT_LAYER_ID,
+          type: "circle",
+          source: NIFC_SOURCE_ID,
+          paint: {
+            "circle-color": "#ff5c5c",
+            "circle-radius": [
+              "interpolate", ["linear"],
+              ["coalesce", ["get", "size_acres"], 1],
+              0,    5,
+              1000, 9,
+              50000, 16,
+            ],
+            "circle-opacity": 0.7,
+            "circle-stroke-color": "#040810",
+            "circle-stroke-width": 1.5,
+          },
+        });
+        map.addLayer({
+          id: NIFC_LABEL_LAYER_ID,
+          type: "symbol",
+          source: NIFC_SOURCE_ID,
+          minzoom: 6,
+          layout: {
+            "text-field": ["get", "name"],
+            "text-font": ["Open Sans Regular"],
+            "text-size": 10,
+            "text-anchor": "top",
+            "text-offset": [0, 1.2],
+            "text-allow-overlap": false,
+          },
+          paint: {
+            "text-color": "#ffb0a8",
+            "text-halo-color": "#040810",
+            "text-halo-width": 1.5,
+          },
+        });
+      }
+      // Red Flag / Fire Weather Watch polygons
+      if (!map.getSource(RFW_SOURCE_ID)) {
+        map.addSource(RFW_SOURCE_ID, {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+        map.addLayer({
+          id: RFW_FILL_LAYER_ID,
+          type: "fill",
+          source: RFW_SOURCE_ID,
+          paint: {
+            "fill-color": [
+              "match", ["get", "event"],
+              "Red Flag Warning",   "#ff3a3a",
+              "Fire Weather Watch", "#ff8a3a",
+              "#a8a8b8",
+            ],
+            "fill-opacity": 0.18,
+          },
+        });
+        map.addLayer({
+          id: RFW_LINE_LAYER_ID,
+          type: "line",
+          source: RFW_SOURCE_ID,
+          paint: {
+            "line-color": [
+              "match", ["get", "event"],
+              "Red Flag Warning",   "#ff5c5c",
+              "Fire Weather Watch", "#ffa05c",
+              "#a8a8b8",
+            ],
+            "line-width": 1.2,
+            "line-opacity": 0.7,
+          },
+        });
+      }
+      // Ignition risk grid (heatmap-ish circles colored by risk_score)
+      if (!map.getSource(RISK_GRID_SOURCE_ID)) {
+        map.addSource(RISK_GRID_SOURCE_ID, {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+        map.addLayer({
+          id: RISK_GRID_LAYER_ID,
+          type: "circle",
+          source: RISK_GRID_SOURCE_ID,
+          paint: {
+            "circle-radius": [
+              "interpolate", ["linear"], ["zoom"],
+              4, 22,
+              7, 60,
+            ],
+            "circle-color": [
+              "interpolate", ["linear"], ["coalesce", ["get", "risk_score"], 0],
+              0,    "rgba(95,208,147,0)",
+              0.25, "rgba(95,208,147,0.5)",
+              0.5,  "rgba(240,168,48,0.65)",
+              0.75, "rgba(255,92,92,0.7)",
+              1,    "rgba(180,30,30,0.85)",
+            ],
+            "circle-blur": 0.85,
+            "circle-opacity": 0.6,
+          },
+        }, NIFC_INCIDENT_LAYER_ID);  // draw BELOW incident points
+      }
+      // Lightning strikes (small yellow dots)
+      if (!map.getSource(STRIKE_SOURCE_ID)) {
+        map.addSource(STRIKE_SOURCE_ID, {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+        map.addLayer({
+          id: STRIKE_LAYER_ID,
+          type: "circle",
+          source: STRIKE_SOURCE_ID,
+          paint: {
+            "circle-color": "#ffd040",
+            "circle-radius": 3,
+            "circle-stroke-color": "#040810",
+            "circle-stroke-width": 0.8,
+            "circle-opacity": 0.9,
+          },
+        });
+      }
+      // Pre-position recommendations (suggested staging coords)
+      if (!map.getSource(PREPOSITION_SOURCE_ID)) {
+        map.addSource(PREPOSITION_SOURCE_ID, {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+        map.addLayer({
+          id: PREPOSITION_LINE_LAYER_ID,
+          type: "line",
+          source: PREPOSITION_SOURCE_ID,
+          filter: ["==", "$type", "LineString"],
+          paint: {
+            "line-color": "#76e0d2",
+            "line-width": 1.2,
+            "line-opacity": 0.7,
+            "line-dasharray": [3, 2],
+          },
+        });
+        map.addLayer({
+          id: PREPOSITION_POINT_LAYER_ID,
+          type: "circle",
+          source: PREPOSITION_SOURCE_ID,
+          filter: ["==", "$type", "Point"],
+          paint: {
+            "circle-color": "rgba(0,0,0,0)",
+            "circle-radius": 10,
+            "circle-stroke-color": "#76e0d2",
+            "circle-stroke-width": 2,
+            "circle-stroke-opacity": 0.95,
+          },
+        });
+        map.addLayer({
+          id: PREPOSITION_LABEL_LAYER_ID,
+          type: "symbol",
+          source: PREPOSITION_SOURCE_ID,
+          filter: ["==", "$type", "Point"],
+          layout: {
+            "text-field": "PRE-POSITION",
+            "text-font": ["Open Sans Regular"],
+            "text-size": 9,
+            "text-anchor": "bottom",
+            "text-offset": [0, -1.2],
+            "text-letter-spacing": 0.16,
+          },
+          paint: {
+            "text-color": "#a8f0e4",
+            "text-halo-color": "#040810",
+            "text-halo-width": 1.4,
+          },
+        });
+      }
+      // Fire-asset positions (CAL FIRE ACCs, USFS, etc)
+      if (!map.getSource(FIRE_ASSETS_SOURCE_ID)) {
+        map.addSource(FIRE_ASSETS_SOURCE_ID, {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+        map.addLayer({
+          id: FIRE_ASSETS_LAYER_ID,
+          type: "circle",
+          source: FIRE_ASSETS_SOURCE_ID,
+          paint: {
+            "circle-color": "#5fd093",
+            "circle-radius": 5,
+            "circle-stroke-color": "#040810",
+            "circle-stroke-width": 1.2,
+          },
+        });
+        map.addLayer({
+          id: FIRE_ASSETS_LABEL_LAYER_ID,
+          type: "symbol",
+          source: FIRE_ASSETS_SOURCE_ID,
+          minzoom: 5.5,
+          layout: {
+            "text-field": ["get", "name"],
+            "text-font": ["Open Sans Regular"],
+            "text-size": 9,
+            "text-anchor": "left",
+            "text-offset": [0.7, 0],
+          },
+          paint: {
+            "text-color": "#cdf2dd",
+            "text-halo-color": "#040810",
+            "text-halo-width": 1.4,
+          },
+        });
+      }
+    };
+
     map.on("style.load", ensureActiveDispatchLayers);
     map.on("style.load", ensureWatchlistLayers);
     map.on("style.load", ensureSanctionLayers);
+    map.on("style.load", ensureWildfireLayers);
     map.on("style.load", ensureSarLayers);
 
     // Click → popup. Detections are densely packed so attach to the
@@ -2226,7 +2473,7 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
       const bounds = new maplibregl.LngLatBounds();
       let any = false;
       for (const e of renderEntities) {
-        if (_insideFitClamp(e.lon, e.lat)) {
+        if (_insideFitClamp(e.lon, e.lat, cfg.apiPath)) {
           bounds.extend([e.lon, e.lat]);
           any = true;
         }
@@ -2784,6 +3031,87 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
     }
     src.setData({ type: "FeatureCollection", features });
   }, [activeDispatches, entitiesById, ready]);
+
+  // ------------------------------------------------------------------
+  // Wildfire prevention layers — only active on the wildfire tab.
+  // Polls all five backend endpoints in parallel on a 90 s cadence
+  // and hides every layer when the tab is anything else (maritime).
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const isWildfire = cfg.apiPath === "/wildfire";
+    const wildfireLayers = [
+      NIFC_INCIDENT_LAYER_ID, NIFC_LABEL_LAYER_ID,
+      RFW_FILL_LAYER_ID, RFW_LINE_LAYER_ID,
+      RISK_GRID_LAYER_ID,
+      STRIKE_LAYER_ID,
+      PREPOSITION_POINT_LAYER_ID, PREPOSITION_LINE_LAYER_ID, PREPOSITION_LABEL_LAYER_ID,
+      FIRE_ASSETS_LAYER_ID, FIRE_ASSETS_LABEL_LAYER_ID,
+    ];
+    for (const lid of wildfireLayers) {
+      if (map.getLayer(lid)) {
+        map.setLayoutProperty(
+          lid, "visibility",
+          isWildfire ? "visible" : "none",
+        );
+      }
+    }
+    if (!isWildfire) return;
+
+    let cancelled = false;
+    const pull = async () => {
+      const setSrc = (sid, data) => {
+        const s = map.getSource(sid);
+        if (s && !cancelled) s.setData(data || { type: "FeatureCollection", features: [] });
+      };
+      // Fire all five fetches in parallel; each handles its own errors.
+      const safeFetch = (url) =>
+        fetch(`${API_BASE}${url}`).then((r) => r.ok ? r.json() : null).catch(() => null);
+      const [inc, rfw, risk, lit, pre, ast] = await Promise.all([
+        safeFetch("/wildfire/incidents"),
+        safeFetch("/wildfire/red_flag"),
+        safeFetch("/wildfire/risk_grid"),
+        safeFetch("/wildfire/lightning"),
+        safeFetch("/wildfire/preposition"),
+        safeFetch("/wildfire/assets"),
+      ]);
+      if (cancelled) return;
+      if (inc)  setSrc(NIFC_SOURCE_ID, inc);
+      if (rfw)  setSrc(RFW_SOURCE_ID, rfw);
+      if (risk) setSrc(RISK_GRID_SOURCE_ID, risk);
+      if (lit)  setSrc(STRIKE_SOURCE_ID, lit);
+      if (ast)  setSrc(FIRE_ASSETS_SOURCE_ID, ast);
+      // For preposition: emit both Points (the staging coords) AND
+      // LineStrings (from each staging coord back to the nearest
+      // fire asset) so the operator sees the gap visually.
+      if (pre && pre.features) {
+        const features = [];
+        for (const f of pre.features) {
+          features.push(f);   // the point itself
+          const a = f.properties?.nearest_asset;
+          if (a && typeof a.lon === "number" && typeof a.lat === "number") {
+            features.push({
+              type: "Feature",
+              geometry: {
+                type: "LineString",
+                coordinates: [
+                  f.geometry.coordinates,
+                  [a.lon, a.lat],
+                ],
+              },
+              properties: { kind: "asset_link",
+                            asset_name: a.name, distance_km: a.distance_km },
+            });
+          }
+        }
+        setSrc(PREPOSITION_SOURCE_ID, { type: "FeatureCollection", features });
+      }
+    };
+    pull();
+    const id = window.setInterval(pull, WILDFIRE_POLL_MS);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [cfg.apiPath, ready]);
 
   // ------------------------------------------------------------------
   // Onshore assets — fetched once on toggle-on. The catalog is static

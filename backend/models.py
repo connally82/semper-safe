@@ -49,6 +49,9 @@ class EntityType(str, Enum):
     SMOKE_PLUME = "smoke_plume"     # visible-imagery plume detection
     FIRE_EVENT = "fire_event"       # fused: persistent hotspot + smoke + weather
     FALSE_POSITIVE = "false_positive"  # suppressed (industrial flare, etc.)
+    # Wildfire prevention (Phase 6)
+    LIGHTNING_IGNITION_RISK = "lightning_ignition_risk"  # CG strike + low-fuel-moisture cell
+    FIRE_PREPOSITION = "fire_preposition"                # engine-recommended staging point
     # Cross-domain
     UNKNOWN = "unknown"
 

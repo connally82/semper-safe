@@ -116,6 +116,12 @@ const DOMAINS = {
       hotspot:        { color: "#f0a830", label: "HOTSPOT",         glow: false },
       smoke_plume:    { color: "#a8a8b8", label: "SMOKE PLUME",     glow: false },
       false_positive: { color: "#4a5668", label: "SUPPRESSED · FP", glow: false },
+      // Prevention-side classifications added with the 2026 wildfire
+      // prevention buildout. lightning_ignition_risk is the strike-
+      // landed-on-tinder signal; fire_preposition is an engine-emitted
+      // recommendation to stage assets at a high-risk coordinate.
+      lightning_ignition_risk: { color: "#ffd040", label: "LIGHTNING-IGNITION", glow: true },
+      fire_preposition:        { color: "#76e0d2", label: "PRE-POSITION",       glow: true },
     },
     actionLabel: {
       alert_fire_dispatch: "Alert fire dispatch",
@@ -123,7 +129,7 @@ const DOMAINS = {
       request_aerial_recon: "Request aerial recon",
       log_only: "Log only — watchlist",
     },
-    aoiLabel: "AOI: Northern California · 5 fixed sensors + LEO/GEO",
+    aoiLabel: "AOI: Western US · NWS RFW · NIFC active · risk grid",
     coordFmt: (lon, lat) => `${Math.abs(lon).toFixed(3)}°W ${lat.toFixed(3)}°N`,
   },
 };

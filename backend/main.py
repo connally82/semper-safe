@@ -64,6 +64,8 @@ _sar_auto_process_task: asyncio.Task[None] | None = None
 _sar_auto_process_cancel: asyncio.Event | None = None
 _s2_discover_task: asyncio.Task[None] | None = None
 _s2_discover_cancel: asyncio.Event | None = None
+_wildfire_refresh_task: asyncio.Task[None] | None = None
+_wildfire_refresh_cancel: asyncio.Event | None = None
 
 # How often to scan maritime entities for AIS dropouts. The sweep is cheap
 # (in-memory iteration over self.entities); the real cost is the audit/store
@@ -231,6 +233,86 @@ async def _gap_sweeper_loop(cancel: asyncio.Event) -> None:
                     log.debug("evicted %d stale in-memory observations", evicted)
             except Exception as exc:  # noqa: BLE001
                 log.exception("in-memory eviction crashed: %s", exc)
+
+
+# Wildfire data caches — refreshed every WILDFIRE_REFRESH_INTERVAL_S
+# by _wildfire_refresh_loop. Endpoints serve from cache so an operator
+# never blocks on a slow NIFC/NWS round trip.
+WILDFIRE_REFRESH_INTERVAL_S = 5 * 60   # 5 minutes — NIFC updates
+                                       # incident sizes / containment
+                                       # several times an hour.
+_wildfire_cache = {
+    "incidents": [],           # NIFC active incidents (list of dicts)
+    "red_flag":  [],           # NWS Red Flag / Fire Weather Watch polygons
+    "risk_grid": [],           # Per-cell HDW samples
+    "lightning": [],           # Last-hour strikes
+    "preposition": [],         # Recommended staging points
+    "last_refresh_at": None,
+}
+
+
+async def _wildfire_refresh_loop(cancel: asyncio.Event) -> None:
+    """Periodically refresh every wildfire data feed. Each source is
+    fetched in a threadpool so a slow NIFC ArcGIS query doesn't block
+    the others. Failures are logged but don't crash the loop."""
+    import nifc
+    log.info("wildfire refresh loop started (every %ds)",
+             WILDFIRE_REFRESH_INTERVAL_S)
+    # Kick off first refresh shortly after boot rather than on the full
+    # interval — so an operator opening the wildfire tab during the
+    # first few minutes already sees real incidents.
+    first_delay = 30
+    while not cancel.is_set():
+        try:
+            await asyncio.wait_for(cancel.wait(), timeout=first_delay)
+        except asyncio.TimeoutError:
+            try:
+                incidents = await asyncio.to_thread(nifc.fetch_active_incidents)
+                _wildfire_cache["incidents"] = incidents
+                log.info("wildfire refresh: %d NIFC incidents", len(incidents))
+            except Exception as exc:  # noqa: BLE001
+                log.exception("NIFC refresh crashed: %s", exc)
+            try:
+                # Red Flag + ignition-risk + lightning + preposition
+                # imports are lazy so a missing module doesn't crash
+                # the whole loop.
+                from nws_alerts import fetch_red_flag_warnings
+                _wildfire_cache["red_flag"] = await asyncio.to_thread(
+                    fetch_red_flag_warnings)
+                log.info("wildfire refresh: %d RFW/FWW polygons",
+                         len(_wildfire_cache["red_flag"]))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("RFW refresh crashed (continuing): %s", exc)
+            try:
+                from wildfire_risk import compute_risk_grid
+                _wildfire_cache["risk_grid"] = await asyncio.to_thread(
+                    compute_risk_grid)
+                log.info("wildfire refresh: risk_grid n=%d cells",
+                         len(_wildfire_cache["risk_grid"]))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("risk grid refresh crashed (continuing): %s", exc)
+            try:
+                from wildfire_lightning import recent_strikes
+                _wildfire_cache["lightning"] = await asyncio.to_thread(
+                    recent_strikes)
+                log.info("wildfire refresh: %d lightning strikes",
+                         len(_wildfire_cache["lightning"]))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("lightning refresh crashed (continuing): %s", exc)
+            try:
+                from wildfire_preposition import recommend_prepositions
+                _wildfire_cache["preposition"] = await asyncio.to_thread(
+                    recommend_prepositions,
+                    _wildfire_cache["incidents"],
+                    _wildfire_cache["risk_grid"],
+                )
+                log.info("wildfire refresh: %d pre-position recs",
+                         len(_wildfire_cache["preposition"]))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("preposition refresh crashed (continuing): %s", exc)
+            _wildfire_cache["last_refresh_at"] = datetime.now(
+                timezone.utc).isoformat()
+        first_delay = WILDFIRE_REFRESH_INTERVAL_S
 
 
 async def _sar_discover_loop(cancel: asyncio.Event) -> None:
@@ -675,6 +757,15 @@ def _bootstrap():
             )
             log.info("S2 discovery task started (every %ds)",
                      S2_DISCOVERY_INTERVAL_S)
+
+            # Wildfire prevention data feeds: NIFC incidents +
+            # NWS Red Flag warnings + ignition-risk grid + lightning
+            # + preposition recs. Refreshed on a 5-min cadence.
+            global _wildfire_refresh_task, _wildfire_refresh_cancel
+            _wildfire_refresh_cancel = asyncio.Event()
+            _wildfire_refresh_task = loop.create_task(
+                _wildfire_refresh_loop(_wildfire_refresh_cancel)
+            )
 
             # Sentinel-1 auto-process pipeline — opt-in, requires
             # Copernicus auth + R2 to actually do anything. Runs the
@@ -1695,6 +1786,210 @@ def maritime_file_dispatch(body: DispatchRequest):
 
 
 # Wildfire domain
+@app.get("/wildfire/incidents")
+def wildfire_incidents():
+    """Active US wildfire incidents from NIFC WFIGS, cached.
+
+    GeoJSON FeatureCollection of incident POO (point of origin)
+    locations with name, discovery time, current size (acres),
+    containment %, agency, state, behavior, and cause. Updated
+    every 5 minutes by the wildfire refresh loop.
+    """
+    features = []
+    for i in _wildfire_cache["incidents"]:
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Point",
+                         "coordinates": [i["lon"], i["lat"]]},
+            "properties": {
+                "incident_id":  i["incident_id"],
+                "name":         i["name"],
+                "discovered_at": i["discovered_at"],
+                "size_acres":   i["size_acres"],
+                "contained_pct": i["contained_pct"],
+                "agency":       i["agency"],
+                "state":        i["state"],
+                "behavior":     i["behavior"],
+                "cause":        i["cause"],
+            },
+        })
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "n_incidents": len(features),
+        "last_refresh_at": _wildfire_cache["last_refresh_at"],
+    }
+
+
+@app.get("/wildfire/assets")
+def wildfire_assets():
+    """Fire-asset catalog — CAL FIRE Air Attack Bases, USFS air-attack,
+    helitack, IABs, regional ops centers. Static data; cached by the
+    browser for an hour."""
+    from fastapi.responses import JSONResponse
+    import wildfire_preposition
+    features = [
+        {
+            "type": "Feature",
+            "geometry": {"type": "Point",
+                         "coordinates": [a["lon"], a["lat"]]},
+            "properties": {"name": a["name"], "type": a["type"]},
+        }
+        for a in wildfire_preposition.list_assets()
+    ]
+    return JSONResponse(
+        {"type": "FeatureCollection", "features": features},
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@app.get("/wildfire/preposition")
+def wildfire_preposition_endpoint():
+    """Engine-recommended preposition stagings for the next 24 h.
+
+    Computed from the cached ignition-risk grid and active NIFC
+    incidents on each wildfire refresh tick. Each feature is a Point
+    at the suggested staging coordinate with the nearest fire asset,
+    coverage gap, and a one-paragraph rationale string."""
+    features = []
+    for p in _wildfire_cache["preposition"]:
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Point",
+                         "coordinates": [p["lon"], p["lat"]]},
+            "properties": {
+                "id":            p["id"],
+                "score":         p["score"],
+                "risk_score":    p["risk_score"],
+                "hdw":           p["hdw"],
+                "nearest_asset": p["nearest_asset"],
+                "rationale":     p["rationale"],
+            },
+        })
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "n_recommendations": len(features),
+        "last_refresh_at": _wildfire_cache["last_refresh_at"],
+    }
+
+
+@app.get("/wildfire/lightning")
+def wildfire_lightning():
+    """Last-hour cloud-to-ground lightning strikes inside the AOI.
+
+    Synthesized from NWS Severe Thunderstorm Warning polygons (a
+    free public proxy for real lightning), with a per-strike polarity,
+    amplitude, and timestamp. Frontend renders as glowing yellow
+    points with a 1-hour fade. Real Vaisala / Earth Networks feeds
+    would slot in via the same dict shape.
+    """
+    features = [
+        {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [s["lon"], s["lat"]]},
+            "properties": {
+                "id":           s["id"],
+                "t":            s["t"],
+                "polarity":     s["polarity"],
+                "amplitude_ka": s["amplitude_ka"],
+                "source":       s["source"],
+            },
+        }
+        for s in _wildfire_cache["lightning"]
+    ]
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "n_strikes": len(features),
+        "source": "nws_thunderstorm_proxy",
+        "last_refresh_at": _wildfire_cache["last_refresh_at"],
+    }
+
+
+@app.get("/wildfire/risk_grid")
+def wildfire_risk_grid():
+    """Ignition-risk grid — Hot-Dry-Windy index per AOI cell.
+
+    Each feature is a Point at the cell center with the HDW value,
+    normalized risk_score [0,1], and the peak forecast conditions
+    (temp / RH / wind) that produced the score. Frontend renders
+    as a colored heatmap; clicking a cell pops the conditions.
+    """
+    features = [
+        {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [c["lon"], c["lat"]]},
+            "properties": {
+                "hdw":          c["hdw"],
+                "risk_score":   c["risk_score"],
+                "peak_temp_c":  c["peak_temp_c"],
+                "peak_rh_pct":  c["peak_rh_pct"],
+                "peak_wind_ms": c["peak_wind_ms"],
+            },
+        }
+        for c in _wildfire_cache["risk_grid"]
+    ]
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "n_cells": len(features),
+        "last_refresh_at": _wildfire_cache["last_refresh_at"],
+    }
+
+
+@app.get("/wildfire/red_flag")
+def wildfire_red_flag():
+    """Active NWS Red Flag Warnings + Fire Weather Watches as GeoJSON.
+
+    Cached output from the wildfire refresh loop — polygons + headline
+    + severity per active alert. The frontend renders these as a
+    translucent red fill layer so the operator sees the next 12-24 h
+    of high-risk geographies at a glance.
+    """
+    features = []
+    for a in _wildfire_cache["red_flag"]:
+        geom = a.get("geometry")
+        if not geom:
+            continue
+        features.append({
+            "type": "Feature",
+            "geometry": geom,
+            "properties": {
+                "id":        a.get("id"),
+                "event":     a.get("event"),
+                "severity":  a.get("severity"),
+                "urgency":   a.get("urgency"),
+                "certainty": a.get("certainty"),
+                "effective": a.get("effective"),
+                "expires":   a.get("expires"),
+                "ends":      a.get("ends"),
+                "headline":  a.get("headline"),
+                "sender":    a.get("sender"),
+            },
+        })
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "n_alerts": len(features),
+        "last_refresh_at": _wildfire_cache["last_refresh_at"],
+    }
+
+
+@app.get("/wildfire/incidents/{incident_id}/perimeter")
+def wildfire_incident_perimeter(incident_id: str):
+    """Polygon perimeter for one incident from NIFC, when mapped.
+
+    Many small fires lack a mapped perimeter; returns 404 in that
+    case so the frontend can fall back to the POO point.
+    """
+    import nifc
+    p = nifc.fetch_incident_perimeter(incident_id)
+    if p is None:
+        raise HTTPException(404, "no perimeter mapped for this incident")
+    return p
+
+
 @app.get("/wildfire/entities")
 def wildfire_entities():
     rows = sorted(list(wildfire.entities.values()),
