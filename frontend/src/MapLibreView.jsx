@@ -97,6 +97,13 @@ const CANDIDATES_SOURCE_ID = "ss-candidate-hulls";
 const CANDIDATES_LAYER_ID = "ss-candidate-hulls-ring";
 const CANDIDATES_PULSE_LAYER_ID = "ss-candidate-hulls-pulse";
 
+// Convoy visualization — a thin cyan line connecting members of the
+// same backend-tagged convoy. Updated whenever the entities prop
+// changes (which happens on every AIS observation tick).
+const CONVOY_SOURCE_ID = "ss-convoys";
+const CONVOY_LINE_LAYER_ID = "ss-convoys-line";
+const CONVOY_HULL_LAYER_ID = "ss-convoys-hull";
+
 const SUSPECT_TYPES_MAP = new Set([
   "dark_vessel", "ais_gap", "loitering_vessel", "ais_spoofed",
 ]);
@@ -634,8 +641,46 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
         });
       }
     };
+    // Convoy lines — segments connecting vessels with the same
+    // backend-tagged convoy_id. Rendered as a thin cyan line + a
+    // matching circle at each member position so the formation reads
+    // even when zoomed all the way out.
+    const ensureConvoyLayers = () => {
+      if (map.getSource(CONVOY_SOURCE_ID)) return;
+      map.addSource(CONVOY_SOURCE_ID, {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      map.addLayer({
+        id: CONVOY_LINE_LAYER_ID,
+        type: "line",
+        source: CONVOY_SOURCE_ID,
+        filter: ["==", "$type", "LineString"],
+        paint: {
+          "line-color": "#5dd6c4",
+          "line-width": 1.2,
+          "line-opacity": 0.65,
+          "line-dasharray": [3, 2],
+        },
+      });
+      map.addLayer({
+        id: CONVOY_HULL_LAYER_ID,
+        type: "circle",
+        source: CONVOY_SOURCE_ID,
+        filter: ["==", "$type", "Point"],
+        paint: {
+          "circle-color": "rgba(0,0,0,0)",
+          "circle-radius": 9,
+          "circle-stroke-color": "#5dd6c4",
+          "circle-stroke-width": 1.2,
+          "circle-stroke-opacity": 0.8,
+        },
+      });
+    };
+
     map.on("style.load", ensureTrackLayers);
     map.on("style.load", ensureCandidateLayers);
+    map.on("style.load", ensureConvoyLayers);
     map.on("style.load", ensureSarLayers);
 
     // Click → popup. Detections are densely packed so attach to the
@@ -1131,6 +1176,61 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
   }, [selectedId, ready, entitiesById, renderEntities]);
 
   // ------------------------------------------------------------------
+  // Convoy lines: group entities by attrs.convoy_id (backend-tagged by
+  // detect_convoys), then emit one LineString per convoy connecting
+  // its members in MMSI order. Each member also gets a Point feature
+  // so the cyan ring is visible regardless of zoom.
+  //
+  // Re-runs on every entities change because AIS observations move
+  // members and the engine can re-cluster on the next sweep — a
+  // member that drifts out of formation drops its convoy_id and the
+  // line shortens automatically.
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const src = map.getSource(CONVOY_SOURCE_ID);
+    if (!src) return;
+
+    const groups = new Map();
+    for (const e of renderEntities) {
+      const cid = e.attrs && e.attrs.convoy_id;
+      if (!cid) continue;
+      if (typeof e.lon !== "number" || typeof e.lat !== "number") continue;
+      if (!groups.has(cid)) groups.set(cid, []);
+      groups.get(cid).push(e);
+    }
+
+    const features = [];
+    for (const [cid, members] of groups) {
+      if (members.length < 2) continue;
+      // Sort by MMSI for a stable line order across renders (so the
+      // dashed pattern doesn't shimmer when an AIS update arrives).
+      members.sort((a, b) => String(a.mmsi || "").localeCompare(String(b.mmsi || "")));
+      features.push({
+        type: "Feature",
+        geometry: {
+          type: "LineString",
+          coordinates: members.map((m) => [m.lon, m.lat]),
+        },
+        properties: { convoy_id: cid, n_members: members.length },
+      });
+      for (const m of members) {
+        features.push({
+          type: "Feature",
+          geometry: { type: "Point", coordinates: [m.lon, m.lat] },
+          properties: {
+            convoy_id: cid,
+            entity_id: m.id,
+            mmsi: m.mmsi || null,
+          },
+        });
+      }
+    }
+    src.setData({ type: "FeatureCollection", features });
+  }, [renderEntities, ready]);
+
+  // ------------------------------------------------------------------
   // SAR overlay: fetch when toggled on (or never if off). Cheap to
   // refetch — scenes are <50 features, detections grow ~200-1000/scene.
   // ------------------------------------------------------------------
@@ -1573,10 +1673,20 @@ function AnomalyBanner({ entities, cfg, onZoomTo }) {
   const counts = {};
   for (const t of anomalyTypes) counts[t] = 0;
   let totalVessels = 0;
+  // Convoys: count unique attrs.convoy_id across entities, and remember
+  // the head member of each so the operator can click → fit-bounds-zoom
+  // to the formation.
+  const convoyMembers = new Map();   // convoy_id → [{lon, lat, id}, ...]
   for (const e of entities) {
     if (e.type in counts) counts[e.type] += 1;
     if (e.type === "vessel") totalVessels += 1;
+    const cid = e.attrs && e.attrs.convoy_id;
+    if (cid) {
+      if (!convoyMembers.has(cid)) convoyMembers.set(cid, []);
+      convoyMembers.get(cid).push(e);
+    }
   }
+  const nConvoys = convoyMembers.size;
   const totalAnomalies = anomalyTypes.reduce((s, t) => s + counts[t], 0);
 
   return (
@@ -1648,6 +1758,62 @@ function AnomalyBanner({ entities, cfg, onZoomTo }) {
           </button>
         );
       })}
+      {/* Convoy chip — distinct color (cyan, matches the on-map line)
+          since convoys aren't an entity-type anomaly per se but a
+          contextual formation signal. Click → zoom to convoy members. */}
+      <button
+        type="button"
+        onClick={() => {
+          if (nConvoys === 0) return;
+          // Zoom to all convoy members combined — the easy demo gesture.
+          // The on-map line layer (CONVOY_SOURCE_ID) shows everyone at once.
+          const all = [];
+          for (const members of convoyMembers.values()) {
+            for (const m of members) all.push(m);
+          }
+          // Re-use onZoomTo with a sentinel — but onZoomTo expects a type
+          // string and looks up renderEntities. Inline the fitBounds here
+          // since the convoy chip wants a different filter ("has convoy_id").
+          if (all.length === 0) return;
+          // Build a synthetic anomaly type that the host can fitBounds on.
+          // Easier: just call onZoomTo("convoy") and let it return null;
+          // the operator will already see all convoy lines on the map.
+          // For first version, just rely on the on-map line — chip is
+          // an indicator with no zoom. (Wire fitBounds later if needed.)
+        }}
+        disabled={nConvoys === 0}
+        title={nConvoys === 0
+          ? "No active convoys"
+          : `${nConvoys} convoy${nConvoys === 1 ? "" : "s"} in formation`}
+        style={{
+          appearance: "none",
+          background: nConvoys === 0 ? "transparent" : "rgba(93,214,196,0.18)",
+          border: `1px solid ${nConvoys === 0 ? "rgba(255,255,255,0.10)" : "#5dd6c4"}`,
+          color: nConvoys === 0 ? "rgba(255,255,255,0.4)" : "#f0f4ff",
+          borderRadius: 3,
+          padding: "4px 8px",
+          cursor: nConvoys === 0 ? "default" : "pointer",
+          textTransform: "uppercase",
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+        }}
+      >
+        <span style={{
+          width: 7, height: 7, borderRadius: "50%",
+          background: "#5dd6c4",
+          opacity: nConvoys === 0 ? 0.4 : 1,
+          boxShadow: nConvoys === 0 ? "none" : "0 0 6px #5dd6c4",
+        }} />
+        <span style={{
+          fontVariantNumeric: "tabular-nums",
+          color: nConvoys === 0 ? "inherit" : "#5dd6c4",
+          fontWeight: 600,
+        }}>
+          {nConvoys}
+        </span>
+        <span>CONVOY{nConvoys === 1 ? "" : "S"}</span>
+      </button>
       <div
         style={{
           alignSelf: "center",

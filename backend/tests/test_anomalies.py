@@ -154,3 +154,96 @@ class TestAisSpoofDetection:
         # Position is still the FIRST report, not the teleport endpoint.
         assert ent.geom.lon == pytest.approx(-95.0, abs=1e-9)
         assert ent.geom.lat == pytest.approx(29.0, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Convoy detection
+# ---------------------------------------------------------------------------
+
+
+def _heading_obs(oid: str, mmsi: str, t: datetime, lon: float, lat: float,
+                 speed_kn: float, heading: float) -> Observation:
+    """Same as _obs but with explicit speed + heading attrs (convoy det needs them)."""
+    return Observation(
+        obs_id=oid, source=SourceType.AIS, source_id=mmsi,
+        t=t, geom=Geom(lon=lon, lat=lat),
+        h3_cell="8800000000fffff",
+        attrs={"speed_kn": speed_kn, "heading": heading},
+    )
+
+
+class TestConvoyDetection:
+    def test_four_vessel_formation_flagged(self) -> None:
+        """4 vessels, eastbound at 10 kn, ~1 km spacing → one convoy."""
+        eng = FusionEngine()
+        for i, mmsi in enumerate(["111", "112", "113", "114"]):
+            eng.ingest(_heading_obs(f"a{i}", mmsi, T0,
+                                    -95.0 + i * 0.012, 29.0,
+                                    speed_kn=10.0 + i * 0.3, heading=90 + i * 2))
+        convoys = eng.detect_convoys(T0)
+        assert len(convoys) == 1
+        assert len(convoys[0]) == 4
+        cids = {m.attrs.get("convoy_id") for m in convoys[0]}
+        assert len(cids) == 1 and next(iter(cids)).startswith("convoy_")
+
+    def test_solo_vessel_not_in_convoy(self) -> None:
+        """A south-bound vessel in the same area but not in formation
+        is not assigned a convoy_id."""
+        eng = FusionEngine()
+        # Convoy
+        for i, mmsi in enumerate(["111", "112", "113"]):
+            eng.ingest(_heading_obs(f"a{i}", mmsi, T0,
+                                    -95.0 + i * 0.01, 29.0,
+                                    speed_kn=10.0, heading=90))
+        # Loner — same area, perpendicular heading
+        eng.ingest(_heading_obs("b0", "999", T0, -94.99, 29.01,
+                                speed_kn=10.0, heading=180))
+        eng.detect_convoys(T0)
+        b = next(e for e in eng.entities.values() if e.attrs.get("mmsi") == "999")
+        assert "convoy_id" not in b.attrs
+
+    def test_two_vessel_pair_below_min_members(self) -> None:
+        """A 2-vessel pair, even in formation, does not qualify as a convoy."""
+        eng = FusionEngine()
+        for i, mmsi in enumerate(["201", "202"]):
+            eng.ingest(_heading_obs(f"c{i}", mmsi, T0,
+                                    -93.0 + i * 0.005, 28.0,
+                                    speed_kn=8.0, heading=45))
+        eng.detect_convoys(T0)
+        for mmsi in ("201", "202"):
+            ent = next(e for e in eng.entities.values() if e.attrs.get("mmsi") == mmsi)
+            assert "convoy_id" not in ent.attrs
+
+    def test_stationary_vessels_skipped(self) -> None:
+        """Vessels below CONVOY_MIN_SPEED_KN aren't candidates — anchorages
+        aren't convoys."""
+        eng = FusionEngine()
+        for i, mmsi in enumerate(["301", "302", "303"]):
+            eng.ingest(_heading_obs(f"d{i}", mmsi, T0,
+                                    -96.0 + i * 0.005, 27.5,
+                                    speed_kn=0.5, heading=0))
+        convoys = eng.detect_convoys(T0)
+        assert convoys == []
+
+    def test_membership_demoted_when_vessel_leaves(self) -> None:
+        """After a vessel breaks formation, the next sweep removes its convoy_id."""
+        eng = FusionEngine()
+        # Form a convoy
+        for i, mmsi in enumerate(["111", "112", "113"]):
+            eng.ingest(_heading_obs(f"a{i}", mmsi, T0,
+                                    -95.0 + i * 0.01, 29.0,
+                                    speed_kn=10.0, heading=90))
+        eng.detect_convoys(T0)
+        assert all("convoy_id" in eng.entities[eid].attrs
+                   for eid in eng.entities)
+
+        # Vessel 113 makes a sharp turn — heading 270 now (westbound)
+        eng.ingest(_heading_obs("a3_turn", "113",
+                                T0 + timedelta(minutes=5),
+                                -94.95, 29.0,
+                                speed_kn=10.0, heading=270))
+        # 111 and 112 keep going east; only 2 left in formation → no convoy
+        eng.detect_convoys(T0 + timedelta(minutes=5))
+        for mmsi in ("111", "112", "113"):
+            ent = next(e for e in eng.entities.values() if e.attrs.get("mmsi") == mmsi)
+            assert "convoy_id" not in ent.attrs, f"{mmsi} should be demoted"

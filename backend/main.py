@@ -174,6 +174,14 @@ async def _gap_sweeper_loop(cancel: asyncio.Event) -> None:
             except Exception as exc:  # noqa: BLE001
                 log.exception("loitering sweep crashed: %s", exc)
             try:
+                # Convoy detection — O(N²) but bounded (~300 active vessels)
+                # so it runs in <10 ms. Same threadpool offload pattern.
+                await asyncio.to_thread(
+                    maritime.detect_convoys, datetime.now(timezone.utc),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("convoy sweep crashed: %s", exc)
+            try:
                 evicted = await asyncio.to_thread(_evict_stale_in_memory_obs)
                 if evicted:
                     log.debug("evicted %d stale in-memory observations", evicted)

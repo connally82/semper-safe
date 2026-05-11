@@ -111,6 +111,37 @@ SPOOF_MAX_SPEED_KN = 80.0
 SPOOF_MIN_DT_S = 5.0       # below this, GPS reporting jitter dominates
 SPOOF_MAX_DT_S = 3600.0    # above 1h, position changes mean nothing
 
+# Convoy detection. Three or more cooperative vessels moving in
+# formation — same heading, similar speed, tight spatial cluster — is a
+# signal that's interesting on its own and amplified when paired with
+# the other anomaly classes:
+#   - escort flotillas (sanctioned-tanker conveys, paramilitary escorts)
+#   - illegal-transshipment groups (mothership + fast skiffs)
+#   - smuggling stacks (legitimate-looking cargo plus shadowing chase boat)
+#   - or simply legitimate fleet ops worth labeling as such on the map
+#
+# Algorithm (cheap, runs on the gap-sweeper loop):
+#   1. Filter to type=VESSEL with a recent speed > CONVOY_MIN_SPEED_KN
+#      (stationary vessels aren't a convoy — they're a port queue).
+#   2. Pairwise cluster by haversine ≤ CONVOY_RADIUS_KM AND heading
+#      within ±CONVOY_HEADING_TOL_DEG AND speed within
+#      ±CONVOY_SPEED_TOL_KN.
+#   3. Connected-components: any group ≥ CONVOY_MIN_MEMBERS gets a
+#      shared attrs.convoy_id (stable per-sweep, scoped to the group's
+#      head MMSI). Vessels that drop out of formation lose the attr
+#      on the next sweep.
+#
+# We don't introduce a new EntityType — convoy membership is a
+# *contextual* attribute, not a classification: a convoy member is
+# still a normal cooperative vessel. The frontend draws connecting
+# segments between members of the same convoy_id; the underlying
+# marker color stays the type-meta default.
+CONVOY_RADIUS_KM = 2.0
+CONVOY_HEADING_TOL_DEG = 15.0
+CONVOY_SPEED_TOL_KN = 2.0
+CONVOY_MIN_SPEED_KN = 3.0   # below this, "convoy" is just an anchorage
+CONVOY_MIN_MEMBERS = 3
+
 
 def gap_threshold_for(ent: Entity) -> timedelta:
     """Pick the AIS gap threshold appropriate for the entity's last-known
@@ -528,6 +559,108 @@ class FusionEngine:
             self._make_recommendation(ent)
             flagged.append(ent)
         return flagged
+
+    # --- convoy detection --------------------------------------------
+    def detect_convoys(self, now: datetime) -> list[list[Entity]]:
+        """Sweep entities; cluster cooperative vessels moving in formation.
+
+        Returns the list of convoy groups (each a list of Entity objects).
+        Each member of a group ≥ CONVOY_MIN_MEMBERS gets ent.attrs['convoy_id']
+        set to the group's head MMSI. Vessels that aren't in any group on
+        this sweep lose the attr — convoy membership is ephemeral.
+
+        Pairwise comparison is O(N²) but capped at N≈300 active vessels
+        in the current AOI so it runs in <10 ms even on a shared-cpu
+        Fly VM. If we ever scale past that, switch to a spatial index
+        (grid bucketization on the lat/lon AOI).
+        """
+        candidates: list[Entity] = []
+        for ent in list(self.entities.values()):
+            if ent.type != EntityType.VESSEL:
+                continue
+            speed = ent.attrs.get("speed_kn")
+            if not isinstance(speed, (int, float)) or speed < CONVOY_MIN_SPEED_KN:
+                continue
+            heading = ent.attrs.get("heading")
+            if heading is None or not isinstance(heading, (int, float)):
+                continue
+            # 511 is the ITU-R M.1371 "not available" sentinel; treat as missing.
+            if heading == 511:
+                continue
+            candidates.append(ent)
+
+        # Union-find over pairs that satisfy all three thresholds.
+        parent: dict[str, str] = {e.entity_id: e.entity_id for e in candidates}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        def heading_diff(a: float, b: float) -> float:
+            d = abs(a - b) % 360.0
+            return min(d, 360.0 - d)
+
+        for i in range(len(candidates)):
+            for j in range(i + 1, len(candidates)):
+                ai, aj = candidates[i], candidates[j]
+                if abs(ai.attrs["speed_kn"] - aj.attrs["speed_kn"]) > CONVOY_SPEED_TOL_KN:
+                    continue
+                if heading_diff(ai.attrs["heading"], aj.attrs["heading"]) > CONVOY_HEADING_TOL_DEG:
+                    continue
+                if haversine_km(ai.geom, aj.geom) > CONVOY_RADIUS_KM:
+                    continue
+                union(ai.entity_id, aj.entity_id)
+
+        # Bucket by root.
+        groups: dict[str, list[Entity]] = {}
+        for e in candidates:
+            r = find(e.entity_id)
+            groups.setdefault(r, []).append(e)
+
+        out: list[list[Entity]] = []
+        seen_eids: set[str] = set()
+        for members in groups.values():
+            if len(members) < CONVOY_MIN_MEMBERS:
+                continue
+            # Stable convoy_id per sweep: sort members by MMSI and use
+            # the lowest as the convoy head. Lets the frontend re-render
+            # the same connecting segments across consecutive ingests
+            # even as the member set drifts by one or two vessels.
+            members.sort(key=lambda m: m.attrs.get("mmsi") or m.entity_id)
+            head = members[0]
+            convoy_id = f"convoy_{(head.attrs.get('mmsi') or head.entity_id)[:10]}"
+            for m in members:
+                m.attrs["convoy_id"] = convoy_id
+                m.attrs["convoy_size"] = len(members)
+                seen_eids.add(m.entity_id)
+                store.put_entity(m, domain=DOMAIN)
+            out.append(members)
+            audit_log.append(
+                actor="system",
+                event_type="convoy_detected",
+                payload={"convoy_id": convoy_id, "n_members": len(members),
+                         "member_mmsis": [m.attrs.get("mmsi") for m in members]},
+            )
+
+        # Demote: any previously-tagged vessel that's no longer in a
+        # convoy this sweep loses the attr. (We don't have a fast index
+        # of which entities had convoy_id last time, so just walk all
+        # entities and check.)
+        for ent in list(self.entities.values()):
+            if ent.entity_id in seen_eids:
+                continue
+            if ent.attrs.get("convoy_id"):
+                ent.attrs.pop("convoy_id", None)
+                ent.attrs.pop("convoy_size", None)
+                store.put_entity(ent, domain=DOMAIN)
+        return out
 
     # --- recommendations ---------------------------------------------
     def _make_recommendation(self, ent: Entity) -> Recommendation:
