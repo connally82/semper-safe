@@ -142,6 +142,34 @@ CONVOY_SPEED_TOL_KN = 2.0
 CONVOY_MIN_SPEED_KN = 3.0   # below this, "convoy" is just an anchorage
 CONVOY_MIN_MEMBERS = 3
 
+# Port-skipping detection. AIS-cooperative vessels declare a destination
+# port in the AIS message; matching that string to a known port and
+# comparing the bearing-to-port against the vessel's actual heading
+# tells us whether the vessel is plausibly inbound, or whether it's
+# bypassing the declared destination entirely.
+#
+# Real-world signal:
+#   - sanctioned-fleet vessels (Iranian/Russian shadow fleet) clear a
+#     legitimate port for paperwork purposes and divert at sea
+#   - smuggling: clear customs at Port A, transfer cargo offshore, run
+#     to Port B (or no port at all)
+#   - false routing on AIS to disguise true intent
+#
+# Conditions for the port_skipping flag:
+#   - vessel.attrs.destination matches a KNOWN_GULF_PORTS entry
+#   - vessel has a usable heading (not 511 / unset)
+#   - speed > PORT_SKIP_MIN_SPEED_KN (anchored vessels can't be skipping)
+#   - bearing FROM vessel TO declared port differs from actual heading
+#     by more than PORT_SKIP_BEARING_TOL_DEG
+#   - vessel is in the open ocean transit band: PORT_SKIP_MIN_DIST_KM
+#     <= distance to port <= PORT_SKIP_MAX_DIST_KM. Inside the inner
+#     ring vessels are doing pilot maneuvers (heading naturally diverges);
+#     outside the outer ring the bearing check is too loose to be useful.
+PORT_SKIP_BEARING_TOL_DEG = 60.0
+PORT_SKIP_MIN_SPEED_KN = 4.0
+PORT_SKIP_MIN_DIST_KM = 8.0       # inside this, vessel is in approach
+PORT_SKIP_MAX_DIST_KM = 400.0     # outside this, no useful bearing signal
+
 
 def gap_threshold_for(ent: Entity) -> timedelta:
     """Pick the AIS gap threshold appropriate for the entity's last-known
@@ -167,6 +195,26 @@ def haversine_km(a: Geom, b: Geom) -> float:
     dlo = math.radians(b.lon - a.lon)
     h = math.sin(dla / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin(dlo / 2) ** 2
     return 2 * R * math.asin(math.sqrt(h))
+
+
+def bearing_deg(a: Geom, b: Geom) -> float:
+    """Initial bearing from `a` to `b`, in degrees clockwise from true
+    north [0, 360). Used by port-skipping detection to compare the
+    vessel's actual heading against the bearing required to reach its
+    declared destination."""
+    la1, la2 = math.radians(a.lat), math.radians(b.lat)
+    dlo = math.radians(b.lon - a.lon)
+    y = math.sin(dlo) * math.cos(la2)
+    x = (math.cos(la1) * math.sin(la2)
+         - math.sin(la1) * math.cos(la2) * math.cos(dlo))
+    deg = math.degrees(math.atan2(y, x))
+    return (deg + 360.0) % 360.0
+
+
+def _heading_diff_deg(a: float, b: float) -> float:
+    """Smallest angle between two compass headings in [0, 180]."""
+    d = abs(a - b) % 360.0
+    return min(d, 360.0 - d)
 
 
 # ----------------------------------------------------------------------
@@ -662,6 +710,103 @@ class FusionEngine:
                 store.put_entity(ent, domain=DOMAIN)
         return out
 
+    # --- port-skipping detection -------------------------------------
+    def detect_port_skipping(self, now: datetime) -> list[Entity]:
+        """Sweep entities; flip VESSEL → PORT_SKIPPING when the vessel's
+        AIS-declared destination matches a known Gulf port but the
+        vessel's actual heading isn't taking it there.
+
+        Vessels that resume a plausible course to their declared port
+        (or change destination, or stop) demote back to VESSEL on the
+        next sweep.
+        """
+        # Lazy import — keeps fusion.py loadable in unit tests that
+        # don't have the ports module available.
+        from gulf_ports import match_port_by_destination
+
+        flagged: list[Entity] = []
+        for ent in list(self.entities.values()):
+            # Only consider vessels (not already-classified anomalies).
+            # PORT_SKIPPING is mutually exclusive with the others — a
+            # dark vessel has no AIS to declare a destination from.
+            if ent.type not in (EntityType.VESSEL, EntityType.PORT_SKIPPING):
+                continue
+            dest = ent.attrs.get("destination")
+            port = match_port_by_destination(dest)
+
+            heading = ent.attrs.get("heading")
+            speed = ent.attrs.get("speed_kn")
+
+            should_flag = False
+            details: dict | None = None
+            if (
+                port is not None
+                and isinstance(heading, (int, float))
+                and heading != 511
+                and isinstance(speed, (int, float))
+                and speed >= PORT_SKIP_MIN_SPEED_KN
+                and ent.geom is not None
+            ):
+                port_geom = Geom(lon=port["lon"], lat=port["lat"])
+                dist_km = haversine_km(ent.geom, port_geom)
+                if (PORT_SKIP_MIN_DIST_KM <= dist_km
+                        <= PORT_SKIP_MAX_DIST_KM):
+                    bearing_to_port = bearing_deg(ent.geom, port_geom)
+                    diff = _heading_diff_deg(heading, bearing_to_port)
+                    if diff > PORT_SKIP_BEARING_TOL_DEG:
+                        should_flag = True
+                        details = {
+                            "declared_port": port["name"],
+                            "port_lon": port["lon"],
+                            "port_lat": port["lat"],
+                            "distance_km": round(dist_km, 1),
+                            "bearing_to_port": round(bearing_to_port, 1),
+                            "heading": round(float(heading), 1),
+                            "heading_diff_deg": round(diff, 1),
+                        }
+
+            if should_flag and ent.type != EntityType.PORT_SKIPPING:
+                ent.type = EntityType.PORT_SKIPPING
+                ent.priority_score = 0.65
+                ent.attrs["port_skip"] = details
+                ent.notes = (
+                    f"Declared destination {details['declared_port']} "
+                    f"({details['distance_km']} km away) — actual heading "
+                    f"{details['heading']:.0f}° vs bearing-to-port "
+                    f"{details['bearing_to_port']:.0f}° "
+                    f"(off by {details['heading_diff_deg']:.0f}°)."
+                )
+                store.put_entity(ent, domain=DOMAIN)
+                audit_log.append(
+                    actor="system",
+                    event_type="entity_reclassified",
+                    payload={"entity_id": ent.entity_id,
+                             "to": "port_skipping",
+                             **details},
+                )
+                self._make_recommendation(ent)
+                flagged.append(ent)
+            elif should_flag and ent.type == EntityType.PORT_SKIPPING:
+                # Update the attrs (port distance/bearing drift over time)
+                # but don't audit-log another reclassification event.
+                ent.attrs["port_skip"] = details
+                store.put_entity(ent, domain=DOMAIN)
+            elif (not should_flag) and ent.type == EntityType.PORT_SKIPPING:
+                # Demote — vessel has either reached a plausible course,
+                # changed destination, or slowed below the threshold.
+                ent.type = EntityType.VESSEL
+                ent.priority_score = 0.05
+                ent.attrs.pop("port_skip", None)
+                ent.notes = ""
+                store.put_entity(ent, domain=DOMAIN)
+                audit_log.append(
+                    actor="system",
+                    event_type="entity_reclassified",
+                    payload={"entity_id": ent.entity_id, "to": "vessel",
+                             "reason": "port_skip_resolved"},
+                )
+        return flagged
+
     # --- recommendations ---------------------------------------------
     def _make_recommendation(self, ent: Entity) -> Recommendation:
         if ent.type == EntityType.DARK_VESSEL:
@@ -690,6 +835,19 @@ class FusionEngine:
                 "in rolling window). Position cannot be trusted. Recommend "
                 "tasking next SAR pass to obtain a non-cooperative fix and "
                 "alert Coast Guard if confirmed off the reported track."
+            )
+        elif ent.type == EntityType.PORT_SKIPPING:
+            ps = ent.attrs.get("port_skip", {})
+            action = ActionType.LOG_ONLY
+            rationale = (
+                f"Vessel declared destination "
+                f"{ps.get('declared_port', '(unknown)')} but is heading "
+                f"{ps.get('heading_diff_deg', '?')}° off the bearing "
+                f"required to reach it. Pattern matches shadow-fleet "
+                f"diversion and clear-paperwork-then-divert smuggling. "
+                f"Monitor next AIS update for course correction or "
+                f"destination change; escalate if neither happens within "
+                f"the next 4 h."
             )
 
         rec = Recommendation(

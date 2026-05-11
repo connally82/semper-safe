@@ -42,6 +42,7 @@ class EntityType(str, Enum):
     AIS_GAP = "ais_gap"
     LOITERING_VESSEL = "loitering_vessel"   # AIS-cooperative but stationary >N hours
     AIS_SPOOFED = "ais_spoofed"             # AIS-cooperative but reported position is implausible
+    PORT_SKIPPING = "port_skipping"         # AIS-cooperative but heading away from declared destination
     DEBRIS = "debris"
     # Wildfire
     HOTSPOT = "hotspot"             # single thermal anomaly, unconfirmed

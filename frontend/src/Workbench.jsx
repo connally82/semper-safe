@@ -81,6 +81,11 @@ const DOMAINS = {
       // anomaly so an operator can scan a dense map and pick out
       // "the vessel that's lying about its position" instantly.
       ais_spoofed:      { color: "#ff5cd2", label: "AIS SPOOFED",      glow: true },
+      // Teal — declared destination doesn't match actual heading. A
+      // step less alarming than dark / spoofed (the vessel is still
+      // cooperative, just lying about WHERE it's going) but high-
+      // priority enough to glow.
+      port_skipping:    { color: "#76e0d2", label: "PORT SKIP",        glow: true },
     },
     actionLabel: {
       task_sar_satellite: "Task SAR satellite",
@@ -550,7 +555,7 @@ function MapView({ entities, selectedId, onSelect, cfg }) {
 // ais_gap: vessel went silent — is someone else nearby who might be it?
 // loitering_vessel + ais_spoofed: same investigative question, different signal.
 const SUSPECT_TYPES = new Set([
-  "dark_vessel", "ais_gap", "loitering_vessel", "ais_spoofed",
+  "dark_vessel", "ais_gap", "loitering_vessel", "ais_spoofed", "port_skipping",
 ]);
 
 // Haversine distance — same formula the backend uses in fusion.haversine_km.

@@ -182,6 +182,15 @@ async def _gap_sweeper_loop(cancel: asyncio.Event) -> None:
             except Exception as exc:  # noqa: BLE001
                 log.exception("convoy sweep crashed: %s", exc)
             try:
+                # Port-skipping detection — O(N) over cooperative vessels
+                # with destination + heading. Same threadpool pattern.
+                await asyncio.to_thread(
+                    maritime.detect_port_skipping,
+                    datetime.now(timezone.utc),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("port-skipping sweep crashed: %s", exc)
+            try:
                 evicted = await asyncio.to_thread(_evict_stale_in_memory_obs)
                 if evicted:
                     log.debug("evicted %d stale in-memory observations", evicted)

@@ -247,3 +247,101 @@ class TestConvoyDetection:
         for mmsi in ("111", "112", "113"):
             ent = next(e for e in eng.entities.values() if e.attrs.get("mmsi") == mmsi)
             assert "convoy_id" not in ent.attrs, f"{mmsi} should be demoted"
+
+
+# ---------------------------------------------------------------------------
+# Port-skipping detection
+# ---------------------------------------------------------------------------
+
+
+def _route_obs(oid: str, mmsi: str, t: datetime, lon: float, lat: float,
+               speed_kn: float, heading: float, dest: str) -> Observation:
+    """Observation with destination + heading attrs — port-skipping needs both."""
+    return Observation(
+        obs_id=oid, source=SourceType.AIS, source_id=mmsi,
+        t=t, geom=Geom(lon=lon, lat=lat),
+        h3_cell="8800000000fffff",
+        attrs={"speed_kn": speed_kn, "heading": heading, "destination": dest},
+    )
+
+
+class TestPortSkippingDetection:
+    def test_off_course_for_declared_destination_flagged(self) -> None:
+        """Vessel declares HOUSTON (NNW of position) but heads east →
+        flagged as port_skipping, attrs.port_skip populated with details."""
+        eng = FusionEngine()
+        eng.ingest(_route_obs("a0", "111", T0, -94.5, 28.5,
+                              speed_kn=10, heading=90, dest="HOUSTON"))
+        flagged = eng.detect_port_skipping(T0)
+        assert len(flagged) == 1
+        ent = flagged[0]
+        assert ent.type == EntityType.PORT_SKIPPING
+        ps = ent.attrs.get("port_skip")
+        assert ps and ps["declared_port"] == "Houston"
+        assert ps["heading_diff_deg"] > 60.0
+
+    def test_on_course_not_flagged(self) -> None:
+        """Same position + destination, but heading toward Houston (~330°)
+        → no flag. Cooperative vessel doing what AIS says."""
+        eng = FusionEngine()
+        eng.ingest(_route_obs("b0", "222", T0, -94.5, 28.5,
+                              speed_kn=10, heading=330, dest="HOUSTON"))
+        eng.detect_port_skipping(T0)
+        ent = next(e for e in eng.entities.values() if e.attrs.get("mmsi") == "222")
+        assert ent.type == EntityType.VESSEL
+
+    def test_no_destination_not_flagged(self) -> None:
+        """Vessel reports no destination → can't be port-skipping."""
+        eng = FusionEngine()
+        eng.ingest(_route_obs("c0", "333", T0, -94.5, 28.5,
+                              speed_kn=10, heading=90, dest=""))
+        eng.detect_port_skipping(T0)
+        ent = next(e for e in eng.entities.values() if e.attrs.get("mmsi") == "333")
+        assert ent.type == EntityType.VESSEL
+
+    def test_unknown_destination_not_flagged(self) -> None:
+        """Destination doesn't match any Gulf port → no flag."""
+        eng = FusionEngine()
+        eng.ingest(_route_obs("d0", "444", T0, -94.5, 28.5,
+                              speed_kn=10, heading=90, dest="LIMA"))
+        eng.detect_port_skipping(T0)
+        ent = next(e for e in eng.entities.values() if e.attrs.get("mmsi") == "444")
+        assert ent.type == EntityType.VESSEL
+
+    def test_too_close_to_port_not_flagged(self) -> None:
+        """Vessel inside the inner ring (port approach) — heading
+        divergence is normal pilot maneuvering, not a routing anomaly."""
+        eng = FusionEngine()
+        # 5 km north of Houston port-mouth — well inside the 8 km inner ring.
+        eng.ingest(_route_obs("e0", "555", T0, -95.01, 29.77,
+                              speed_kn=8, heading=90, dest="HOUSTON"))
+        eng.detect_port_skipping(T0)
+        ent = next(e for e in eng.entities.values() if e.attrs.get("mmsi") == "555")
+        assert ent.type == EntityType.VESSEL
+
+    def test_low_speed_not_flagged(self) -> None:
+        """Vessel speed < threshold (drifting, anchored, pilot wait) → no flag."""
+        eng = FusionEngine()
+        eng.ingest(_route_obs("f0", "666", T0, -94.5, 28.5,
+                              speed_kn=2, heading=90, dest="HOUSTON"))
+        eng.detect_port_skipping(T0)
+        ent = next(e for e in eng.entities.values() if e.attrs.get("mmsi") == "666")
+        assert ent.type == EntityType.VESSEL
+
+    def test_demotion_after_course_correction(self) -> None:
+        """Vessel flagged as port_skipping, then turns toward port → demoted."""
+        eng = FusionEngine()
+        eng.ingest(_route_obs("g0", "777", T0, -94.5, 28.5,
+                              speed_kn=10, heading=90, dest="HOUSTON"))
+        eng.detect_port_skipping(T0)
+        ent = next(e for e in eng.entities.values() if e.attrs.get("mmsi") == "777")
+        assert ent.type == EntityType.PORT_SKIPPING
+
+        # Course correction toward Houston (~330°)
+        eng.ingest(_route_obs("g1", "777", T0 + timedelta(minutes=10),
+                              -94.5, 28.5,
+                              speed_kn=10, heading=330, dest="HOUSTON"))
+        eng.detect_port_skipping(T0 + timedelta(minutes=10))
+        ent = next(e for e in eng.entities.values() if e.attrs.get("mmsi") == "777")
+        assert ent.type == EntityType.VESSEL
+        assert "port_skip" not in ent.attrs

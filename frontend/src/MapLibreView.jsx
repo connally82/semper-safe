@@ -160,7 +160,7 @@ function _pointInPolygon(lon, lat, polygon) {
 }
 
 const SUSPECT_TYPES_MAP = new Set([
-  "dark_vessel", "ais_gap", "loitering_vessel", "ais_spoofed",
+  "dark_vessel", "ais_gap", "loitering_vessel", "ais_spoofed", "port_skipping",
 ]);
 const CANDIDATE_RADIUS_KM = 5.0;
 const CANDIDATE_MAX = 10;
@@ -337,7 +337,7 @@ function entityRadius(type) {
 // Anomaly transitions worth alerting on. A vessel newly entering any
 // of these states gets a toast (and dark_vessel gets a sound).
 const ANOMALY_ALERT_TYPES = new Set([
-  "dark_vessel", "ais_spoofed", "loitering_vessel", "ais_gap",
+  "dark_vessel", "ais_spoofed", "loitering_vessel", "ais_gap", "port_skipping",
 ]);
 
 // localStorage keys for user preferences.
@@ -2214,6 +2214,7 @@ function AnomalyBanner({ entities, cfg, onZoomTo }) {
   const anomalyTypes = [
     "dark_vessel",
     "ais_spoofed",
+    "port_skipping",
     "loitering_vessel",
     "ais_gap",
   ];
