@@ -808,47 +808,169 @@ class FusionEngine:
         return flagged
 
     # --- recommendations ---------------------------------------------
+    def _nearest_port(self, geom: Geom) -> tuple[dict | None, float]:
+        """Find the closest Gulf port to a position; returns (port_dict, km).
+        Returns (None, inf) if the ports module isn't importable."""
+        try:
+            from gulf_ports import KNOWN_GULF_PORTS
+        except Exception:  # noqa: BLE001
+            return None, float("inf")
+        best, best_km = None, float("inf")
+        for p in KNOWN_GULF_PORTS:
+            d = haversine_km(geom, Geom(lon=p["lon"], lat=p["lat"]))
+            if d < best_km:
+                best, best_km = p, d
+        return best, best_km
+
+    def _nearest_cooperative_vessel(self, ent: Entity) -> tuple[Entity | None, float]:
+        """Closest currently-cooperative (VESSEL) entity to `ent`, by km.
+        Used for 'this dark vessel is 800 m from MV Frontier' style hints."""
+        best, best_km = None, float("inf")
+        for other in list(self.entities.values()):
+            if other.entity_id == ent.entity_id:
+                continue
+            if other.type != EntityType.VESSEL:
+                continue
+            if other.geom is None:
+                continue
+            d = haversine_km(ent.geom, other.geom)
+            if d < best_km:
+                best, best_km = other, d
+        return best, best_km
+
     def _make_recommendation(self, ent: Entity) -> Recommendation:
+        """Build a Recommendation with case-specific rationale text.
+
+        Each branch tries to reference concrete signals — nearest port,
+        nearest cooperative vessel, declared destination, time-since-AIS,
+        observed speed/heading — instead of generic boilerplate, so an
+        operator reading the recommendation can act on it without
+        opening the entity panel for every detail.
+        """
+        a = ent.attrs or {}
+        port, port_km = self._nearest_port(ent.geom) if ent.geom else (None, float("inf"))
+
         if ent.type == EntityType.DARK_VESSEL:
             action = ActionType.TASK_SAR_SAT
-            rationale = ("SAR detection unmatched to any cooperative AIS target. "
-                         "Recommend tasking next satellite pass for confirmation "
-                         "before alerting surface assets.")
+            near, near_km = self._nearest_cooperative_vessel(ent)
+            near_phrase = (
+                f"Nearest cooperative target: "
+                f"{near.attrs.get('name') or 'MMSI ' + str(near.attrs.get('mmsi'))} "
+                f"{near_km:.1f} km away."
+            ) if near is not None and near_km < 25 else (
+                "No cooperative AIS targets within 25 km — open ocean."
+            )
+            port_phrase = (
+                f"Nearest port: {port['name']} ({port_km:.0f} km)."
+                if port else ""
+            )
+            rationale = (
+                f"SAR-only return, no AIS-cooperative target inside the "
+                f"fusion window ({SAR_AIS_MATCH_RADIUS_KM:.1f} km / "
+                f"{int(SAR_AIS_MATCH_WINDOW.total_seconds() // 60)} min). "
+                f"{near_phrase} {port_phrase} Recommend tasking next "
+                f"SAR pass for re-acquisition; if confirmed, alert Coast "
+                f"Guard with the dark-vessel track."
+            ).strip()
+
         elif ent.type == EntityType.AIS_GAP:
             action = ActionType.LOG_ONLY
-            rationale = ("AIS dropout exceeds threshold. Watch for resumption "
-                         "or correlate with next SAR pass. No surface dispatch "
-                         "without corroboration.")
+            nav = a.get("nav_status")
+            nav_phrase = {
+                0: "underway",
+                1: "anchored",
+                5: "moored",
+                6: "aground",
+                7: "fishing",
+            }.get(nav, "unknown nav state") if nav is not None else "unknown nav state"
+            age_min = max(0, int(
+                (datetime.now(ent.last_seen.tzinfo or None) - ent.last_seen).total_seconds() // 60
+            )) if ent.last_seen else 0
+            last_speed = a.get("speed_kn")
+            speed_phrase = (
+                f"Last reported speed: {last_speed:.1f} kn at heading "
+                f"{a.get('heading', '?')}°."
+            ) if isinstance(last_speed, (int, float)) else ""
+            port_phrase = (
+                f"Nearest port: {port['name']} ({port_km:.0f} km)."
+                if port else ""
+            )
+            rationale = (
+                f"AIS feed silent for {age_min} min while previously "
+                f"reporting {nav_phrase}. {speed_phrase} {port_phrase} "
+                f"Watch for resumption; correlate with next SAR pass. "
+                f"No surface dispatch without corroboration."
+            ).strip()
+
         elif ent.type == EntityType.LOITERING_VESSEL:
             action = ActionType.LOG_ONLY
-            rationale = (
-                "Cooperative AIS target stationary past loitering threshold. "
-                "Pattern is consistent with operational pause (anchorage, "
-                "pilot wait), illegal fishing, or transfer activity. "
-                "Inspect vessel attrs (nav_status, ship_type, destination) "
-                "before tasking surface assets."
+            hours = a.get("loitering_hours")
+            hours_phrase = (
+                f"Stationary {hours:.1f} h."
+                if isinstance(hours, (int, float)) else "Stationary past threshold."
             )
+            ship_type = a.get("ship_type")
+            type_phrase = (
+                f"AIS-reported ship type: {ship_type}."
+                if ship_type is not None else ""
+            )
+            dest_phrase = (
+                f"Declared destination: {a['destination']}."
+                if a.get("destination") else ""
+            )
+            port_phrase = (
+                f"Nearest port: {port['name']} ({port_km:.0f} km)."
+                if port else ""
+            )
+            rationale = (
+                f"{hours_phrase} {port_phrase} {type_phrase} {dest_phrase} "
+                f"Pattern is consistent with operational pause (anchorage, "
+                f"pilot wait), illegal fishing, or transfer activity. "
+                f"Inspect vessel attrs before tasking surface assets."
+            ).strip()
+
         elif ent.type == EntityType.AIS_SPOOFED:
             action = ActionType.TASK_SAR_SAT
-            rationale = (
-                "AIS reporting implausible-speed teleports (multiple events "
-                "in rolling window). Position cannot be trusted. Recommend "
-                "tasking next SAR pass to obtain a non-cooperative fix and "
-                "alert Coast Guard if confirmed off the reported track."
+            events = a.get("spoof_events", [])
+            last_kn = events[-1].get("implied_kn") if events else None
+            spoof_phrase = (
+                f"{len(events)} implausible-speed reports in the rolling "
+                f"window; most recent implied {last_kn:.0f} kn."
+                if isinstance(last_kn, (int, float))
+                else f"{len(events)} implausible reports in the rolling window."
             )
+            port_phrase = (
+                f"Nearest port: {port['name']} ({port_km:.0f} km)."
+                if port else ""
+            )
+            rationale = (
+                f"{spoof_phrase} Reported position cannot be trusted; the "
+                f"last trustworthy fix is preserved on the map. {port_phrase} "
+                f"Recommend tasking next SAR pass for a non-cooperative fix "
+                f"and alerting Coast Guard if confirmed off the reported track."
+            ).strip()
+
         elif ent.type == EntityType.PORT_SKIPPING:
-            ps = ent.attrs.get("port_skip", {})
+            ps = a.get("port_skip", {})
             action = ActionType.LOG_ONLY
+            speed = a.get("speed_kn")
+            speed_phrase = (
+                f"Currently making {speed:.1f} kn."
+                if isinstance(speed, (int, float)) else ""
+            )
             rationale = (
                 f"Vessel declared destination "
-                f"{ps.get('declared_port', '(unknown)')} but is heading "
-                f"{ps.get('heading_diff_deg', '?')}° off the bearing "
-                f"required to reach it. Pattern matches shadow-fleet "
-                f"diversion and clear-paperwork-then-divert smuggling. "
-                f"Monitor next AIS update for course correction or "
-                f"destination change; escalate if neither happens within "
-                f"the next 4 h."
-            )
+                f"{ps.get('declared_port', '(unknown)')} "
+                f"({ps.get('distance_km', '?')} km away) but actual heading "
+                f"is {ps.get('heading_diff_deg', '?')}° off the bearing "
+                f"required to reach it. {speed_phrase} Pattern matches "
+                f"shadow-fleet diversion and clear-paperwork-then-divert "
+                f"smuggling. Monitor next AIS update for course correction "
+                f"or destination change; escalate if neither within 4 h."
+            ).strip()
+        else:
+            action = ActionType.LOG_ONLY
+            rationale = "Routine."
 
         rec = Recommendation(
             rec_id=f"rec_{uuid.uuid4().hex[:10]}",

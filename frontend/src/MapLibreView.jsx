@@ -153,6 +153,14 @@ const AOI_DRAW_VERTEX_LAYER_ID = "ss-aoi-draw-vertex";
 const ANOMALY_TRAILS_SOURCE_ID = "ss-anomaly-trails";
 const ANOMALY_TRAILS_LAYER_ID = "ss-anomaly-trails-line";
 
+// Activity heatmap — renders current vessel positions as a kernel-
+// density heatmap. Helps distinguish 'dark vessel in busy shipping
+// lane' (probably benign) from 'dark vessel in empty water'
+// (suspicious). Toggleable via a chip in the basemap toggle bar.
+const HEATMAP_SOURCE_ID = "ss-activity-heatmap";
+const HEATMAP_LAYER_ID = "ss-activity-heatmap-layer";
+const HEATMAP_STORAGE_KEY = "ss-activity-heatmap";
+
 // Cap how many trails we fetch — saves the backend from N parallel
 // /entities/{id}/track hits when there are 50+ anomalies on the map.
 // 25 covers all dark/spoofed/port-skipping vessels in normal operation
@@ -427,6 +435,37 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
     setSoundEnabled(on);
     try { window.localStorage.setItem(SOUND_STORAGE_KEY, on ? "1" : "0"); }
     catch { /* localStorage may be disabled */ }
+  };
+
+  // Anomaly trail window — operator picks how far back the per-anomaly
+  // trail polylines extend. Persists in localStorage so a demo doesn't
+  // have to re-pick it after a reload.
+  const [trailWindow, setTrailWindow] = useState(() => {
+    if (typeof window === "undefined") return "1h";
+    try {
+      const v = window.localStorage.getItem("ss-trail-window");
+      return ["1h", "6h", "24h"].includes(v) ? v : "1h";
+    } catch { return "1h"; }
+  });
+  const persistTrailWindow = (w) => {
+    setTrailWindow(w);
+    try { window.localStorage.setItem("ss-trail-window", w); } catch {}
+  };
+  const trailWindowMs = ({
+    "1h": 60 * 60 * 1000,
+    "6h": 6 * 60 * 60 * 1000,
+    "24h": 24 * 60 * 60 * 1000,
+  })[trailWindow] || 60 * 60 * 1000;
+
+  const [heatmapOn, setHeatmapOn] = useState(() => {
+    if (typeof window === "undefined") return false;
+    try { return window.localStorage.getItem(HEATMAP_STORAGE_KEY) === "1"; }
+    catch { return false; }
+  });
+  const persistHeatmap = (on) => {
+    setHeatmapOn(on);
+    try { window.localStorage.setItem(HEATMAP_STORAGE_KEY, on ? "1" : "0"); }
+    catch {}
   };
 
   // AOI drawing state.
@@ -902,11 +941,53 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
       });
     };
 
+    // Activity heatmap — kernel-density layer over the current
+    // vessel positions. Heatmap intensity is per-point, dropping off
+    // smoothly so the result reads as "where the traffic is right
+    // now". We render it UNDER the markers so dots remain readable.
+    const ensureHeatmapLayers = () => {
+      if (map.getSource(HEATMAP_SOURCE_ID)) return;
+      map.addSource(HEATMAP_SOURCE_ID, {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      map.addLayer({
+        id: HEATMAP_LAYER_ID,
+        type: "heatmap",
+        source: HEATMAP_SOURCE_ID,
+        layout: { visibility: "none" },
+        paint: {
+          "heatmap-weight": 1,
+          "heatmap-intensity": [
+            "interpolate", ["linear"], ["zoom"],
+            5, 0.6,
+            12, 2.2,
+          ],
+          "heatmap-radius": [
+            "interpolate", ["linear"], ["zoom"],
+            5, 12,
+            12, 30,
+          ],
+          "heatmap-opacity": 0.6,
+          "heatmap-color": [
+            "interpolate", ["linear"], ["heatmap-density"],
+            0,    "rgba(0,0,0,0)",
+            0.1,  "rgba(82,113,196,0.55)",
+            0.35, "rgba(95,208,147,0.7)",
+            0.6,  "rgba(240,168,48,0.8)",
+            0.85, "rgba(224,85,110,0.85)",
+            1,    "rgba(255,255,255,0.9)",
+          ],
+        },
+      });
+    };
+
     map.on("style.load", ensureTrackLayers);
     map.on("style.load", ensureCandidateLayers);
     map.on("style.load", ensureConvoyLayers);
     map.on("style.load", ensureAoiLayers);
     map.on("style.load", ensureAnomalyTrailsLayers);
+    map.on("style.load", ensureHeatmapLayers);
     map.on("style.load", ensureSarLayers);
 
     // Click → popup. Detections are densely packed so attach to the
@@ -1646,6 +1727,40 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
   }, [aoiMode, aoiPoints, renderEntities]);
 
   // ------------------------------------------------------------------
+  // Activity heatmap — feed current vessel positions into the heatmap
+  // layer and toggle its visibility. Re-runs whenever entities change
+  // OR the heatmap is toggled, so live AIS updates are reflected.
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const src = map.getSource(HEATMAP_SOURCE_ID);
+    if (!src) return;
+    // Only feed COOPERATIVE positions (vessels + ais_gap) into the
+    // density layer. Including dark/spoofed/loitering would distort
+    // the "where is the normal traffic" story — those are the very
+    // things the operator wants context FOR.
+    const pts = renderEntities.filter(
+      (e) => (e.type === "vessel" || e.type === "ais_gap")
+             && typeof e.lon === "number" && typeof e.lat === "number",
+    );
+    src.setData({
+      type: "FeatureCollection",
+      features: pts.map((e) => ({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: [e.lon, e.lat] },
+        properties: {},
+      })),
+    });
+    if (map.getLayer(HEATMAP_LAYER_ID)) {
+      map.setLayoutProperty(
+        HEATMAP_LAYER_ID, "visibility",
+        heatmapOn ? "visible" : "none",
+      );
+    }
+  }, [renderEntities, heatmapOn, ready]);
+
+  // ------------------------------------------------------------------
   // Anomaly trails — fetch the last-hour track for every anomaly
   // entity (capped at ANOMALY_TRAIL_MAX) and render as a fading
   // polyline tinted to the entity's typeMeta color. Caches per-entity
@@ -1669,18 +1784,27 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
     let cancelled = false;
     const cache = trailCacheRef.current;
 
+    const cutoffMs = Date.now() - trailWindowMs;
     const renderFromCache = () => {
       if (cancelled) return;
       const features = [];
       for (const e of candidates) {
         const c = cache.get(e.id);
         if (!c || !c.points || c.points.length < 2) continue;
+        // Filter track points to the active window. Track point .ts
+        // is already pre-parsed by fetchTrack-time post-processing
+        // elsewhere; if missing, fall back to parsing here.
+        const filtered = c.points.filter((p) => {
+          const ts = p.ts ?? (p.t ? Date.parse(p.t) : NaN);
+          return !Number.isNaN(ts) && ts >= cutoffMs;
+        });
+        if (filtered.length < 2) continue;
         const meta = cfg.typeMeta[e.type];
         features.push({
           type: "Feature",
           geometry: {
             type: "LineString",
-            coordinates: c.points.map((p) => [p.lon, p.lat]),
+            coordinates: filtered.map((p) => [p.lon, p.lat]),
           },
           properties: {
             entity_id: e.id,
@@ -1708,6 +1832,9 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
           const pts = (data.track || []).filter(
             (p) => typeof p.lon === "number" && typeof p.lat === "number",
           );
+          // Pre-parse timestamps so the renderFromCache window filter
+          // doesn't re-Date.parse on every trail-window toggle tick.
+          for (const p of pts) p.ts = Date.parse(p.t);
           cache.set(e.id, { last_seen: e.last_seen, points: pts });
           renderFromCache();
         })
@@ -1729,7 +1856,7 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
       cancelled = true;
       for (const c of ctrls) c.abort();
     };
-  }, [renderEntities, cfg, ready]);
+  }, [renderEntities, cfg, ready, trailWindowMs]);
 
   // ------------------------------------------------------------------
   // Convoy lines: group entities by attrs.convoy_id (backend-tagged by
@@ -2168,6 +2295,58 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
         </button>
         <button
           type="button"
+          title="Toggle activity heatmap — shows where cooperative traffic is"
+          onClick={() => persistHeatmap(!heatmapOn)}
+          style={{
+            appearance: "none",
+            border: "none",
+            borderLeft: "1px solid rgba(255,255,255,0.18)",
+            cursor: "pointer",
+            padding: "6px 10px",
+            background: heatmapOn ? "rgba(255,150,80,0.28)" : "transparent",
+            color: heatmapOn ? "#ffd2a8" : "rgba(255,255,255,0.7)",
+            textTransform: "uppercase",
+            minWidth: 56,
+            fontSize: 10,
+            letterSpacing: "0.08em",
+          }}
+        >
+          ▓ heat
+        </button>
+
+        {/* Anomaly trail window — 1h / 6h / 24h. Filters the per-
+            anomaly polylines client-side from cached track points
+            so swapping windows is instant (no extra backend hit). */}
+        {["1h", "6h", "24h"].map((w, i) => (
+          <button
+            key={w}
+            type="button"
+            title={`Show anomaly trails for last ${w}`}
+            onClick={() => persistTrailWindow(w)}
+            style={{
+              appearance: "none",
+              border: "none",
+              borderLeft: "1px solid rgba(255,255,255,0.18)",
+              cursor: "pointer",
+              padding: "6px 8px",
+              fontSize: 10,
+              fontFamily: "inherit",
+              letterSpacing: "0.08em",
+              background: trailWindow === w
+                ? "rgba(95,208,147,0.22)" : "transparent",
+              color: trailWindow === w
+                ? "#cdf2dd" : "rgba(255,255,255,0.55)",
+              textTransform: "uppercase",
+              minWidth: 36,
+            }}
+          >
+            {/* Prefix the first chip with a label so the row reads
+                 as a single grouped control. */}
+            {i === 0 ? `↳ ${w}` : w}
+          </button>
+        ))}
+        <button
+          type="button"
           title={
             aoiMode === "idle"
               ? "Draw a custom area of interest — click corners, double-click to finish"
@@ -2304,8 +2483,33 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
           Polls /maritime/realtime every 30 s. Each sensor row shows
           a colored dot keyed to "how stale is this", a label, and a
           short numeric detail. Lets the operator tell instantly
-          whether AIS / SAR / buoys / etc are alive. */}
-      <SystemPulse apiBase={API_BASE} />
+          whether AIS / SAR / buoys / etc are alive.
+
+          Also pushes a toast into the corner stream on any
+          fresh→stale or stale→down transition so the operator
+          can't miss a feed degrading. */}
+      <SystemPulse
+        apiBase={API_BASE}
+        onSensorAlarm={(alarm) => {
+          setToasts((cur) => {
+            const t = {
+              id: `sensor_${alarm.key}_${Date.now()}`,
+              entity_id: null,
+              name: `${alarm.label} feed`,
+              mmsi: null,
+              from: alarm.from,
+              to: alarm.to === "down" ? "DOWN" : "STALE",
+              meta: {
+                color: alarm.to === "down" ? "#e0556e" : "#f0a830",
+                label: alarm.to === "down" ? "SENSOR DOWN" : "SENSOR STALE",
+              },
+              ts: Date.now(),
+            };
+            return [t, ...cur].slice(0, TOAST_MAX_VISIBLE);
+          });
+          if (soundEnabled && alarm.to === "down") _playDarkVesselPing();
+        }}
+      />
 
       {/* Time-scrub slider. Bottom-center, full width. Slider value is
           minutes-into-the-past (0 = now). Operators slide back to see
@@ -2921,8 +3125,18 @@ function PulseRow({ label, seconds, color, detail }) {
   );
 }
 
-function SystemPulse({ apiBase }) {
+// Track previous sensor health so we can fire a toast/sound on a
+// fresh→stale transition (instead of every poll while it's stale).
+function _classify(age, t) {
+  if (age == null) return "unknown";
+  if (age <= t.fresh) return "fresh";
+  if (age <= t.stale) return "stale";
+  return "down";
+}
+
+function SystemPulse({ apiBase, onSensorAlarm }) {
   const [pulse, setPulse] = useState(null);
+  const prevHealthRef = useRef({});
   useEffect(() => {
     let cancelled = false;
     const ctrl = new AbortController();
@@ -2942,6 +3156,37 @@ function SystemPulse({ apiBase }) {
     const interval = window.setInterval(pull, 30_000);
     return () => { cancelled = true; ctrl.abort(); window.clearInterval(interval); };
   }, [apiBase]);
+
+  // Detect fresh→stale / stale→down transitions and bubble up to the
+  // host so the toast stream + audio ping can announce them. Compares
+  // each sensor's current classification against the previous tick.
+  useEffect(() => {
+    if (!pulse || !onSensorAlarm) return;
+    const sensors = [
+      { key: "ais",   label: "AIS",   age: pulse.ais?.age_seconds,   t: PULSE_THRESHOLDS_S.ais },
+      { key: "buoys", label: "Buoys", age: pulse.buoys?.age_seconds, t: PULSE_THRESHOLDS_S.buoys },
+      { key: "sar",   label: "SAR",   age: pulse.sar?.age_seconds,   t: PULSE_THRESHOLDS_S.sar },
+      { key: "s2",    label: "S2",    age: pulse.s2?.age_seconds,    t: PULSE_THRESHOLDS_S.s2 },
+    ];
+    const prev = prevHealthRef.current;
+    for (const s of sensors) {
+      const now = _classify(s.age, s.t);
+      const was = prev[s.key];
+      // Only alarm on degradations (fresh→stale, stale→down, fresh→down).
+      // No alarm when the sensor recovers — that's good news, the UI
+      // dot turning green is enough.
+      if (was && now !== was) {
+        const rank = { fresh: 0, stale: 1, down: 2, unknown: 3 };
+        if ((rank[now] || 0) > (rank[was] || 0)) {
+          onSensorAlarm({
+            key: s.key, label: s.label,
+            from: was, to: now, age: s.age,
+          });
+        }
+      }
+      prev[s.key] = now;
+    }
+  }, [pulse, onSensorAlarm]);
 
   if (!pulse) return null;
 
