@@ -1275,6 +1275,50 @@ def maritime_daily_brief():
     )
 
 
+@app.get("/maritime/entities/{eid}/registry")
+def maritime_entity_registry(eid: str):
+    """Public-registry enrichment for an entity (MMSI → flag state, etc).
+
+    Free public sources: the MMSI's first 3 digits (MID) tell us the
+    flag state per ITU-R M.585. Paid APIs (Equasis, MarineTraffic)
+    fill IMO/owner/class-society fields; without a key we return
+    the MID-derived info plus structured placeholders so the frontend
+    can show 'pending — Equasis key not configured' for those slots.
+    """
+    import mmsi_mid
+
+    ent = maritime.entities.get(eid)
+    if ent is None:
+        raise HTTPException(404, "entity not found")
+    mmsi = (ent.attrs or {}).get("mmsi")
+    flag = mmsi_mid.mid_country(mmsi)
+    kind = mmsi_mid.mmsi_kind(mmsi)
+    return {
+        "entity_id": eid,
+        "mmsi": mmsi,
+        "mmsi_kind": kind,
+        "flag": flag,                           # {"country": ..., "iso2": ...} or null
+        "vessel_name": (ent.attrs or {}).get("name"),
+        "ais_ship_type": (ent.attrs or {}).get("ship_type"),
+        "ais_destination": (ent.attrs or {}).get("destination"),
+        # Placeholders — wire to Equasis/MarineTraffic when keys
+        # are configured. Field shape is stable so the frontend can
+        # render them today and start showing real values the moment
+        # they're populated.
+        "imo": None,
+        "owner": None,
+        "manager": None,
+        "class_society": None,
+        "year_built": None,
+        "registry_source": "mmsi_mid_only",
+        "registry_note": (
+            "Flag state derived from MMSI MID prefix (ITU-R M.585). "
+            "Owner / IMO / class society require an Equasis or "
+            "MarineTraffic API key — not configured."
+        ),
+    }
+
+
 @app.get("/maritime/entities/{eid}/audit")
 def maritime_entity_audit(eid: str, limit: int = 100):
     """Audit-chain entries tagged to a specific entity.

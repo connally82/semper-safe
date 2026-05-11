@@ -133,6 +133,16 @@ const PINNED_TRACK_LAYER_ID = "ss-pinned-track-line";
 const PINNED_HEAD_LAYER_ID = "ss-pinned-track-head";
 const PINNED_TRACK_COLOR = "#ffd897";
 
+// Spoof track reconstruction — when an ais_spoofed entity is selected,
+// render two layers: the BROADCAST positions (from attrs.spoof_events
+// `to` field) as a dashed white polyline + endpoint pins, and a
+// connecting deception arrow from the trustworthy position to each
+// broadcast claim. Lets the operator see the magnitude of the lie at
+// a glance.
+const SPOOF_BROADCAST_SOURCE_ID = "ss-spoof-broadcast";
+const SPOOF_BROADCAST_LINE_LAYER_ID = "ss-spoof-broadcast-line";
+const SPOOF_BROADCAST_POINT_LAYER_ID = "ss-spoof-broadcast-point";
+
 // Candidate-hull halos — when an anomaly entity is selected, the 5-km
 // neighborhood of AIS-cooperative vessels gets ringed on the map so
 // the operator sees the side-panel "candidate hulls" list spatially.
@@ -183,6 +193,16 @@ const ASSETS_SOURCE_ID = "ss-onshore-assets";
 const ASSETS_LAYER_ID = "ss-onshore-assets-layer";
 const ASSETS_LABEL_LAYER_ID = "ss-onshore-assets-label";
 const ASSETS_STORAGE_KEY = "ss-onshore-assets";
+
+// Watchlist — operator marks specific MMSIs as "watch closely".
+// Tracked in localStorage so it survives sessions. Watchlisted entities
+// get a gold pulse ring on the map and fire a toast every time they
+// reappear after being absent for more than WATCHLIST_REAPPEAR_MIN_S.
+const WATCHLIST_STORAGE_KEY = "ss-watchlist-mmsis";
+const WATCHLIST_REAPPEAR_MIN_S = 5 * 60;
+const WATCHLIST_SOURCE_ID = "ss-watchlist";
+const WATCHLIST_RING_LAYER_ID = "ss-watchlist-ring";
+const WATCHLIST_LABEL_LAYER_ID = "ss-watchlist-label";
 
 // Active-dispatch state — once an operator files a dispatch, the
 // responsible entity stays ringed on the map for ACTIVE_DISPATCH_TTL_MS.
@@ -608,6 +628,81 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
     try { window.localStorage.setItem(ASSETS_STORAGE_KEY, on ? "1" : "0"); }
     catch {}
   };
+
+  // Watchlist — set of MMSI strings the operator has marked. Loaded
+  // from localStorage. Add/remove via the WATCH button in Workbench
+  // (dispatched via a window event so MapLibreView and Workbench can
+  // both modify it without prop drilling).
+  const [watchlist, setWatchlist] = useState(() => {
+    if (typeof window === "undefined") return new Set();
+    try {
+      const raw = window.localStorage.getItem(WATCHLIST_STORAGE_KEY);
+      return new Set(raw ? JSON.parse(raw) : []);
+    } catch { return new Set(); }
+  });
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        WATCHLIST_STORAGE_KEY, JSON.stringify([...watchlist]));
+    } catch {}
+  }, [watchlist]);
+  useEffect(() => {
+    // Other components mutate the watchlist via window events.
+    const onAdd = (e) => {
+      const mmsi = e.detail?.mmsi;
+      if (!mmsi) return;
+      setWatchlist((cur) => {
+        if (cur.has(mmsi)) return cur;
+        const next = new Set(cur); next.add(mmsi); return next;
+      });
+    };
+    const onRemove = (e) => {
+      const mmsi = e.detail?.mmsi;
+      if (!mmsi) return;
+      setWatchlist((cur) => {
+        if (!cur.has(mmsi)) return cur;
+        const next = new Set(cur); next.delete(mmsi); return next;
+      });
+    };
+    window.addEventListener("ss-watchlist-add", onAdd);
+    window.addEventListener("ss-watchlist-remove", onRemove);
+    return () => {
+      window.removeEventListener("ss-watchlist-add", onAdd);
+      window.removeEventListener("ss-watchlist-remove", onRemove);
+    };
+  }, []);
+
+  // Reappearance tracker — when a watchlisted MMSI shows up in the
+  // current entities stream AFTER being absent (or last seen >5 min
+  // ago), fire a toast. Per-MMSI cooldown prevents flapping.
+  const watchLastSeenRef = useRef(new Map());   // mmsi → last_seen ms
+  useEffect(() => {
+    if (watchlist.size === 0) return;
+    const now = Date.now();
+    const newToasts = [];
+    for (const e of renderEntities) {
+      const m = e.mmsi;
+      if (!m || !watchlist.has(m)) continue;
+      const lastTs = watchLastSeenRef.current.get(m);
+      if (lastTs == null
+          || (now - lastTs) / 1000 > WATCHLIST_REAPPEAR_MIN_S) {
+        newToasts.push({
+          id: `watch_${m}_${now}`,
+          entity_id: e.id,
+          name: e.name,
+          mmsi: m,
+          from: "WATCHLIST",
+          to: "REAPPEARED",
+          meta: { color: "#ffd040", label: "WATCHLIST" },
+          ts: now,
+        });
+      }
+      watchLastSeenRef.current.set(m, now);
+    }
+    if (newToasts.length > 0) {
+      setToasts((cur) => [...newToasts, ...cur].slice(0, TOAST_MAX_VISIBLE));
+    }
+  }, [renderEntities, watchlist]);
 
   // Active dispatches — { entity_id, dispatched_at_ms, action_type }[].
   // Loaded from localStorage so a reload doesn't lose tracking. The
@@ -1231,8 +1326,51 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
       });
     };
 
+    // Spoof reconstruction — dashed white polyline + endpoint pins
+    // at each broadcast position, plus a thin line from each broadcast
+    // back to the trustworthy position (the visual "lie magnitude").
+    const ensureSpoofLayers = () => {
+      if (map.getSource(SPOOF_BROADCAST_SOURCE_ID)) return;
+      map.addSource(SPOOF_BROADCAST_SOURCE_ID, {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      map.addLayer({
+        id: SPOOF_BROADCAST_LINE_LAYER_ID,
+        type: "line",
+        source: SPOOF_BROADCAST_SOURCE_ID,
+        filter: ["==", "$type", "LineString"],
+        paint: {
+          "line-color": ["case",
+            ["==", ["get", "kind"], "deception"], "#ff5cd2",
+            "rgba(255,255,255,0.85)"],
+          "line-width": ["case",
+            ["==", ["get", "kind"], "deception"], 1.2,
+            2.0],
+          "line-dasharray": [3, 2],
+          "line-opacity": ["case",
+            ["==", ["get", "kind"], "deception"], 0.55,
+            0.85],
+        },
+        layout: { "line-cap": "round", "line-join": "round" },
+      });
+      map.addLayer({
+        id: SPOOF_BROADCAST_POINT_LAYER_ID,
+        type: "circle",
+        source: SPOOF_BROADCAST_SOURCE_ID,
+        filter: ["==", "$type", "Point"],
+        paint: {
+          "circle-color": "rgba(255,255,255,0.85)",
+          "circle-radius": 3.5,
+          "circle-stroke-color": "#ff5cd2",
+          "circle-stroke-width": 1.5,
+        },
+      });
+    };
+
     map.on("style.load", ensureTrackLayers);
     map.on("style.load", ensurePinnedTrackLayers);
+    map.on("style.load", ensureSpoofLayers);
     map.on("style.load", ensureCandidateLayers);
     map.on("style.load", ensureConvoyLayers);
     map.on("style.load", ensureAoiLayers);
@@ -1370,7 +1508,50 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
     map.on("style.load", ensureHeatmapLayers);
     map.on("style.load", ensureWorkloadLayers);
     map.on("style.load", ensureAssetLayers);
+    // Watchlist ring — gold ring + 'WATCH' label around every entity
+    // whose MMSI is on the operator's watchlist. Sits on top of all
+    // other markers so it's never occluded.
+    const ensureWatchlistLayers = () => {
+      if (map.getSource(WATCHLIST_SOURCE_ID)) return;
+      map.addSource(WATCHLIST_SOURCE_ID, {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      map.addLayer({
+        id: WATCHLIST_RING_LAYER_ID,
+        type: "circle",
+        source: WATCHLIST_SOURCE_ID,
+        paint: {
+          "circle-color": "rgba(0,0,0,0)",
+          "circle-radius": 14,
+          "circle-stroke-color": "#ffd040",
+          "circle-stroke-width": 2,
+          "circle-stroke-opacity": 0.9,
+        },
+      });
+      map.addLayer({
+        id: WATCHLIST_LABEL_LAYER_ID,
+        type: "symbol",
+        source: WATCHLIST_SOURCE_ID,
+        layout: {
+          "text-field": "WATCH",
+          "text-font": ["Open Sans Regular"],
+          "text-size": 9,
+          "text-anchor": "top",
+          "text-offset": [0, 1.2],
+          "text-allow-overlap": false,
+          "text-letter-spacing": 0.18,
+        },
+        paint: {
+          "text-color": "#ffd040",
+          "text-halo-color": "#040810",
+          "text-halo-width": 1.4,
+        },
+      });
+    };
+
     map.on("style.load", ensureActiveDispatchLayers);
+    map.on("style.load", ensureWatchlistLayers);
     map.on("style.load", ensureSarLayers);
 
     // Click → popup. Detections are densely packed so attach to the
@@ -1955,6 +2136,69 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
   }, [selectedId, ready, entitiesById, cfg]);
 
   // ------------------------------------------------------------------
+  // Spoof track reconstruction — when an ais_spoofed entity is
+  // selected, draw the broadcast-position polyline + endpoint pins +
+  // deception arrows from the trustworthy position to each broadcast.
+  // Cleared when selection isn't a spoofer or has no spoof_events.
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const src = map.getSource(SPOOF_BROADCAST_SOURCE_ID);
+    if (!src) return;
+    if (!selectedId) {
+      src.setData({ type: "FeatureCollection", features: [] });
+      return;
+    }
+    const ent = entitiesById.get(selectedId);
+    if (!ent || ent.type !== "ais_spoofed") {
+      src.setData({ type: "FeatureCollection", features: [] });
+      return;
+    }
+    const events = (ent.attrs && ent.attrs.spoof_events) || [];
+    if (events.length === 0) {
+      src.setData({ type: "FeatureCollection", features: [] });
+      return;
+    }
+    const features = [];
+    // Broadcast trail — chain the .to positions in order.
+    if (events.length >= 2) {
+      features.push({
+        type: "Feature",
+        geometry: {
+          type: "LineString",
+          coordinates: events.map((e) => [e.to.lon, e.to.lat]),
+        },
+        properties: { kind: "broadcast" },
+      });
+    }
+    // Each broadcast position as a pin.
+    for (const ev of events) {
+      features.push({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: [ev.to.lon, ev.to.lat] },
+        properties: { kind: "broadcast", implied_kn: ev.implied_kn },
+      });
+    }
+    // Deception arrow — thin line from the trustworthy position to
+    // each broadcast (one per spoof event). Anchored at ent.geom
+    // (the kept fix).
+    if (typeof ent.lon === "number" && typeof ent.lat === "number") {
+      for (const ev of events) {
+        features.push({
+          type: "Feature",
+          geometry: {
+            type: "LineString",
+            coordinates: [[ent.lon, ent.lat], [ev.to.lon, ev.to.lat]],
+          },
+          properties: { kind: "deception" },
+        });
+      }
+    }
+    src.setData({ type: "FeatureCollection", features });
+  }, [selectedId, ready, entitiesById]);
+
+  // ------------------------------------------------------------------
   // Pinned-track render — same shape as the selected-track effect but
   // tied to pinnedId. Clears the pinned source when there's no pin.
   // ------------------------------------------------------------------
@@ -2299,6 +2543,33 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
       );
     }
   }, [renderEntities, heatmapOn, ready]);
+
+  // ------------------------------------------------------------------
+  // Watchlist rings — every entity whose MMSI is on the watchlist
+  // gets a gold ring + 'WATCH' label, drawn on top of all other
+  // markers. Re-renders on entities change AND watchlist change.
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const src = map.getSource(WATCHLIST_SOURCE_ID);
+    if (!src) return;
+    if (watchlist.size === 0) {
+      src.setData({ type: "FeatureCollection", features: [] });
+      return;
+    }
+    const features = [];
+    for (const e of renderEntities) {
+      if (!e.mmsi || !watchlist.has(e.mmsi)) continue;
+      if (typeof e.lon !== "number" || typeof e.lat !== "number") continue;
+      features.push({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: [e.lon, e.lat] },
+        properties: { entity_id: e.id, mmsi: e.mmsi },
+      });
+    }
+    src.setData({ type: "FeatureCollection", features });
+  }, [watchlist, renderEntities, ready]);
 
   // ------------------------------------------------------------------
   // Active dispatch rings — recompute features whenever the dispatch

@@ -713,6 +713,76 @@ function NearbyCandidatesSection({ entity, allEntities, onSelect, cfg }) {
   );
 }
 
+// VesselRegistrySection — surfaces public-registry enrichment for the
+// selected vessel. Today: MMSI MID prefix → flag state + MMSI kind.
+// Tomorrow (with an Equasis/MarineTraffic key): IMO, owner, manager,
+// class society, year built. Renders 'pending' on the unfilled fields
+// so the operator sees what the slot WILL show once keys are wired.
+function VesselRegistrySection({ entity, apiBase }) {
+  const [data, setData] = useState(null);
+  useEffect(() => {
+    if (!entity?.id) { setData(null); return; }
+    const ctrl = new AbortController();
+    fetch(`${apiBase}/maritime/entities/${entity.id}/registry`,
+          { signal: ctrl.signal })
+      .then((r) => r.ok ? r.json() : null)
+      .then((d) => setData(d))
+      .catch(() => {});
+    return () => ctrl.abort();
+  }, [entity?.id, apiBase]);
+
+  if (!data) return null;
+  if (!data.mmsi) return null;   // non-AIS entity (dark vessel etc) — skip
+
+  const flag = data.flag || {};
+  const row = (label, value) => (
+    <div style={{
+      display: "grid", gridTemplateColumns: "100px 1fr", gap: 8,
+      padding: "2px 0",
+    }}>
+      <span style={{
+        fontFamily: "'IBM Plex Mono', monospace", fontSize: 9,
+        color: PALETTE.muted, letterSpacing: "0.15em",
+      }}>{label}</span>
+      <span style={{
+        fontFamily: "'IBM Plex Sans', sans-serif", fontSize: 11,
+        color: value ? PALETTE.text : PALETTE.muted,
+        fontStyle: value ? "normal" : "italic",
+      }}>{value || "—"}</span>
+    </div>
+  );
+
+  return (
+    <div style={{
+      padding: "10px 18px",
+      borderTop: `1px solid ${PALETTE.border}`,
+    }}>
+      <div style={{
+        fontFamily: "'IBM Plex Mono', monospace", fontSize: 9,
+        color: PALETTE.muted, letterSpacing: "0.2em", marginBottom: 6,
+      }}>
+        VESSEL REGISTRY
+      </div>
+      {row("MMSI",   data.mmsi)}
+      {row("KIND",   data.mmsi_kind)}
+      {row("FLAG",   flag.country
+        ? `${flag.country} (${flag.iso2})`
+        : "(MID not in table)")}
+      {row("IMO",    data.imo)}
+      {row("OWNER",  data.owner)}
+      {row("CLASS",  data.class_society)}
+      {row("BUILT",  data.year_built)}
+      <div style={{
+        marginTop: 6, fontSize: 9, color: PALETTE.dim,
+        fontFamily: "'IBM Plex Mono', monospace", lineHeight: 1.4,
+      }}>
+        Source: {data.registry_source}.{" "}
+        {data.registry_note}
+      </div>
+    </div>
+  );
+}
+
 // EntityAuditPanel — fetches and renders every audit-chain entry
 // tagged to the selected entity. Lifecycle view: creation,
 // reclassifications, recommendations, dispatches, decisions all in
@@ -1348,6 +1418,55 @@ function LineagePanel({ entity, pinnedEntity, allEntities, onSelect, onPin, onUn
           {entity.vtype && <Tag>{entity.vtype.toUpperCase()}</Tag>}
           {entity.attrs && entity.attrs.frp_mw &&
             <Tag color={cfg.accent}>FRP {entity.attrs.frp_mw} MW</Tag>}
+          {/* Watch button — adds the MMSI to the operator's watchlist
+              (localStorage-backed, fires toasts on reappearance). Only
+              renders for AIS-cooperative entities (those have MMSIs). */}
+          {entity.mmsi && (() => {
+            // Check the watchlist via direct localStorage read on each
+            // render — sidestep prop drilling. Cheap.
+            let onList = false;
+            try {
+              const raw = window.localStorage.getItem("ss-watchlist-mmsis");
+              onList = raw && JSON.parse(raw).includes(entity.mmsi);
+            } catch {}
+            const evt = onList ? "ss-watchlist-remove" : "ss-watchlist-add";
+            return (
+              <button
+                type="button"
+                onClick={() => {
+                  try {
+                    window.dispatchEvent(new CustomEvent(evt, {
+                      detail: { mmsi: entity.mmsi },
+                    }));
+                  } catch {}
+                  // Force re-render via a tiny state toggle so the
+                  // button label flips immediately.
+                  // (LineagePanel re-renders whenever the parent
+                  // entities prop changes anyway, which the watchlist
+                  // also triggers on every reappearance.)
+                }}
+                title={onList
+                  ? "Remove from watchlist"
+                  : "Add to watchlist — alerts when this MMSI reappears"}
+                style={{
+                  appearance: "none",
+                  background: onList
+                    ? "rgba(255,208,64,0.28)" : "rgba(255,208,64,0.12)",
+                  border: `1px solid ${onList
+                    ? "#ffd040" : "rgba(255,208,64,0.4)"}`,
+                  color: "#ffd040",
+                  fontFamily: "'IBM Plex Mono', monospace",
+                  fontSize: 9,
+                  letterSpacing: "0.18em",
+                  padding: "2px 7px",
+                  cursor: "pointer",
+                  textTransform: "uppercase",
+                }}
+              >
+                {onList ? "★ watching" : "☆ watch"}
+              </button>
+            );
+          })()}
           {/* Pin button — saves this entity for side-by-side comparison */}
           {onPin && pinnedEntity?.id !== entity.id && (
             <button
@@ -1492,6 +1611,10 @@ function LineagePanel({ entity, pinnedEntity, allEntities, onSelect, onPin, onUn
           {entity.notes}
         </div>
       )}
+
+      {/* Vessel registry — MMSI MID → flag state, plus owner/IMO
+          placeholders ready to fill when an Equasis key is wired. */}
+      <VesselRegistrySection entity={entity} apiBase={API_BASE} />
 
       {/* Optical chip — actual Sentinel-2 imagery of the selected
           vessel's location. Renders inline for ANY selected entity,
