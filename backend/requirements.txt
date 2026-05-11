@@ -22,3 +22,4 @@ numpy>=1.26              # CFAR detector
 scipy>=1.13              # scipy.ndimage.label, RegularGridInterpolator (geocoder)
 rasterio>=1.4            # SAR scene tile reads via /vsizip+/vsis3/ (manylinux wheels include GDAL)
 Pillow>=10.0             # JPEG encoding for Sentinel-2 RGB chips (Phase 4.x)
+reportlab>=4.0           # Phase 5 — operator daily PDF brief

@@ -1058,6 +1058,271 @@ def maritime_reject(eid: str, body: DecisionRequest):
     return {"rejected": [r.model_dump() for r in affected]}
 
 
+@app.get("/maritime/daily_brief.pdf")
+def maritime_daily_brief():
+    """Generate a one-page PDF brief summarizing the last 24 h.
+
+    Contents:
+      - Header: timestamp + audit chain head (verifiable integrity token)
+      - Anomaly tally: counts per type (dark, spoofed, loitering, gap,
+        port-skipping, convoys)
+      - Top 10 dark vessels by priority — entity_id, lat/lon, last seen,
+        rcs_db when known
+      - Dispatch log: every dispatch_filed in the window with operator,
+        action_type, entity, and audit hash
+      - Sensor pulse: age and detail line per sensor
+
+    Designed as a leave-behind for briefings — the audit hash + dispatch
+    hashes are the integrity proofs an oversight reviewer would need
+    to re-verify the day's actions against the chain.
+    """
+    from datetime import timedelta as _td
+    from io import BytesIO
+    from fastapi.responses import Response
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib import colors as rl_colors
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+        )
+    except ImportError as exc:
+        raise HTTPException(
+            501,
+            "PDF brief requires reportlab — pip install reportlab "
+            f"(import failed: {exc})",
+        )
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - _td(hours=24)
+
+    # ----- Anomaly tally
+    tally = {
+        "vessel": 0, "dark_vessel": 0, "ais_gap": 0,
+        "loitering_vessel": 0, "ais_spoofed": 0, "port_skipping": 0,
+    }
+    convoy_ids: set[str] = set()
+    dark_vessels = []
+    for ent in maritime.entities.values():
+        t = ent.type.value
+        if t in tally:
+            tally[t] += 1
+        if t == "dark_vessel":
+            dark_vessels.append(ent)
+        cid = (ent.attrs or {}).get("convoy_id")
+        if cid:
+            convoy_ids.add(cid)
+    dark_vessels.sort(key=lambda e: -e.priority_score)
+    dark_vessels = dark_vessels[:10]
+
+    # ----- Recent dispatches from the audit log
+    dispatches = []
+    for e in audit_log.all():
+        if e.event_type != "dispatch_filed":
+            continue
+        if e.t < cutoff:
+            continue
+        dispatches.append(e)
+    dispatches.sort(key=lambda e: -e.seq)
+
+    # ----- Build the PDF
+    buf = BytesIO()
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "ssTitle", parent=styles["Title"],
+        fontSize=16, textColor=rl_colors.HexColor("#0a1118"),
+        spaceAfter=4,
+    )
+    meta_style = ParagraphStyle(
+        "ssMeta", parent=styles["Normal"],
+        fontSize=8, textColor=rl_colors.HexColor("#666"),
+        spaceAfter=10, leading=10,
+    )
+    h2_style = ParagraphStyle(
+        "ssH2", parent=styles["Heading2"],
+        fontSize=11, textColor=rl_colors.HexColor("#0a1118"),
+        spaceBefore=10, spaceAfter=4,
+    )
+    body_style = ParagraphStyle(
+        "ssBody", parent=styles["Normal"],
+        fontSize=8, textColor=rl_colors.HexColor("#1a2330"),
+        leading=10,
+    )
+
+    doc = SimpleDocTemplate(
+        buf, pagesize=letter,
+        leftMargin=0.6 * inch, rightMargin=0.6 * inch,
+        topMargin=0.6 * inch, bottomMargin=0.6 * inch,
+        title="Semper Safe — Daily Brief",
+    )
+    story = []
+    story.append(Paragraph("Semper Safe · Maritime Daily Brief", title_style))
+    audit_head = audit_log.head()
+    audit_count = audit_log.count() if hasattr(audit_log, "count") else len(audit_log.all())
+    story.append(Paragraph(
+        f"Window: {cutoff.strftime('%Y-%m-%d %H:%MZ')} → "
+        f"{now.strftime('%Y-%m-%d %H:%MZ')} &nbsp;·&nbsp; "
+        f"Audit chain head: {audit_head[:24]}… &nbsp;·&nbsp; "
+        f"{audit_count} total entries",
+        meta_style,
+    ))
+
+    # Anomaly tally table
+    story.append(Paragraph("Anomaly tally", h2_style))
+    tally_data = [
+        ["Type", "Count"],
+        ["Cooperative vessels", str(tally["vessel"])],
+        ["Dark vessels (SAR-only)", str(tally["dark_vessel"])],
+        ["AIS spoofed", str(tally["ais_spoofed"])],
+        ["Port-skipping", str(tally["port_skipping"])],
+        ["Loitering", str(tally["loitering_vessel"])],
+        ["AIS dropouts (gaps)", str(tally["ais_gap"])],
+        ["Convoys in formation", str(len(convoy_ids))],
+    ]
+    tally_table = Table(tally_data, colWidths=[3.5 * inch, 1 * inch])
+    tally_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#1a2330")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("GRID", (0, 0), (-1, -1), 0.25, rl_colors.HexColor("#cccccc")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+         [rl_colors.white, rl_colors.HexColor("#f5f5f7")]),
+    ]))
+    story.append(tally_table)
+
+    # Top dark vessels
+    if dark_vessels:
+        story.append(Paragraph("Top dark vessels (by priority)", h2_style))
+        rows = [["Entity", "Lat", "Lon", "Last seen", "Priority"]]
+        for ent in dark_vessels:
+            rows.append([
+                ent.entity_id[:14],
+                f"{ent.geom.lat:.4f}" if ent.geom else "—",
+                f"{ent.geom.lon:.4f}" if ent.geom else "—",
+                ent.last_seen.strftime("%Y-%m-%d %H:%MZ"),
+                f"{ent.priority_score:.2f}",
+            ])
+        dv_table = Table(rows, colWidths=[1.3 * inch, 0.8 * inch,
+                                          0.8 * inch, 1.3 * inch, 0.8 * inch])
+        dv_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#1a2330")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("ALIGN", (1, 0), (4, -1), "RIGHT"),
+            ("GRID", (0, 0), (-1, -1), 0.25, rl_colors.HexColor("#cccccc")),
+        ]))
+        story.append(dv_table)
+    else:
+        story.append(Paragraph("Top dark vessels: none in current state.", body_style))
+
+    # Dispatch log
+    story.append(Paragraph(
+        f"Dispatch log ({len(dispatches)} in last 24 h)", h2_style))
+    if dispatches:
+        rows = [["Seq", "Time (UTC)", "Operator", "Action", "Entity", "Hash"]]
+        for d in dispatches[:25]:    # cap at 25 rows to fit one page
+            payload = d.payload or {}
+            rows.append([
+                str(d.seq),
+                d.t.strftime("%H:%M"),
+                d.actor[:16],
+                (payload.get("action_type") or "—")[:16],
+                (payload.get("entity_name")
+                 or payload.get("entity_id", "")[:12])[:16],
+                d.self_hash[:10] + "…",
+            ])
+        disp_table = Table(rows, colWidths=[0.5 * inch, 0.7 * inch,
+                                            1.1 * inch, 1.2 * inch,
+                                            1.4 * inch, 0.9 * inch])
+        disp_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#1a2330")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("ALIGN", (0, 0), (0, -1), "RIGHT"),
+            ("GRID", (0, 0), (-1, -1), 0.25, rl_colors.HexColor("#cccccc")),
+            ("FONTNAME", (5, 1), (5, -1), "Courier"),
+        ]))
+        story.append(disp_table)
+    else:
+        story.append(Paragraph(
+            "No dispatches filed in the last 24 hours.", body_style))
+
+    # Footer
+    story.append(Spacer(1, 0.15 * inch))
+    story.append(Paragraph(
+        f"Generated by semper-safe at {now.strftime('%Y-%m-%dT%H:%M:%SZ')}. "
+        f"Every dispatch above is hash-chained to the audit log; verify "
+        f"by walking from audit chain head {audit_head[:20]}… back to "
+        f"genesis using POST /audit/verify.",
+        meta_style,
+    ))
+
+    doc.build(story)
+    pdf_bytes = buf.getvalue()
+    filename = f"semper-safe-brief-{now.strftime('%Y%m%d-%H%M')}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.get("/maritime/dispatches/recent")
+def maritime_recent_dispatches(hours: int = 24):
+    """Return positions of dispatch_filed audit entries in the last
+    `hours` window. Used by the frontend operator-workload heatmap
+    to surface 'where the watch has been busy'.
+
+    The dispatch payload was built by maritime_file_dispatch and
+    stamps the entity_id, entity_type, entity_name + entity_mmsi
+    onto the audit entry. We resolve entity_id → current position
+    via the in-memory engine; entities that have been retention-
+    swept since the dispatch resolve to None and are omitted.
+    """
+    from datetime import timedelta as _td
+
+    cutoff = datetime.now(timezone.utc) - _td(hours=hours)
+    entries = audit_log.all()
+    out = []
+    for e in entries:
+        if e.event_type != "dispatch_filed":
+            continue
+        if e.t < cutoff:
+            continue
+        payload = e.payload or {}
+        eid = payload.get("entity_id")
+        if not eid:
+            continue
+        ent = maritime.entities.get(eid)
+        if ent is None or ent.geom is None:
+            continue
+        out.append({
+            "audit_seq": e.seq,
+            "audit_hash": e.self_hash,
+            "dispatched_at": e.t.isoformat(),
+            "operator": e.actor,
+            "entity_id": eid,
+            "entity_type": payload.get("entity_type"),
+            "action_type": payload.get("action_type"),
+            "lon": ent.geom.lon,
+            "lat": ent.geom.lat,
+        })
+    return {
+        "since": cutoff.isoformat(),
+        "now": datetime.now(timezone.utc).isoformat(),
+        "n_dispatches": len(out),
+        "dispatches": out,
+    }
+
+
 @app.post("/maritime/dispatches", status_code=201)
 def maritime_file_dispatch(body: DispatchRequest):
     """File a formal dispatch — appends a 'dispatch_filed' audit entry

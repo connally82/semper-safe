@@ -161,6 +161,14 @@ const HEATMAP_SOURCE_ID = "ss-activity-heatmap";
 const HEATMAP_LAYER_ID = "ss-activity-heatmap-layer";
 const HEATMAP_STORAGE_KEY = "ss-activity-heatmap";
 
+// Operator-workload heatmap — overlay where dispatch_filed audit
+// entries landed in the last 24 h. Distinct palette (purple→pink)
+// so it's visually separable from the cooperative-traffic heatmap.
+const WORKLOAD_SOURCE_ID = "ss-workload-heatmap";
+const WORKLOAD_LAYER_ID = "ss-workload-heatmap-layer";
+const WORKLOAD_STORAGE_KEY = "ss-workload-heatmap";
+const WORKLOAD_REFRESH_MS = 90 * 1000;   // dispatches are rare; 90s is plenty
+
 // Cap how many trails we fetch — saves the backend from N parallel
 // /entities/{id}/track hits when there are 50+ anomalies on the map.
 // 25 covers all dark/spoofed/port-skipping vessels in normal operation
@@ -360,6 +368,93 @@ function entityRadius(type) {
   return 6;
 }
 
+// Vessel-type SVG glyphs keyed off the AIS ship_type code (ITU-R
+// M.1371). The shape rotates with the vessel's heading so the operator
+// can see vessel class at a glance — "that's a tanker, not just any
+// dot". Falls back to the generic circle when ship_type is missing
+// (most non-Class-A transmitters) or for non-AIS entity types
+// (dark_vessel, fire_event, etc).
+//
+// Shapes are designed inside a viewBox of about [-6, -8] to [6, 8] —
+// bow points "up" (north) before rotation. Each glyph is filled with
+// the type-meta color so the type/anomaly classification still reads.
+function _vesselGlyph(shipType, color, stroke, strokeWidth) {
+  if (shipType == null) return null;
+  const n = Number(shipType);
+  if (Number.isNaN(n)) return null;
+  // Cargo (70-79): rectangular hull with three cargo containers on top.
+  if (n >= 70 && n <= 79) {
+    return `
+      <path d="M -4 -7 L 4 -7 L 5 7 L -5 7 Z"
+            fill="${color}" stroke="${stroke}" stroke-width="${strokeWidth}"
+            stroke-linejoin="round" />
+      <rect x="-3" y="-5" width="6" height="2.2" fill="${stroke}" opacity="0.6"/>
+      <rect x="-3" y="-2" width="6" height="2.2" fill="${stroke}" opacity="0.6"/>
+      <rect x="-3" y="1"  width="6" height="2.2" fill="${stroke}" opacity="0.6"/>
+    `;
+  }
+  // Tanker (80-89): rounded hull with a dome on the deck.
+  if (n >= 80 && n <= 89) {
+    return `
+      <path d="M -4 -7 Q 0 -8 4 -7 L 4.5 6 Q 0 8 -4.5 6 Z"
+            fill="${color}" stroke="${stroke}" stroke-width="${strokeWidth}"
+            stroke-linejoin="round" />
+      <circle cx="0" cy="0" r="2.5" fill="${stroke}" opacity="0.55"/>
+    `;
+  }
+  // Passenger / cruise (60-69): elongated hull with horizontal deck lines.
+  if (n >= 60 && n <= 69) {
+    return `
+      <path d="M -3 -8 L 3 -8 L 3.5 7 L -3.5 7 Z"
+            fill="${color}" stroke="${stroke}" stroke-width="${strokeWidth}"
+            stroke-linejoin="round" />
+      <line x1="-3" y1="-3" x2="3" y2="-3" stroke="${stroke}" stroke-width="0.6" opacity="0.7"/>
+      <line x1="-3" y1="0"  x2="3" y2="0"  stroke="${stroke}" stroke-width="0.6" opacity="0.7"/>
+      <line x1="-3" y1="3"  x2="3" y2="3"  stroke="${stroke}" stroke-width="0.6" opacity="0.7"/>
+    `;
+  }
+  // Fishing (30) — small hull plus a vertical mast.
+  if (n === 30) {
+    return `
+      <path d="M -3 -3 L 3 -3 L 3.5 5 L -3.5 5 Z"
+            fill="${color}" stroke="${stroke}" stroke-width="${strokeWidth}"
+            stroke-linejoin="round" />
+      <line x1="0" y1="-3" x2="0" y2="-9" stroke="${color}" stroke-width="1.2"/>
+      <line x1="-2.5" y1="-7" x2="2.5" y2="-7" stroke="${color}" stroke-width="0.8"/>
+    `;
+  }
+  // Sailing / pleasure (36-37): triangle sail.
+  if (n === 36 || n === 37) {
+    return `
+      <path d="M 0 -8 L -3 5 L 3 5 Z"
+            fill="${color}" stroke="${stroke}" stroke-width="${strokeWidth}"
+            stroke-linejoin="round" />
+      <path d="M -4 5 Q 0 7 4 5 Z"
+            fill="${color}" opacity="0.7"
+            stroke="${stroke}" stroke-width="${strokeWidth}"/>
+    `;
+  }
+  // Tug / SAR / pilot / port-service (50-59): chunky square.
+  if (n >= 50 && n <= 59) {
+    return `
+      <path d="M -3.5 -5 L 3.5 -5 L 3 6 L -3 6 Z"
+            fill="${color}" stroke="${stroke}" stroke-width="${strokeWidth}"
+            stroke-linejoin="round" />
+      <rect x="-1.5" y="-2.5" width="3" height="3" fill="${stroke}" opacity="0.55"/>
+    `;
+  }
+  // Anything else AIS reports (high-speed craft 40-49, military 35,
+  // dredging 33, towing 31-32, other 90-99): generic boat silhouette.
+  if (n >= 1 && n <= 99) {
+    return `
+      <path d="M 0 -7 L 4 -2 L 3 6 L -3 6 L -4 -2 Z"
+            fill="${color}" stroke="${stroke}" stroke-width="${strokeWidth}"
+            stroke-linejoin="round" />
+    `;
+  }
+  return null;
+}
+
 // Anomaly transitions worth alerting on. A vessel newly entering any
 // of these states gets a toast (and dark_vessel gets a sound).
 const ANOMALY_ALERT_TYPES = new Set([
@@ -465,6 +560,16 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
   const persistHeatmap = (on) => {
     setHeatmapOn(on);
     try { window.localStorage.setItem(HEATMAP_STORAGE_KEY, on ? "1" : "0"); }
+    catch {}
+  };
+  const [workloadOn, setWorkloadOn] = useState(() => {
+    if (typeof window === "undefined") return false;
+    try { return window.localStorage.getItem(WORKLOAD_STORAGE_KEY) === "1"; }
+    catch { return false; }
+  });
+  const persistWorkload = (on) => {
+    setWorkloadOn(on);
+    try { window.localStorage.setItem(WORKLOAD_STORAGE_KEY, on ? "1" : "0"); }
     catch {}
   };
 
@@ -987,7 +1092,48 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
     map.on("style.load", ensureConvoyLayers);
     map.on("style.load", ensureAoiLayers);
     map.on("style.load", ensureAnomalyTrailsLayers);
+    // Operator-workload heatmap — same approach as the activity
+    // heatmap but on dispatch positions, with a distinct
+    // purple→pink palette so the two can be on simultaneously
+    // without visual confusion.
+    const ensureWorkloadLayers = () => {
+      if (map.getSource(WORKLOAD_SOURCE_ID)) return;
+      map.addSource(WORKLOAD_SOURCE_ID, {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      map.addLayer({
+        id: WORKLOAD_LAYER_ID,
+        type: "heatmap",
+        source: WORKLOAD_SOURCE_ID,
+        layout: { visibility: "none" },
+        paint: {
+          "heatmap-weight": 1,
+          "heatmap-intensity": [
+            "interpolate", ["linear"], ["zoom"],
+            5, 0.8,
+            12, 2.6,
+          ],
+          "heatmap-radius": [
+            "interpolate", ["linear"], ["zoom"],
+            5, 14,
+            12, 36,
+          ],
+          "heatmap-opacity": 0.65,
+          "heatmap-color": [
+            "interpolate", ["linear"], ["heatmap-density"],
+            0,    "rgba(0,0,0,0)",
+            0.15, "rgba(95,70,150,0.5)",
+            0.45, "rgba(170,80,200,0.75)",
+            0.75, "rgba(255,90,210,0.85)",
+            1,    "rgba(255,180,255,0.95)",
+          ],
+        },
+      });
+    };
+
     map.on("style.load", ensureHeatmapLayers);
+    map.on("style.load", ensureWorkloadLayers);
     map.on("style.load", ensureSarLayers);
 
     // Click → popup. Detections are densely packed so attach to the
@@ -1151,6 +1297,13 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
       try {
         members = JSON.parse(p.members_json || "[]");
       } catch { members = []; }
+      // Also focus the side panel on the convoy's head member so the
+      // operator can drill into a real vessel rather than only seeing
+      // the popup. The first MMSI sort order = the head (matches the
+      // backend's convoy_id naming convention).
+      if (members.length > 0 && members[0].id && onSelect) {
+        onSelect(members[0].id);
+      }
       const rows = members.map((m) => {
         const ident = m.name || (m.mmsi ? `MMSI ${m.mmsi}` : "unidentified");
         const speed = m.speed_kn != null
@@ -1401,6 +1554,27 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
                 stroke-linejoin="round" />
         </g>` : "";
 
+      // Pick a vessel-type glyph if the AIS message carries a ship_type
+      // and the entity is a cooperative vessel (not a SAR-only dark
+      // contact, fire event, etc — those have no AIS to read).
+      const shipType = a.ship_type;
+      const useGlyph = (e.type === "vessel"
+                        || e.type === "ais_gap"
+                        || e.type === "loitering_vessel"
+                        || e.type === "ais_spoofed"
+                        || e.type === "port_skipping")
+                       && shipType != null && !cross;
+      const glyphSvg = useGlyph
+        ? _vesselGlyph(shipType, meta.color, stroke, strokeWidth)
+        : null;
+
+      // Anchored vessels and ones with no heading get a non-rotated
+      // glyph — rotating to 0° (north) by default would mis-imply
+      // a direction the AIS didn't report.
+      const rotatable = useGlyph && glyphSvg && headingDeg != null
+                        && (e.type === "vessel" || e.type === "ais_gap")
+                        && (speed == null || speed > 1.0);
+
       el.innerHTML = `
         <svg viewBox="-12 -12 24 24" width="20" height="20"
              style="overflow:visible;display:block;">
@@ -1417,9 +1591,14 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
                        <line x1="-4" y1="-4" x2="4" y2="4"
                              stroke="${meta.color}" stroke-width="1.5"/>
                      </g>`
-                  : `<circle r="${r}" fill="${meta.color}"
-                              stroke="${stroke}" stroke-width="${strokeWidth}"/>`}
-          ${arrowSvg}
+                  : (glyphSvg
+                       ? (rotatable
+                            ? `<g transform="rotate(${headingDeg})">${glyphSvg}</g>`
+                            : `<g>${glyphSvg}</g>`)
+                       : `<circle r="${r}" fill="${meta.color}"
+                                   stroke="${stroke}" stroke-width="${strokeWidth}"/>`
+                    )}
+          ${glyphSvg ? "" : arrowSvg}
         </svg>
       `;
       el.title = `${meta.label || e.type}${e.name ? ` — ${e.name}` : ""}` +
@@ -1611,17 +1790,62 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
     }
     const newToasts = [];
     let anyNewDarkVessel = false;
+    // Pre-index positions of dark/spoofed vessels — we look up each
+    // gap candidate against this so "gap appeared near a known dark
+    // vessel" gets through the suppression filter.
+    const darkPositions = [];
+    for (const o of renderEntities) {
+      if (o.type === "dark_vessel" || o.type === "ais_spoofed") {
+        if (typeof o.lon === "number" && typeof o.lat === "number") {
+          darkPositions.push([o.lon, o.lat]);
+        }
+      }
+    }
     for (const e of renderEntities) {
       const prev = typeMap.get(e.id);
       if (prev === e.type) continue;
       typeMap.set(e.id, e.type);
       if (!ANOMALY_ALERT_TYPES.has(e.type)) continue;
-      // Skip the case where prev is undefined AND type is ais_gap — the
-      // gap sweeper creates these continuously as the AIS feed naturally
-      // drops connections; toasting every gap floods the UI. Dark vessel,
-      // spoofed, loitering all warrant the toast even if it's a fresh
-      // entity (those are interesting on first appearance).
-      if (prev === undefined && e.type === "ais_gap") continue;
+      // ais_gap is the spammy one — the gap sweeper creates these
+      // continuously as the AIS feed naturally drops connections.
+      // Two cases survive the suppression because they're actually
+      // interesting:
+      //   (a) the gap is within 5 km of a dark/spoofed vessel — a
+      //       cooperative vessel going silent next to a non-coop
+      //       target is a real correlation signal
+      //   (b) the gap is in empty water — no other AIS-cooperative
+      //       vessel within 10 km. A gap in a busy lane is noise;
+      //       a gap with no neighbors is a vessel deliberately
+      //       slipping away from witnesses.
+      if (e.type === "ais_gap") {
+        let interesting = false;
+        if (typeof e.lon === "number" && typeof e.lat === "number") {
+          // Case (a) — near dark/spoofed
+          for (const [olon, olat] of darkPositions) {
+            if (_haversineKm({ lon: e.lon, lat: e.lat },
+                             { lon: olon, lat: olat }) <= 5.0) {
+              interesting = true;
+              break;
+            }
+          }
+          if (!interesting) {
+            // Case (b) — empty water. Count cooperative neighbors.
+            let neighbors = 0;
+            for (const o of renderEntities) {
+              if (o.id === e.id) continue;
+              if (o.type !== "vessel" && o.type !== "ais_gap") continue;
+              if (typeof o.lon !== "number" || typeof o.lat !== "number") continue;
+              if (_haversineKm({ lon: e.lon, lat: e.lat },
+                               { lon: o.lon, lat: o.lat }) <= 10.0) {
+                neighbors += 1;
+                if (neighbors >= 1) break;   // anything close-by → skip
+              }
+            }
+            if (neighbors === 0) interesting = true;
+          }
+        }
+        if (!interesting) continue;
+      }
       const meta = cfg.typeMeta[e.type];
       if (!meta) continue;
       newToasts.push({
@@ -1759,6 +1983,48 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
       );
     }
   }, [renderEntities, heatmapOn, ready]);
+
+  // ------------------------------------------------------------------
+  // Operator-workload heatmap — periodically pulls the recent-dispatch
+  // positions and feeds them into the WORKLOAD layer. Cheap: dispatches
+  // are rare (a few per shift) so we poll every 90 s instead of every
+  // entities-tick.
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    if (map.getLayer(WORKLOAD_LAYER_ID)) {
+      map.setLayoutProperty(
+        WORKLOAD_LAYER_ID, "visibility",
+        workloadOn ? "visible" : "none",
+      );
+    }
+    if (!workloadOn) return;
+    let cancelled = false;
+    const pull = () => {
+      const ctrl = new AbortController();
+      fetch(`${API_BASE}/maritime/dispatches/recent?hours=24`,
+            { signal: ctrl.signal })
+        .then((r) => r.ok ? r.json() : null)
+        .then((data) => {
+          if (cancelled || !data) return;
+          const src = map.getSource(WORKLOAD_SOURCE_ID);
+          if (!src) return;
+          src.setData({
+            type: "FeatureCollection",
+            features: (data.dispatches || []).map((d) => ({
+              type: "Feature",
+              geometry: { type: "Point", coordinates: [d.lon, d.lat] },
+              properties: { entity_id: d.entity_id, t: d.dispatched_at },
+            })),
+          });
+        })
+        .catch(() => { /* network blips are fine — try again on interval */ });
+    };
+    pull();
+    const id = window.setInterval(pull, WORKLOAD_REFRESH_MS);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [workloadOn, ready]);
 
   // ------------------------------------------------------------------
   // Anomaly trails — fetch the last-hour track for every anomaly
@@ -2313,6 +2579,26 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
         >
           ▓ heat
         </button>
+        <button
+          type="button"
+          title="Toggle operator-workload heatmap — recent dispatch positions"
+          onClick={() => persistWorkload(!workloadOn)}
+          style={{
+            appearance: "none",
+            border: "none",
+            borderLeft: "1px solid rgba(255,255,255,0.18)",
+            cursor: "pointer",
+            padding: "6px 10px",
+            background: workloadOn ? "rgba(200,90,210,0.28)" : "transparent",
+            color: workloadOn ? "#f0c8ff" : "rgba(255,255,255,0.7)",
+            textTransform: "uppercase",
+            minWidth: 64,
+            fontSize: 10,
+            letterSpacing: "0.08em",
+          }}
+        >
+          ▓ ops
+        </button>
 
         {/* Anomaly trail window — 1h / 6h / 24h. Filters the per-
             anomaly polylines client-side from cached track points
@@ -2725,6 +3011,32 @@ function AnomalyBanner({ entities, cfg, onZoomTo }) {
         }}
       >
         ⬇ csv
+      </button>
+      <button
+        type="button"
+        onClick={() => {
+          // Browser handles the download via the Content-Disposition
+          // header the backend sets. Opening in a new tab keeps the
+          // current Workbench state intact.
+          window.open(`${API_BASE}/maritime/daily_brief.pdf`, "_blank");
+        }}
+        title="Download today's PDF brief — anomaly tally + dispatch log + audit hash"
+        style={{
+          appearance: "none",
+          background: "rgba(255,255,255,0.04)",
+          border: "1px solid rgba(255,255,255,0.3)",
+          color: "#f0f4ff",
+          borderRadius: 3,
+          padding: "4px 8px",
+          cursor: "pointer",
+          textTransform: "uppercase",
+          fontFamily: "'IBM Plex Mono', monospace",
+          fontSize: 10,
+          letterSpacing: "0.12em",
+          fontWeight: 600,
+        }}
+      >
+        ⬇ pdf
       </button>
     </div>
   );
