@@ -1301,7 +1301,17 @@ function hashStr(s) {
 // =============================================================
 async function tryFetch(url, opts = {}) {
   const ctrl = new AbortController();
-  const tid = setTimeout(() => ctrl.abort(), 1500);
+  // 1500ms was the original timeout when /health returned in <100ms.
+  // Bumped to 20s after a recurring user complaint of "everything goes
+  // away and goes back to Madagascar": on slower backend states (e.g.
+  // when the audit-log scan in /health is taking 4-11 s) the 1500ms
+  // budget fires, this throws, Workbench flips to conn.status='offline'
+  // and falls back to the embedded MARITIME scenario — which has
+  // Madagascar seed entities. The Texas data was always there in the
+  // backend; the frontend just gave up before it loaded. A 20s budget
+  // covers the worst observed /health latency comfortably without
+  // making the "actually offline" failure mode meaningfully slower.
+  const tid = setTimeout(() => ctrl.abort(), 20000);
   try {
     const r = await fetch(url, { ...opts, signal: ctrl.signal });
     clearTimeout(tid);

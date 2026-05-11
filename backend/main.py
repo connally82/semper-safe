@@ -1706,6 +1706,94 @@ def maritime_sar_optical_chip(
     )
 
 
+@app.get("/maritime/optical_chip")
+def maritime_optical_chip(
+    lat: float,
+    lon: float,
+    half_size_m: float = 1500.0,
+    max_days: int = 7,
+    max_cloud_pct: float = 60.0,
+):
+    """Serve the most recent Sentinel-2 RGB chip for ANY lat/lon — not
+    just a SAR detection point.
+
+    Lets the side panel show actual optical imagery of any vessel the
+    operator clicks (cooperative AIS vessels, ais_gap entities, etc),
+    without requiring a SAR pass. Cache key is a hash of the rounded
+    lat/lon so different vessels at nearby positions can share a chip.
+
+    Returns:
+      - image/jpeg with the rendered chip on success
+      - 404 if no recent S2 scene overlaps the point within the window
+      - 202 if the matched S2 scene exists but hasn't been downloaded
+        yet — frontend can retry after the background download lands
+
+    Query parameters tuned for "show me what's around this vessel":
+      half_size_m=1500   ⇒ 3 km × 3 km chip; vessels are visible as
+                           bright pixels at 10 m S2 GSD.
+      max_days=7         ⇒ widen from the SAR-detection 3-day window
+                           because we don't have a SAR timestamp to
+                           anchor — last week is fine.
+      max_cloud_pct=60   ⇒ accept moderately cloudy scenes; a cloudy
+                           chip is more useful than no chip at all.
+    """
+    import hashlib
+    from datetime import datetime, timezone as _tz
+    from fastapi.responses import Response, JSONResponse
+    from db import models as dbm
+    from db.session import session_scope
+
+    # Deterministic cache key — bucket lat/lon to ~110 m precision so
+    # multiple vessels in the same neighborhood share a single chip.
+    bucket_lat = round(lat, 3)
+    bucket_lon = round(lon, 3)
+    half = round(half_size_m)
+    raw = f"point_{bucket_lat}_{bucket_lon}_{half}"
+    cache_key = hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    now = datetime.now(_tz.utc)
+    s2_scene_id = s2.find_nearest_s2_for_point(
+        lat, lon, now,
+        max_days=max_days, max_cloud_pct=max_cloud_pct,
+    )
+    if s2_scene_id is None:
+        raise HTTPException(
+            404,
+            f"no Sentinel-2 scene within ±{max_days} days and "
+            f"≤{max_cloud_pct}% cloud overlaps this point",
+        )
+
+    with session_scope() as s:
+        s2_scene = s.get(dbm.S2SceneRow, s2_scene_id)
+        if s2_scene is None or s2_scene.state != "downloaded":
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "status": "s2_scene_not_yet_downloaded",
+                    "s2_scene_id": s2_scene_id,
+                    "tip": "POST /admin/s2/download/{scene_id} then retry",
+                },
+            )
+
+    import s2_processor
+    try:
+        chip = s2_processor.extract_chip(
+            cache_key, s2_scene_id, lat, lon,
+            half_size_m=half_size_m,
+            # No vessel-length annotation here — we don't know if this
+            # point even IS a vessel. Just the underlying imagery.
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("point optical_chip generation failed: %s", exc)
+        raise HTTPException(500, f"chip generation failed: {exc}")
+
+    return Response(
+        content=chip,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @app.post("/admin/sar/discover")
 def admin_sar_discover(x_admin_token: str | None = Header(default=None)):
     """Manually trigger a Sentinel-1 catalog discovery sweep."""
