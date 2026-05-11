@@ -545,7 +545,170 @@ function MapView({ entities, selectedId, onSelect, cfg }) {
   );
 }
 
-function LineagePanel({ entity, decisions, onApprove, onReject, cfg }) {
+// Anomaly types that warrant a "who is this really?" investigation panel.
+// dark_vessel: SAR hit with no AIS — need to find candidate hulls nearby.
+// ais_gap: vessel went silent — is someone else nearby who might be it?
+// loitering_vessel + ais_spoofed: same investigative question, different signal.
+const SUSPECT_TYPES = new Set([
+  "dark_vessel", "ais_gap", "loitering_vessel", "ais_spoofed",
+]);
+
+// Haversine distance — same formula the backend uses in fusion.haversine_km.
+// Pure-JS so the panel doesn't need a network call to rank candidates.
+function _distKm(a, b) {
+  const R = 6371.0;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const la1 = toRad(a.lat), la2 = toRad(b.lat);
+  const dla = toRad(b.lat - a.lat);
+  const dlo = toRad(b.lon - a.lon);
+  const h = Math.sin(dla / 2) ** 2 +
+            Math.cos(la1) * Math.cos(la2) * Math.sin(dlo / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+// Format an ISO timestamp as a human-friendly "5m ago" relative string.
+function _ageStr(iso) {
+  if (!iso) return "—";
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return "—";
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 60) return `${Math.round(s)}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86400)}d ago`;
+}
+
+// Side-panel section that surfaces cooperative AIS vessels in a tight
+// radius around an anomaly. The investigative question this answers:
+// "we have a dark vessel here / a vessel went dark here / a vessel is
+//  spoofing AIS — which of the cooperative hulls nearby could it actually
+//  be?" One click drops the operator into the candidate's detail view.
+//
+// Radius is intentionally tight (5 km). Realistic vessel positions can
+// drift by a kilometer or two between consecutive AIS reports, so 5 km
+// covers a generous "they could be the same hull observed differently".
+// Wider radii flood the list and stop being useful.
+const SUSPECT_SEARCH_RADIUS_KM = 5.0;
+const SUSPECT_MAX_CANDIDATES = 10;
+
+function NearbyCandidatesSection({ entity, allEntities, onSelect, cfg }) {
+  const candidates = useMemo(() => {
+    if (entity == null || typeof entity.lon !== "number" ||
+        typeof entity.lat !== "number") {
+      return [];
+    }
+    const origin = { lon: entity.lon, lat: entity.lat };
+    const rows = [];
+    for (const e of allEntities) {
+      if (e.id === entity.id) continue;
+      // Only consider AIS-cooperative vessels — anomaly-to-anomaly matches
+      // aren't investigative leads, they're separate threats.
+      if (e.type !== "vessel" && e.type !== "ais_gap") continue;
+      if (typeof e.lon !== "number" || typeof e.lat !== "number") continue;
+      const d = _distKm(origin, { lon: e.lon, lat: e.lat });
+      if (d > SUSPECT_SEARCH_RADIUS_KM) continue;
+      rows.push({ ent: e, distance_km: d });
+    }
+    rows.sort((a, b) => a.distance_km - b.distance_km);
+    return rows.slice(0, SUSPECT_MAX_CANDIDATES);
+  }, [entity, allEntities]);
+
+  return (
+    <div style={{
+      padding: "12px 18px",
+      borderTop: `1px solid ${PALETTE.border}`,
+      background: PALETTE.surface,
+    }}>
+      <div style={{
+        fontFamily: "'IBM Plex Mono', monospace", fontSize: 9,
+        color: PALETTE.muted, letterSpacing: "0.2em",
+        display: "flex", justifyContent: "space-between", alignItems: "baseline",
+      }}>
+        <span>NEARBY CANDIDATE HULLS</span>
+        <span style={{ color: PALETTE.dim }}>≤ {SUSPECT_SEARCH_RADIUS_KM} KM</span>
+      </div>
+      {candidates.length === 0 ? (
+        <div style={{
+          marginTop: 8,
+          fontFamily: "'IBM Plex Sans', sans-serif", fontSize: 12,
+          color: PALETTE.muted, fontStyle: "italic", lineHeight: 1.4,
+        }}>
+          No cooperative AIS vessels within {SUSPECT_SEARCH_RADIUS_KM} km.
+          This anomaly is isolated — no obvious co-located candidate hull.
+        </div>
+      ) : (
+        <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+          {candidates.map(({ ent, distance_km }) => {
+            const m = cfg.typeMeta[ent.type] || { color: PALETTE.muted, label: ent.type };
+            return (
+              <button
+                key={ent.id}
+                type="button"
+                onClick={() => onSelect && onSelect(ent.id)}
+                style={{
+                  appearance: "none",
+                  background: PALETTE.surface2 + "70",
+                  border: `1px solid ${PALETTE.border}`,
+                  borderRadius: 3,
+                  padding: "8px 10px",
+                  cursor: onSelect ? "pointer" : "default",
+                  textAlign: "left",
+                  fontFamily: "'IBM Plex Sans', sans-serif",
+                  color: PALETTE.text,
+                  display: "grid",
+                  gridTemplateColumns: "1fr auto",
+                  gap: 4,
+                  rowGap: 2,
+                }}
+                title={`Switch focus to ${ent.name || ent.id}`}
+              >
+                <span style={{
+                  fontSize: 12, fontWeight: 500,
+                  overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                }}>
+                  {ent.name || (
+                    <span style={{ color: PALETTE.muted, fontStyle: "italic" }}>
+                      unidentified
+                    </span>
+                  )}
+                </span>
+                <span style={{
+                  fontFamily: "'IBM Plex Mono', monospace", fontSize: 11,
+                  color: m.color, fontVariantNumeric: "tabular-nums",
+                  textAlign: "right",
+                }}>
+                  {distance_km < 1
+                    ? `${Math.round(distance_km * 1000)} m`
+                    : `${distance_km.toFixed(1)} km`}
+                </span>
+                <span style={{
+                  fontFamily: "'IBM Plex Mono', monospace", fontSize: 10,
+                  color: PALETTE.muted, letterSpacing: "0.06em",
+                  display: "flex", gap: 6, alignItems: "center",
+                }}>
+                  <span style={{
+                    width: 6, height: 6, borderRadius: "50%",
+                    background: m.color, display: "inline-block",
+                  }} />
+                  <span>{m.label}</span>
+                  {ent.mmsi && <span>· MMSI {ent.mmsi}</span>}
+                </span>
+                <span style={{
+                  fontFamily: "'IBM Plex Mono', monospace", fontSize: 10,
+                  color: PALETTE.muted, textAlign: "right",
+                }}>
+                  {_ageStr(ent.last_seen)}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LineagePanel({ entity, allEntities, onSelect, decisions, onApprove, onReject, cfg }) {
   if (!entity) {
     return (
       <div style={{
@@ -717,6 +880,15 @@ function LineagePanel({ entity, decisions, onApprove, onReject, cfg }) {
           ))}
         </div>
       </div>
+
+      {SUSPECT_TYPES.has(entity.type) && (
+        <NearbyCandidatesSection
+          entity={entity}
+          allEntities={allEntities || []}
+          onSelect={onSelect}
+          cfg={cfg}
+        />
+      )}
 
       {entity.recommendation && (
         <div style={{
@@ -1030,6 +1202,8 @@ export default function Workbench() {
           />
           <LineagePanel
             entity={selected}
+            allEntities={sortedEntities}
+            onSelect={(id) => setSelection(s => ({ ...s, [domainKey]: id }))}
             decisions={decisions}
             onApprove={(id) => handleDecision(id, "approved")}
             onReject={(id) => handleDecision(id, "rejected")}
