@@ -90,6 +90,33 @@ const TRACK_SOURCE_ID = "ss-selected-track";
 const TRACK_LAYER_ID = "ss-selected-track-line";
 const TRACK_HEAD_LAYER_ID = "ss-selected-track-head";
 
+// Candidate-hull halos — when an anomaly entity is selected, the 5-km
+// neighborhood of AIS-cooperative vessels gets ringed on the map so
+// the operator sees the side-panel "candidate hulls" list spatially.
+const CANDIDATES_SOURCE_ID = "ss-candidate-hulls";
+const CANDIDATES_LAYER_ID = "ss-candidate-hulls-ring";
+const CANDIDATES_PULSE_LAYER_ID = "ss-candidate-hulls-pulse";
+
+const SUSPECT_TYPES_MAP = new Set([
+  "dark_vessel", "ais_gap", "loitering_vessel", "ais_spoofed",
+]);
+const CANDIDATE_RADIUS_KM = 5.0;
+const CANDIDATE_MAX = 10;
+
+// Pure-JS haversine — same formula used by the backend fusion engine.
+// Inlined here so the candidate-halo layer can recompute without a
+// network round trip.
+function _haversineKm(a, b) {
+  const R = 6371.0;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const la1 = toRad(a.lat), la2 = toRad(b.lat);
+  const dla = toRad(b.lat - a.lat);
+  const dlo = toRad(b.lon - a.lon);
+  const h = Math.sin(dla / 2) ** 2 +
+            Math.cos(la1) * Math.cos(la2) * Math.sin(dlo / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
 // Sentinel-1 SAR overlay — Phase 4.x.
 // Scenes = footprint polygons (semi-transparent fill, color by state).
 // Detections = vessel returns from the CFAR detector. Red ≈ dark-vessel
@@ -374,6 +401,46 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
       });
     };
 
+    // Candidate-hull halos — yellow rings around the AIS-cooperative
+    // vessels within 5 km of the selected anomaly. One ring layer + one
+    // pulse layer (the pulse is animated via setPaintProperty in a
+    // separate effect, but a static fallback ring is drawn so the halo
+    // is still visible if the animation never runs).
+    const ensureCandidateLayers = () => {
+      if (map.getSource(CANDIDATES_SOURCE_ID)) return;
+      map.addSource(CANDIDATES_SOURCE_ID, {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      // Outer pulse ring — larger, animated opacity. Sits BELOW the
+      // sharp inner ring so the pulse glow doesn't wash out the edge.
+      map.addLayer({
+        id: CANDIDATES_PULSE_LAYER_ID,
+        type: "circle",
+        source: CANDIDATES_SOURCE_ID,
+        paint: {
+          "circle-color": "rgba(0,0,0,0)",
+          "circle-radius": 20,
+          "circle-stroke-color": "#f0c930",
+          "circle-stroke-width": 1.0,
+          "circle-stroke-opacity": 0.35,
+        },
+      });
+      // Inner sharp ring — fixed.
+      map.addLayer({
+        id: CANDIDATES_LAYER_ID,
+        type: "circle",
+        source: CANDIDATES_SOURCE_ID,
+        paint: {
+          "circle-color": "rgba(0,0,0,0)",
+          "circle-radius": 11,
+          "circle-stroke-color": "#f0c930",
+          "circle-stroke-width": 2,
+          "circle-stroke-opacity": 0.9,
+        },
+      });
+    };
+
     // SAR scene footprints + detections. Same lifecycle as the track
     // layers — re-attached on every style.load (including basemap swaps).
     const ensureSarLayers = () => {
@@ -568,6 +635,7 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
       }
     };
     map.on("style.load", ensureTrackLayers);
+    map.on("style.load", ensureCandidateLayers);
     map.on("style.load", ensureSarLayers);
 
     // Click → popup. Detections are densely packed so attach to the
@@ -1002,6 +1070,65 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
 
     return () => ctrl.abort();
   }, [selectedId, ready, entitiesById, cfg]);
+
+  // ------------------------------------------------------------------
+  // Candidate-hull halos: when an anomaly is selected, ring the 5-km
+  // neighborhood of cooperative AIS vessels on the map. Matches the
+  // "Nearby candidate hulls" side-panel rows so the operator sees the
+  // investigation spatially. Effect resets when:
+  //   - selectedId changes (new anomaly → new candidates)
+  //   - renderEntities changes (live AIS observations may have moved
+  //     a vessel into or out of the radius)
+  //   - selection is NOT an anomaly (e.g. user clicked a cooperative
+  //     vessel) → halos cleared.
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const src = map.getSource(CANDIDATES_SOURCE_ID);
+    if (!src) return;
+
+    if (!selectedId) {
+      src.setData({ type: "FeatureCollection", features: [] });
+      return;
+    }
+    const sel = entitiesById.get(selectedId);
+    if (!sel || !SUSPECT_TYPES_MAP.has(sel.type)) {
+      src.setData({ type: "FeatureCollection", features: [] });
+      return;
+    }
+    if (typeof sel.lon !== "number" || typeof sel.lat !== "number") {
+      src.setData({ type: "FeatureCollection", features: [] });
+      return;
+    }
+
+    const origin = { lon: sel.lon, lat: sel.lat };
+    const rows = [];
+    for (const e of renderEntities) {
+      if (e.id === sel.id) continue;
+      if (e.type !== "vessel" && e.type !== "ais_gap") continue;
+      if (typeof e.lon !== "number" || typeof e.lat !== "number") continue;
+      const d = _haversineKm(origin, { lon: e.lon, lat: e.lat });
+      if (d > CANDIDATE_RADIUS_KM) continue;
+      rows.push({ ent: e, d });
+    }
+    rows.sort((a, b) => a.d - b.d);
+    const top = rows.slice(0, CANDIDATE_MAX);
+
+    src.setData({
+      type: "FeatureCollection",
+      features: top.map(({ ent, d }) => ({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: [ent.lon, ent.lat] },
+        properties: {
+          id: ent.id,
+          mmsi: ent.mmsi || null,
+          name: ent.name || null,
+          distance_km: d,
+        },
+      })),
+    });
+  }, [selectedId, ready, entitiesById, renderEntities]);
 
   // ------------------------------------------------------------------
   // SAR overlay: fetch when toggled on (or never if off). Cheap to
