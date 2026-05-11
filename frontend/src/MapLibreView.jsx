@@ -225,6 +225,18 @@ const FIRE_ASSETS_SOURCE_ID = "ss-fire-assets";
 const FIRE_ASSETS_LAYER_ID = "ss-fire-assets-point";
 const FIRE_ASSETS_LABEL_LAYER_ID = "ss-fire-assets-label";
 
+// Phase 6.2 — PSPS / WUI / smoke / history wildfire prevention layers.
+const PSPS_SOURCE_ID = "ss-psps";
+const PSPS_FILL_LAYER_ID = "ss-psps-fill";
+const PSPS_LINE_LAYER_ID = "ss-psps-line";
+const WUI_SOURCE_ID = "ss-wui";
+const WUI_POINT_LAYER_ID = "ss-wui-point";
+const WUI_LABEL_LAYER_ID = "ss-wui-label";
+const SMOKE_SOURCE_ID = "ss-smoke";
+const SMOKE_FILL_LAYER_ID = "ss-smoke-fill";
+const HISTORY_SOURCE_ID = "ss-history";
+const HISTORY_FILL_LAYER_ID = "ss-history-fill";
+
 // Refresh cadence for wildfire feeds — backend caches data on a 5-min
 // cycle so the client polls slightly less aggressively.
 const WILDFIRE_POLL_MS = 90 * 1000;
@@ -1910,6 +1922,129 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
           },
         });
       }
+      // Historical fire perimeters (3-year, ≥1000 acres) — drawn
+      // FIRST so they sit below every other layer.
+      if (!map.getSource(HISTORY_SOURCE_ID)) {
+        map.addSource(HISTORY_SOURCE_ID, {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+        map.addLayer({
+          id: HISTORY_FILL_LAYER_ID,
+          type: "fill",
+          source: HISTORY_SOURCE_ID,
+          paint: {
+            "fill-color": "#7a4a2a",
+            "fill-opacity": 0.18,
+            "fill-outline-color": "#5a3520",
+          },
+        }, RISK_GRID_LAYER_ID);
+      }
+      // PSPS shutoff polygons — red cross-hatched fill.
+      if (!map.getSource(PSPS_SOURCE_ID)) {
+        map.addSource(PSPS_SOURCE_ID, {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+        map.addLayer({
+          id: PSPS_FILL_LAYER_ID,
+          type: "fill",
+          source: PSPS_SOURCE_ID,
+          paint: {
+            "fill-color": [
+              "match", ["get", "status"],
+              "active",    "#ff3a3a",
+              "scheduled", "#ff8a3a",
+              "standby",   "#ffd040",
+              "#a8a8b8",
+            ],
+            "fill-opacity": 0.14,
+          },
+        });
+        map.addLayer({
+          id: PSPS_LINE_LAYER_ID,
+          type: "line",
+          source: PSPS_SOURCE_ID,
+          paint: {
+            "line-color": [
+              "match", ["get", "status"],
+              "active",    "#ff5c5c",
+              "scheduled", "#ffa05c",
+              "standby",   "#ffd87a",
+              "#a8a8b8",
+            ],
+            "line-width": 1.4,
+            "line-dasharray": [2, 1],
+          },
+        });
+      }
+      // WUI community points — sized + colored by tier.
+      if (!map.getSource(WUI_SOURCE_ID)) {
+        map.addSource(WUI_SOURCE_ID, {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+        map.addLayer({
+          id: WUI_POINT_LAYER_ID,
+          type: "circle",
+          source: WUI_SOURCE_ID,
+          paint: {
+            "circle-color": [
+              "match", ["get", "tier"],
+              "extreme",  "#c43b3b",
+              "high",     "#ff8a3a",
+              "elevated", "#f0c930",
+              "normal",   "#5fd093",
+              "#a8a8b8",
+            ],
+            "circle-radius": [
+              "interpolate", ["linear"],
+              ["coalesce", ["get", "pop"], 1],
+              0,    4,
+              50,   7,
+              200,  10,
+            ],
+            "circle-opacity": 0.8,
+            "circle-stroke-color": "#040810",
+            "circle-stroke-width": 1.2,
+          },
+        });
+        map.addLayer({
+          id: WUI_LABEL_LAYER_ID,
+          type: "symbol",
+          source: WUI_SOURCE_ID,
+          minzoom: 5,
+          layout: {
+            "text-field": ["get", "name"],
+            "text-font": ["Open Sans Regular"],
+            "text-size": 10,
+            "text-anchor": "top",
+            "text-offset": [0, 1.0],
+          },
+          paint: {
+            "text-color": "#f0f4ff",
+            "text-halo-color": "#040810",
+            "text-halo-width": 1.4,
+          },
+        });
+      }
+      // Smoke plumes — gray translucent wedges downwind of incidents.
+      if (!map.getSource(SMOKE_SOURCE_ID)) {
+        map.addSource(SMOKE_SOURCE_ID, {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+        map.addLayer({
+          id: SMOKE_FILL_LAYER_ID,
+          type: "fill",
+          source: SMOKE_SOURCE_ID,
+          paint: {
+            "fill-color": "#a8a8b8",
+            "fill-opacity": 0.18,
+            "fill-outline-color": "#666",
+          },
+        }, NIFC_INCIDENT_LAYER_ID);  // below incident points
+      }
       // Fire-asset positions (CAL FIRE ACCs, USFS, etc)
       if (!map.getSource(FIRE_ASSETS_SOURCE_ID)) {
         map.addSource(FIRE_ASSETS_SOURCE_ID, {
@@ -3048,6 +3183,10 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
       STRIKE_LAYER_ID,
       PREPOSITION_POINT_LAYER_ID, PREPOSITION_LINE_LAYER_ID, PREPOSITION_LABEL_LAYER_ID,
       FIRE_ASSETS_LAYER_ID, FIRE_ASSETS_LABEL_LAYER_ID,
+      HISTORY_FILL_LAYER_ID,
+      PSPS_FILL_LAYER_ID, PSPS_LINE_LAYER_ID,
+      WUI_POINT_LAYER_ID, WUI_LABEL_LAYER_ID,
+      SMOKE_FILL_LAYER_ID,
     ];
     for (const lid of wildfireLayers) {
       if (map.getLayer(lid)) {
@@ -3068,20 +3207,28 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
       // Fire all five fetches in parallel; each handles its own errors.
       const safeFetch = (url) =>
         fetch(`${API_BASE}${url}`).then((r) => r.ok ? r.json() : null).catch(() => null);
-      const [inc, rfw, risk, lit, pre, ast] = await Promise.all([
+      const [inc, rfw, risk, lit, pre, ast, psps, wui, smoke, hist] = await Promise.all([
         safeFetch("/wildfire/incidents"),
         safeFetch("/wildfire/red_flag"),
         safeFetch("/wildfire/risk_grid"),
         safeFetch("/wildfire/lightning"),
         safeFetch("/wildfire/preposition"),
         safeFetch("/wildfire/assets"),
+        safeFetch("/wildfire/psps"),
+        safeFetch("/wildfire/wui"),
+        safeFetch("/wildfire/smoke"),
+        safeFetch("/wildfire/history"),
       ]);
       if (cancelled) return;
-      if (inc)  setSrc(NIFC_SOURCE_ID, inc);
-      if (rfw)  setSrc(RFW_SOURCE_ID, rfw);
-      if (risk) setSrc(RISK_GRID_SOURCE_ID, risk);
-      if (lit)  setSrc(STRIKE_SOURCE_ID, lit);
-      if (ast)  setSrc(FIRE_ASSETS_SOURCE_ID, ast);
+      if (inc)   setSrc(NIFC_SOURCE_ID, inc);
+      if (rfw)   setSrc(RFW_SOURCE_ID, rfw);
+      if (risk)  setSrc(RISK_GRID_SOURCE_ID, risk);
+      if (lit)   setSrc(STRIKE_SOURCE_ID, lit);
+      if (ast)   setSrc(FIRE_ASSETS_SOURCE_ID, ast);
+      if (psps)  setSrc(PSPS_SOURCE_ID, psps);
+      if (wui)   setSrc(WUI_SOURCE_ID, wui);
+      if (smoke) setSrc(SMOKE_SOURCE_ID, smoke);
+      if (hist)  setSrc(HISTORY_SOURCE_ID, hist);
       // For preposition: emit both Points (the staging coords) AND
       // LineStrings (from each staging coord back to the nearest
       // fire asset) so the operator sees the gap visually.

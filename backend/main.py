@@ -247,6 +247,11 @@ _wildfire_cache = {
     "risk_grid": [],           # Per-cell HDW samples
     "lightning": [],           # Last-hour strikes
     "preposition": [],         # Recommended staging points
+    "psps": [],                # Active utility PSPS zones
+    "wui": [],                 # Scored WUI communities
+    "smoke": [],               # Modeled smoke plume polygons
+    "history": [],             # 3-year historical perimeters (refreshed daily)
+    "history_last_refresh": None,
     "last_refresh_at": None,
 }
 
@@ -310,6 +315,46 @@ async def _wildfire_refresh_loop(cancel: asyncio.Event) -> None:
                          len(_wildfire_cache["preposition"]))
             except Exception as exc:  # noqa: BLE001
                 log.warning("preposition refresh crashed (continuing): %s", exc)
+            try:
+                # PSPS catalog is curated — just publish it. Real
+                # IOU feeds (when wired) would refresh here.
+                import psps
+                _wildfire_cache["psps"] = psps.list_zones()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("PSPS refresh crashed (continuing): %s", exc)
+            try:
+                # WUI communities scored against the live HDW grid.
+                from wildfire_wui import score_communities
+                _wildfire_cache["wui"] = await asyncio.to_thread(
+                    score_communities, _wildfire_cache["risk_grid"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("WUI refresh crashed (continuing): %s", exc)
+            try:
+                # Smoke plumes per active incident.
+                from wildfire_smoke import compute_plumes
+                _wildfire_cache["smoke"] = await asyncio.to_thread(
+                    compute_plumes, _wildfire_cache["incidents"],
+                )
+                log.info("wildfire refresh: %d smoke plumes",
+                         len(_wildfire_cache["smoke"]))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("smoke plume refresh crashed (continuing): %s", exc)
+            # Historical perimeters — refreshed at most once per 24h
+            # since the data only changes when a fire wraps up.
+            try:
+                from datetime import timedelta as _td
+                now = datetime.now(timezone.utc)
+                last = _wildfire_cache["history_last_refresh"]
+                if last is None or (now - last) > _td(hours=24):
+                    import nifc_history
+                    _wildfire_cache["history"] = await asyncio.to_thread(
+                        nifc_history.fetch_historical_perimeters)
+                    _wildfire_cache["history_last_refresh"] = now
+                    log.info("wildfire refresh: %d historical perimeters",
+                             len(_wildfire_cache["history"]))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("history refresh crashed (continuing): %s", exc)
             _wildfire_cache["last_refresh_at"] = datetime.now(
                 timezone.utc).isoformat()
         first_delay = WILDFIRE_REFRESH_INTERVAL_S
@@ -1819,6 +1864,113 @@ def wildfire_incidents():
         "n_incidents": len(features),
         "last_refresh_at": _wildfire_cache["last_refresh_at"],
     }
+
+
+@app.get("/wildfire/psps")
+def wildfire_psps():
+    """Active / scheduled / standby PSPS shutoff zones from CA IOUs.
+
+    Polygon GeoJSON with utility, status, start/end, customers
+    affected, and the NWS-driven reason. Frontend renders as red
+    cross-hatched fill; toast when a zone is newly active."""
+    features = []
+    for z in _wildfire_cache["psps"]:
+        geom = z.get("geometry")
+        if not geom:
+            continue
+        features.append({
+            "type": "Feature",
+            "geometry": geom,
+            "properties": {
+                "zone_id":  z["zone_id"],
+                "utility":  z["utility"],
+                "name":     z["name"],
+                "status":   z["status"],
+                "starts_at": z["starts_at"],
+                "ends_at":  z["ends_at"],
+                "customers_affected": z["customers_affected"],
+                "reason":   z["reason"],
+            },
+        })
+    return {"type": "FeatureCollection", "features": features,
+            "n_zones": len(features),
+            "last_refresh_at": _wildfire_cache["last_refresh_at"]}
+
+
+@app.get("/wildfire/wui")
+def wildfire_wui():
+    """Scored WUI communities — top of the list = highest exposure
+    given today's HDW conditions. Frontend renders as points colored
+    by tier (extreme / high / elevated / normal) sized by population."""
+    features = []
+    for c in _wildfire_cache["wui"]:
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Point",
+                         "coordinates": [c["lon"], c["lat"]]},
+            "properties": {
+                "name":       c["name"],
+                "state":      c["state"],
+                "county":     c["county"],
+                "pop":        c["pop"],
+                "structures": c["structures"],
+                "history":    c["history"],
+                "score":      c["score"],
+                "max_nearby_hdw_risk": c["max_nearby_hdw_risk"],
+                "tier":       c["tier"],
+            },
+        })
+    return {"type": "FeatureCollection", "features": features,
+            "n_communities": len(features),
+            "last_refresh_at": _wildfire_cache["last_refresh_at"]}
+
+
+@app.get("/wildfire/smoke")
+def wildfire_smoke():
+    """Modeled smoke plume polygons projected downwind from active
+    NIFC incidents. Wedge geometry sized by incident acres × wind
+    speed. Replaceable with NOAA HRRR-Smoke when wired."""
+    features = []
+    for p in _wildfire_cache["smoke"]:
+        features.append({
+            "type": "Feature",
+            "geometry": p["geometry"],
+            "properties": {
+                "incident_id":      p["incident_id"],
+                "incident_name":    p["incident_name"],
+                "bearing_from_deg": p["bearing_from_deg"],
+                "wind_speed_ms":    p["wind_speed_ms"],
+                "length_km":        p["length_km"],
+                "size_acres":       p["size_acres"],
+            },
+        })
+    return {"type": "FeatureCollection", "features": features,
+            "n_plumes": len(features),
+            "last_refresh_at": _wildfire_cache["last_refresh_at"]}
+
+
+@app.get("/wildfire/history")
+def wildfire_history():
+    """3-year NIFC interagency historical perimeters (≥1000 acres)
+    in the Western US AOI. Frontend renders as a faded brown polygon
+    fill so the operator sees which areas have NOT burned recently
+    (highest fuel load)."""
+    features = []
+    for h in _wildfire_cache["history"]:
+        features.append({
+            "type": "Feature",
+            "geometry": h["geometry"],
+            "properties": {
+                "fire_name": h["fire_name"],
+                "fire_year": h["fire_year"],
+                "acres":     h["acres"],
+                "agency":    h["agency"],
+            },
+        })
+    return {"type": "FeatureCollection", "features": features,
+            "n_perimeters": len(features),
+            "last_refresh_at": _wildfire_cache["history_last_refresh"].isoformat()
+                if _wildfire_cache["history_last_refresh"] else None}
 
 
 @app.get("/wildfire/assets")

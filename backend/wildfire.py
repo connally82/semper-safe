@@ -42,6 +42,66 @@ HOTSPOT_CLUSTER_KM = 1.0
 SMOKE_HOTSPOT_RADIUS_KM = 5.0
 SMOKE_HOTSPOT_WINDOW = timedelta(minutes=30)
 
+# Lightning-ignition fusion. A fresh thermal pixel inside this radius
+# of a recent CG strike + inside a high-HDW cell is the textbook
+# "dry-lightning starts" signal — promote to LIGHTNING_IGNITION_RISK
+# with elevated priority. The engine pulls the lightning strike list
+# and risk grid from main._wildfire_cache at fusion time.
+LIGHTNING_FUSION_RADIUS_KM = 10.0
+LIGHTNING_FUSION_WINDOW = timedelta(hours=3)
+LIGHTNING_FUSION_RISK_THRESHOLD = 0.5    # HDW risk_score floor
+
+
+def _lightning_near(lon: float, lat: float, t: datetime) -> dict | None:
+    """Return the closest recent lightning strike within fusion bounds,
+    or None. Lazy-imports main to avoid an import cycle."""
+    try:
+        from main import _wildfire_cache
+    except Exception:  # noqa: BLE001
+        return None
+    strikes = _wildfire_cache.get("lightning") or []
+    cutoff = t - LIGHTNING_FUSION_WINDOW
+    best, best_km = None, float("inf")
+    for s in strikes:
+        try:
+            s_t = datetime.fromisoformat(s["t"])
+        except Exception:  # noqa: BLE001
+            continue
+        if s_t < cutoff:
+            continue
+        d = haversine_km(
+            Geom(lon=lon, lat=lat),
+            Geom(lon=s["lon"], lat=s["lat"]),
+        )
+        if d < best_km and d <= LIGHTNING_FUSION_RADIUS_KM:
+            best, best_km = s, d
+    return best
+
+
+def _hdw_risk_at(lon: float, lat: float) -> float:
+    """Return the HDW risk_score at the nearest grid cell."""
+    try:
+        from main import _wildfire_cache
+    except Exception:  # noqa: BLE001
+        return 0.0
+    cells = _wildfire_cache.get("risk_grid") or []
+    if not cells:
+        return 0.0
+    best, best_km = 0.0, float("inf")
+    for c in cells:
+        d = haversine_km(
+            Geom(lon=lon, lat=lat),
+            Geom(lon=c["lon"], lat=c["lat"]),
+        )
+        if d < best_km:
+            best = c.get("risk_score") or 0.0
+            best_km = d
+    return best
+
+
+# (Geom is already imported at top.)
+
+
 # Known false-positive sources (industrial flares, gas wells, kilns).
 # In production this is a curated geospatial layer; here, two examples.
 KNOWN_FP_SOURCES: list[tuple[float, float, float, str]] = [
@@ -138,6 +198,55 @@ class WildfireFusion:
                              "method": "thermal_cluster"},
                 )
             store.put_entity(ent, domain=DOMAIN)
+            return ent
+
+        # Before creating a plain HOTSPOT, check whether this thermal
+        # detection co-occurs with a recent CG lightning strike inside
+        # a high-HDW cell. If so, this is the textbook dry-lightning
+        # ignition signal — promote straight to LIGHTNING_IGNITION_RISK
+        # so the operator's prepositioning happens BEFORE the fire
+        # gets persistent enough to read as FIRE_EVENT.
+        strike = _lightning_near(obs.geom.lon, obs.geom.lat, obs.t)
+        hdw_risk = _hdw_risk_at(obs.geom.lon, obs.geom.lat)
+        if strike is not None and hdw_risk >= LIGHTNING_FUSION_RISK_THRESHOLD:
+            eid = f"fire_{uuid.uuid4().hex[:10]}"
+            ent = Entity(
+                entity_id=eid,
+                type=EntityType.LIGHTNING_IGNITION_RISK,
+                geom=obs.geom,
+                last_seen=obs.t,
+                first_seen=obs.t,
+                confidence=0.72,
+                priority_score=0.82,   # high — pre-emptive dispatch worthy
+                observation_ids=[obs.obs_id],
+                attrs={
+                    "frp_mw":           obs.attrs.get("frp_mw"),
+                    "scan_pixel_size_m": obs.attrs.get("pixel_size", 375),
+                    "lightning_strike": strike,
+                    "hdw_risk_score":   hdw_risk,
+                },
+                notes=(
+                    f"Thermal detection co-located with CG strike "
+                    f"({strike.get('polarity', '?')}, "
+                    f"{strike.get('amplitude_ka', '?')} kA) at "
+                    f"{strike.get('t', '?')}. HDW risk_score={hdw_risk:.2f}. "
+                    f"Dry-lightning ignition signature — preposition "
+                    f"before persistence."
+                ),
+            )
+            self.entities[eid] = ent
+            store.put_entity(ent, domain=DOMAIN)
+            audit_log.append(
+                actor="system",
+                event_type="entity_created",
+                payload={
+                    "entity_id": eid,
+                    "type": "lightning_ignition_risk",
+                    "via": obs.source.value,
+                    "strike_t": strike.get("t"),
+                    "hdw_risk": hdw_risk,
+                },
+            )
             return ent
 
         # New hotspot — single detection, low priority until corroborated
