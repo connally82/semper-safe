@@ -194,6 +194,14 @@ const ASSETS_LAYER_ID = "ss-onshore-assets-layer";
 const ASSETS_LABEL_LAYER_ID = "ss-onshore-assets-label";
 const ASSETS_STORAGE_KEY = "ss-onshore-assets";
 
+// Sanctions cross-reference — bulk-fetched catalog of MMSI/IMO entries
+// on OFAC SDN / UK OFSI / EU sanctions lists. Built into a per-MMSI
+// Map at fetch time so the marker render loop does O(1) lookups.
+// Vessels matching get a red SANCTIONED ring + map-side badge.
+const SANCTIONS_SOURCE_ID = "ss-sanctioned";
+const SANCTIONS_RING_LAYER_ID = "ss-sanctioned-ring";
+const SANCTIONS_LABEL_LAYER_ID = "ss-sanctioned-label";
+
 // Watchlist — operator marks specific MMSIs as "watch closely".
 // Tracked in localStorage so it survives sessions. Watchlisted entities
 // get a gold pulse ring on the map and fire a toast every time they
@@ -629,6 +637,32 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
     catch {}
   };
 
+  // Sanctioned MMSI lookup — fetched once on mount. Stored as a Map
+  // keyed by MMSI (also indexes by IMO if present) so the entities
+  // render loop hits O(1) per check. Refreshed every 6h in case the
+  // server-side list changes via a SDN feed update.
+  const [sanctionsByMmsi, setSanctionsByMmsi] = useState(new Map());
+  useEffect(() => {
+    let cancelled = false;
+    const pull = () => {
+      fetch(`${API_BASE}/maritime/sanctions`)
+        .then((r) => r.ok ? r.json() : null)
+        .then((data) => {
+          if (cancelled || !data) return;
+          const m = new Map();
+          for (const v of (data.vessels || [])) {
+            if (v.mmsi) m.set(v.mmsi, v);
+            if (v.imo) m.set(`imo:${v.imo}`, v);
+          }
+          setSanctionsByMmsi(m);
+        })
+        .catch(() => {});
+    };
+    pull();
+    const id = window.setInterval(pull, 6 * 60 * 60 * 1000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, []);
+
   // Watchlist — set of MMSI strings the operator has marked. Loaded
   // from localStorage. Add/remove via the WATCH button in Workbench
   // (dispatched via a window event so MapLibreView and Workbench can
@@ -781,6 +815,71 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
     } catch {}
   };
   const [savedAoisPickerOpen, setSavedAoisPickerOpen] = useState(false);
+
+  // Saved views — snapshot of {map center+zoom, basemap, layer
+  // toggles}. Persisted to localStorage. Operator can save the
+  // current view state with a name, then recall it later with one
+  // click. Independent of selection / pinned entity (those are
+  // operational state, not view state).
+  const SAVED_VIEWS_STORAGE_KEY = "ss-saved-views";
+  const SAVED_VIEWS_MAX = 12;
+  const [savedViews, setSavedViews] = useState(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = window.localStorage.getItem(SAVED_VIEWS_STORAGE_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch { return []; }
+  });
+  const persistSavedViews = (next) => {
+    setSavedViews(next);
+    try {
+      window.localStorage.setItem(SAVED_VIEWS_STORAGE_KEY, JSON.stringify(next));
+    } catch {}
+  };
+  const [savedViewsPickerOpen, setSavedViewsPickerOpen] = useState(false);
+
+  const captureView = () => {
+    const map = mapRef.current;
+    if (!map) return null;
+    const c = map.getCenter();
+    return {
+      center: [c.lng, c.lat],
+      zoom: map.getZoom(),
+      bearing: map.getBearing(),
+      pitch: map.getPitch(),
+      basemap,
+      showSar,
+      showS2,
+      showBuoys,
+      goesMode,
+      viirsMode,
+      heatmapOn,
+      workloadOn,
+      assetsOn,
+      trailWindow,
+    };
+  };
+  const applyView = (v) => {
+    const map = mapRef.current;
+    if (!map || !v) return;
+    if (Array.isArray(v.center) && typeof v.zoom === "number") {
+      map.flyTo({
+        center: v.center, zoom: v.zoom,
+        bearing: v.bearing || 0, pitch: v.pitch || 0,
+        duration: 800,
+      });
+    }
+    if (v.basemap && BASEMAPS[v.basemap]) setBasemap(v.basemap);
+    if (typeof v.showSar === "boolean") setShowSar(v.showSar);
+    if (typeof v.showS2 === "boolean") setShowS2(v.showS2);
+    if (typeof v.showBuoys === "boolean") setShowBuoys(v.showBuoys);
+    if (typeof v.goesMode === "string") setGoesMode(v.goesMode);
+    if (typeof v.viirsMode === "string") setViirsMode(v.viirsMode);
+    if (typeof v.heatmapOn === "boolean") persistHeatmap(v.heatmapOn);
+    if (typeof v.workloadOn === "boolean") persistWorkload(v.workloadOn);
+    if (typeof v.assetsOn === "boolean") persistAssets(v.assetsOn);
+    if (["1h", "6h", "24h"].includes(v.trailWindow)) persistTrailWindow(v.trailWindow);
+  };
   // Ref mirrors so map event listeners (set up once) can read fresh state.
   const aoiModeRef = useRef(aoiMode);
   const aoiPointsRef = useRef(aoiPoints);
@@ -1550,8 +1649,51 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
       });
     };
 
+    // Sanctioned ring + label — drawn on top of all other markers so
+    // a red SANCTIONED ring is never occluded. Uses a thicker outer
+    // stroke than the watchlist ring so they coexist visually.
+    const ensureSanctionLayers = () => {
+      if (map.getSource(SANCTIONS_SOURCE_ID)) return;
+      map.addSource(SANCTIONS_SOURCE_ID, {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      map.addLayer({
+        id: SANCTIONS_RING_LAYER_ID,
+        type: "circle",
+        source: SANCTIONS_SOURCE_ID,
+        paint: {
+          "circle-color": "rgba(0,0,0,0)",
+          "circle-radius": 18,
+          "circle-stroke-color": "#ff3a3a",
+          "circle-stroke-width": 2.5,
+          "circle-stroke-opacity": 0.95,
+        },
+      });
+      map.addLayer({
+        id: SANCTIONS_LABEL_LAYER_ID,
+        type: "symbol",
+        source: SANCTIONS_SOURCE_ID,
+        layout: {
+          "text-field": "SANCTIONED",
+          "text-font": ["Open Sans Regular"],
+          "text-size": 9,
+          "text-anchor": "bottom",
+          "text-offset": [0, -1.5],
+          "text-letter-spacing": 0.2,
+          "text-allow-overlap": false,
+        },
+        paint: {
+          "text-color": "#ff8080",
+          "text-halo-color": "#040810",
+          "text-halo-width": 1.6,
+        },
+      });
+    };
+
     map.on("style.load", ensureActiveDispatchLayers);
     map.on("style.load", ensureWatchlistLayers);
+    map.on("style.load", ensureSanctionLayers);
     map.on("style.load", ensureSarLayers);
 
     // Click → popup. Detections are densely packed so attach to the
@@ -2545,6 +2687,36 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
   }, [renderEntities, heatmapOn, ready]);
 
   // ------------------------------------------------------------------
+  // Sanctioned rings — every entity whose MMSI matches the OFAC/UK/EU
+  // catalog gets a red SANCTIONED ring on top of all other markers.
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const src = map.getSource(SANCTIONS_SOURCE_ID);
+    if (!src) return;
+    if (sanctionsByMmsi.size === 0) {
+      src.setData({ type: "FeatureCollection", features: [] });
+      return;
+    }
+    const features = [];
+    for (const e of renderEntities) {
+      const m = e.mmsi;
+      if (!m || !sanctionsByMmsi.has(m)) continue;
+      if (typeof e.lon !== "number" || typeof e.lat !== "number") continue;
+      features.push({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: [e.lon, e.lat] },
+        properties: {
+          entity_id: e.id,
+          mmsi: m,
+        },
+      });
+    }
+    src.setData({ type: "FeatureCollection", features });
+  }, [sanctionsByMmsi, renderEntities, ready]);
+
+  // ------------------------------------------------------------------
   // Watchlist rings — every entity whose MMSI is on the watchlist
   // gets a gold ring + 'WATCH' label, drawn on top of all other
   // markers. Re-renders on entities change AND watchlist change.
@@ -3421,6 +3593,140 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
         </div>
       )}
 
+      {/* Saved-views picker — bookmark current zoom + toggles + basemap
+          as a named view. Sits below the AOI picker on the left edge. */}
+      <div style={{
+        position: "absolute",
+        top: aoiMode === "fixed" && aoiPoints.length >= 3
+          ? (savedAois.length > 0 ? 140 : 140)
+          : (savedAois.length > 0 ? 60 : 52),
+        left: 12,
+        background: "rgba(4,8,16,0.86)",
+        border: "1px solid rgba(255,255,255,0.18)",
+        borderRadius: 4,
+        padding: "6px 8px",
+        fontFamily: "'IBM Plex Mono', monospace",
+        fontSize: 10,
+        color: "rgba(255,255,255,0.85)",
+        zIndex: 2,
+        minWidth: 160,
+      }}>
+        <div style={{ display: "flex", gap: 4 }}>
+          <button
+            type="button"
+            disabled={savedViews.length >= SAVED_VIEWS_MAX}
+            onClick={() => {
+              const v = captureView();
+              if (!v) return;
+              const name = window.prompt(
+                `Name this view (e.g. "morning watch", "Galveston approach"):`,
+                `View ${savedViews.length + 1}`);
+              if (!name) return;
+              const next = [...savedViews, {
+                id: `view_${Date.now()}`,
+                name: name.slice(0, 32),
+                created_at: new Date().toISOString(),
+                ...v,
+              }];
+              persistSavedViews(next);
+            }}
+            title={savedViews.length >= SAVED_VIEWS_MAX
+              ? "Limit reached — delete a saved view to add another"
+              : "Save current view (zoom, layers, basemap)"}
+            style={{
+              flex: 1,
+              appearance: "none",
+              background: "rgba(255,255,255,0.04)",
+              border: "1px solid rgba(255,255,255,0.18)",
+              color: "rgba(255,255,255,0.85)",
+              fontFamily: "inherit",
+              fontSize: 9,
+              letterSpacing: "0.16em",
+              padding: "3px 6px",
+              cursor: savedViews.length >= SAVED_VIEWS_MAX ? "default" : "pointer",
+              textTransform: "uppercase",
+              borderRadius: 2,
+              opacity: savedViews.length >= SAVED_VIEWS_MAX ? 0.5 : 1,
+            }}
+          >
+            💾 save view
+          </button>
+          {savedViews.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setSavedViewsPickerOpen(o => !o)}
+              title={`${savedViews.length} saved view${savedViews.length === 1 ? "" : "s"}`}
+              style={{
+                appearance: "none",
+                background: savedViewsPickerOpen ? "rgba(95,208,147,0.18)" : "transparent",
+                border: "1px solid rgba(255,255,255,0.18)",
+                color: "rgba(255,255,255,0.7)",
+                fontFamily: "inherit",
+                fontSize: 9,
+                letterSpacing: "0.16em",
+                padding: "3px 6px",
+                cursor: "pointer",
+                borderRadius: 2,
+              }}
+            >
+              📁 {savedViews.length}
+            </button>
+          )}
+        </div>
+        {savedViewsPickerOpen && savedViews.length > 0 && (
+          <div style={{ marginTop: 6, display: "flex",
+                        flexDirection: "column", gap: 2 }}>
+            {savedViews.map((v) => (
+              <div key={v.id} style={{ display: "flex", gap: 4 }}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    applyView(v);
+                    setSavedViewsPickerOpen(false);
+                  }}
+                  style={{
+                    flex: 1,
+                    appearance: "none",
+                    background: "rgba(255,255,255,0.04)",
+                    border: "1px solid rgba(255,255,255,0.15)",
+                    color: "#f0f4ff",
+                    fontFamily: "inherit",
+                    fontSize: 10,
+                    padding: "3px 6px",
+                    cursor: "pointer",
+                    textAlign: "left",
+                    borderRadius: 2,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                  title={`zoom ${(v.zoom || 0).toFixed(1)} · ${v.basemap}`}
+                >
+                  ↺ {v.name}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => persistSavedViews(
+                    savedViews.filter((x) => x.id !== v.id))}
+                  title="Delete saved view"
+                  style={{
+                    appearance: "none",
+                    background: "transparent",
+                    border: "1px solid rgba(255,255,255,0.15)",
+                    color: "rgba(255,255,255,0.5)",
+                    fontFamily: "inherit",
+                    fontSize: 10,
+                    padding: "3px 6px",
+                    cursor: "pointer",
+                    borderRadius: 2,
+                  }}
+                >×</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
       {/* Saved-AOIs picker — small floating menu below the AOI toggle.
           Always present when there's >= 1 saved preset, regardless of
           current draw state, so the operator can recall a saved view
@@ -3554,6 +3860,8 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
           }}
         />
       )}
+
+      <HandoffModal apiBase={API_BASE} />
 
       {/* Toast stream — top-right corner. Transient cards announcing
           new anomaly transitions (vessel → dark_vessel etc). Auto-dismiss
@@ -3840,6 +4148,33 @@ function AnomalyBanner({ entities, cfg, onZoomTo }) {
       >
         ⬇ pdf
       </button>
+      <button
+        type="button"
+        onClick={() => {
+          // Fire a window event the host component listens for —
+          // opens the HandoffModal with the latest data.
+          try {
+            window.dispatchEvent(new CustomEvent("ss-open-handoff"));
+          } catch {}
+        }}
+        title="Generate a watch-turnover handoff log for the relieving operator"
+        style={{
+          appearance: "none",
+          background: "rgba(255,255,255,0.04)",
+          border: "1px solid rgba(255,255,255,0.3)",
+          color: "#f0f4ff",
+          borderRadius: 3,
+          padding: "4px 8px",
+          cursor: "pointer",
+          textTransform: "uppercase",
+          fontFamily: "'IBM Plex Mono', monospace",
+          fontSize: 10,
+          letterSpacing: "0.12em",
+          fontWeight: 600,
+        }}
+      >
+        ⇆ handoff
+      </button>
     </div>
   );
 }
@@ -3893,6 +4228,165 @@ function _downloadAnomaliesCsv(entities, anomalyTypes) {
   // Free the object-URL on the next tick — safe since the browser
   // already initiated the download.
   setTimeout(() => URL.revokeObjectURL(url), 250);
+}
+
+// HandoffModal — operator-to-operator shift turnover note. Listens
+// for a 'ss-open-handoff' window event (fired by the ⇆ HANDOFF chip
+// in the anomaly banner), fetches the latest /maritime/handoff
+// markdown, shows it in a centered modal with two actions: COPY to
+// clipboard, or DOWNLOAD as .md. Closes on ESC or backdrop click.
+function HandoffModal({ apiBase }) {
+  const [open, setOpen] = useState(false);
+  const [data, setData] = useState(null);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    const handler = () => {
+      setOpen(true);
+      setData(null);
+      setCopied(false);
+      fetch(`${apiBase}/maritime/handoff?hours=8`)
+        .then((r) => r.ok ? r.json() : null)
+        .then((d) => setData(d))
+        .catch(() => setData({ markdown: "Failed to fetch handoff log." }));
+    };
+    window.addEventListener("ss-open-handoff", handler);
+    return () => window.removeEventListener("ss-open-handoff", handler);
+  }, [apiBase]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => { if (e.key === "Escape") setOpen(false); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  if (!open) return null;
+  const md = data?.markdown || "Generating…";
+
+  return (
+    <div
+      onClick={() => setOpen(false)}
+      style={{
+        position: "fixed", inset: 0,
+        background: "rgba(0,0,0,0.65)",
+        zIndex: 100,
+        display: "flex", alignItems: "center", justifyContent: "center",
+        padding: 24,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: "#0a1118",
+          border: "1px solid rgba(255,255,255,0.18)",
+          borderRadius: 6,
+          width: "min(720px, 100%)",
+          maxHeight: "85vh",
+          display: "flex", flexDirection: "column",
+          overflow: "hidden",
+          fontFamily: "'IBM Plex Sans', sans-serif",
+          color: "#f0f4ff",
+        }}
+      >
+        <div style={{
+          padding: "12px 18px",
+          borderBottom: "1px solid rgba(255,255,255,0.12)",
+          display: "flex", alignItems: "center", gap: 12,
+        }}>
+          <span style={{
+            fontFamily: "'IBM Plex Mono', monospace",
+            fontSize: 10, letterSpacing: "0.2em",
+            color: "rgba(255,255,255,0.55)",
+          }}>
+            WATCH HANDOFF · {data ? `${data.window_hours} h` : "…"}
+          </span>
+          <span style={{ flex: 1 }} />
+          <button
+            type="button"
+            onClick={() => {
+              if (!md) return;
+              navigator.clipboard?.writeText(md)
+                .then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); })
+                .catch(() => {});
+            }}
+            style={{
+              appearance: "none",
+              background: copied ? "rgba(95,208,147,0.22)" : "rgba(255,255,255,0.04)",
+              border: `1px solid ${copied ? "#5fd093" : "rgba(255,255,255,0.3)"}`,
+              color: copied ? "#cdf2dd" : "#f0f4ff",
+              borderRadius: 3,
+              padding: "4px 10px",
+              cursor: "pointer",
+              fontFamily: "'IBM Plex Mono', monospace",
+              fontSize: 10, letterSpacing: "0.12em",
+              textTransform: "uppercase",
+            }}
+          >
+            {copied ? "✓ copied" : "⧉ copy"}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (!md) return;
+              const blob = new Blob([md], { type: "text/markdown" });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement("a");
+              const stamp = new Date().toISOString()
+                .replace(/[:.]/g, "-").slice(0, 19);
+              a.href = url;
+              a.download = `semper-safe-handoff-${stamp}.md`;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              setTimeout(() => URL.revokeObjectURL(url), 250);
+            }}
+            style={{
+              appearance: "none",
+              background: "rgba(255,255,255,0.04)",
+              border: "1px solid rgba(255,255,255,0.3)",
+              color: "#f0f4ff",
+              borderRadius: 3,
+              padding: "4px 10px",
+              cursor: "pointer",
+              fontFamily: "'IBM Plex Mono', monospace",
+              fontSize: 10, letterSpacing: "0.12em",
+              textTransform: "uppercase",
+            }}
+          >
+            ⬇ .md
+          </button>
+          <button
+            type="button"
+            onClick={() => setOpen(false)}
+            style={{
+              appearance: "none",
+              background: "transparent",
+              border: "1px solid rgba(255,255,255,0.3)",
+              color: "rgba(255,255,255,0.7)",
+              borderRadius: 3,
+              padding: "4px 10px",
+              cursor: "pointer",
+              fontFamily: "'IBM Plex Mono', monospace",
+              fontSize: 10,
+            }}
+          >
+            ✕
+          </button>
+        </div>
+        <pre style={{
+          flex: 1, overflowY: "auto", margin: 0,
+          padding: "16px 20px",
+          fontFamily: "'IBM Plex Mono', ui-monospace, Menlo, monospace",
+          fontSize: 11.5,
+          lineHeight: 1.55,
+          color: "#dde6f4",
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+        }}>{md}</pre>
+      </div>
+    </div>
+  );
 }
 
 // ToastStack — corner notification stream. Surfaces new anomaly

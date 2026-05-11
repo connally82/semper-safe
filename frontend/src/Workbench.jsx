@@ -752,6 +752,7 @@ function VesselRegistrySection({ entity, apiBase }) {
     </div>
   );
 
+  const s = data.sanction;
   return (
     <div style={{
       padding: "10px 18px",
@@ -760,9 +761,46 @@ function VesselRegistrySection({ entity, apiBase }) {
       <div style={{
         fontFamily: "'IBM Plex Mono', monospace", fontSize: 9,
         color: PALETTE.muted, letterSpacing: "0.2em", marginBottom: 6,
+        display: "flex", alignItems: "center", gap: 8,
       }}>
-        VESSEL REGISTRY
+        <span>VESSEL REGISTRY</span>
+        {s && (
+          <span style={{
+            background: "#ff3a3a",
+            color: "#fff",
+            padding: "2px 7px",
+            borderRadius: 2,
+            fontSize: 9,
+            fontWeight: 700,
+            letterSpacing: "0.15em",
+          }}>● SANCTIONED</span>
+        )}
       </div>
+      {/* Sanction detail — only when matched. */}
+      {s && (
+        <div style={{
+          background: "rgba(255,58,58,0.08)",
+          border: "1px solid rgba(255,58,58,0.4)",
+          borderRadius: 3,
+          padding: "6px 8px",
+          marginBottom: 8,
+          fontFamily: "'IBM Plex Sans', sans-serif",
+          fontSize: 11,
+          lineHeight: 1.4,
+          color: PALETTE.text,
+        }}>
+          <div>
+            <strong>{s.source}</strong> · {s.program}
+            {s.name ? ` · ${s.name}` : ""}
+          </div>
+          {s.note && (
+            <div style={{
+              fontSize: 10, color: PALETTE.muted, marginTop: 3,
+              fontStyle: "italic",
+            }}>{s.note}</div>
+          )}
+        </div>
+      )}
       {row("MMSI",   data.mmsi)}
       {row("KIND",   data.mmsi_kind)}
       {row("FLAG",   flag.country

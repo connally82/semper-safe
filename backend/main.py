@@ -1058,6 +1058,167 @@ def maritime_reject(eid: str, body: DecisionRequest):
     return {"rejected": [r.model_dump() for r in affected]}
 
 
+@app.get("/maritime/handoff")
+def maritime_handoff(hours: int = 8):
+    """Structured shift-change summary.
+
+    Designed for the operator-to-operator handoff at watch turnover.
+    Returns both:
+      - markdown: human-readable text the outgoing operator pastes
+        into chat / hands the relieving operator
+      - json: machine-readable breakdown for the modal UI
+
+    Window defaults to the standard 8-h watch. Sections:
+      - State snapshot (anomaly counts, audit chain head)
+      - Open dispatches still inside their 4 h active window
+      - Recent operator decisions in the window
+      - Top dark vessels by priority (worth a look-over)
+      - Audit chain head + verify instructions
+    """
+    from datetime import timedelta as _td
+    from collections import Counter
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - _td(hours=hours)
+    dispatch_cutoff = now - _td(hours=4)   # dispatches active for 4 h
+
+    # ---- snapshot
+    type_counts = Counter(e.type.value for e in maritime.entities.values())
+    convoy_ids = {
+        e.attrs.get("convoy_id") for e in maritime.entities.values()
+        if e.attrs.get("convoy_id")
+    }
+
+    # ---- dispatches in the active window
+    dispatches: list[dict] = []
+    decisions: list[dict] = []
+    for entry in audit_log.all():
+        if entry.event_type == "dispatch_filed" and entry.t >= dispatch_cutoff:
+            p = entry.payload or {}
+            dispatches.append({
+                "seq": entry.seq,
+                "t": entry.t.isoformat(),
+                "operator": entry.actor,
+                "action_type": p.get("action_type"),
+                "entity_id": p.get("entity_id"),
+                "entity_type": p.get("entity_type"),
+                "entity_name": p.get("entity_name") or p.get("entity_mmsi"),
+                "notes": p.get("notes"),
+                "audit_hash": entry.self_hash,
+            })
+        if entry.event_type == "decision" and entry.t >= cutoff:
+            p = entry.payload or {}
+            decisions.append({
+                "seq": entry.seq,
+                "t": entry.t.isoformat(),
+                "operator": entry.actor,
+                "decision": p.get("decision"),
+                "entity_id": p.get("entity_id"),
+                "reason": p.get("reason"),
+                "audit_hash": entry.self_hash,
+            })
+
+    # ---- dark-vessel rollup
+    darks = sorted(
+        [e for e in maritime.entities.values()
+         if e.type.value == "dark_vessel"],
+        key=lambda e: -e.priority_score,
+    )[:10]
+    dark_rows = [
+        {
+            "entity_id": e.entity_id,
+            "lat": e.geom.lat if e.geom else None,
+            "lon": e.geom.lon if e.geom else None,
+            "priority": e.priority_score,
+            "first_seen": e.first_seen.isoformat(),
+            "last_seen": e.last_seen.isoformat(),
+        }
+        for e in darks
+    ]
+
+    # ---- markdown rendering
+    head = audit_log.head()
+    md_lines = [
+        f"# Semper Safe · Maritime Watch Handoff",
+        f"",
+        f"**Generated:** {now.strftime('%Y-%m-%d %H:%M UTC')} ·"
+        f" window {hours} h",
+        f"**Audit chain head:** `{head}`",
+        f"",
+        f"## Current state",
+        f"",
+    ]
+    md_lines.append("| Type | Count |")
+    md_lines.append("| --- | --- |")
+    for k in ("vessel", "ais_gap", "dark_vessel", "ais_spoofed",
+              "loitering_vessel", "port_skipping"):
+        md_lines.append(f"| {k} | {type_counts.get(k, 0)} |")
+    md_lines.append(f"| convoys in formation | {len(convoy_ids)} |")
+    md_lines.append("")
+
+    if dispatches:
+        md_lines.append(f"## Open dispatches ({len(dispatches)} active, last 4 h)")
+        md_lines.append("")
+        md_lines.append("| Time | Action | Entity | Operator | Hash |")
+        md_lines.append("| --- | --- | --- | --- | --- |")
+        for d in dispatches:
+            t = d["t"][11:16]
+            md_lines.append(
+                f"| {t}Z | {d['action_type']} | "
+                f"{d['entity_name'] or d['entity_id'][:12]} "
+                f"({d['entity_type']}) | {d['operator']} | "
+                f"`{d['audit_hash'][:12]}…` |"
+            )
+        md_lines.append("")
+    else:
+        md_lines.append("## Open dispatches")
+        md_lines.append("")
+        md_lines.append("_None active. Quiet handoff._")
+        md_lines.append("")
+
+    if decisions:
+        md_lines.append(f"## Decisions in window ({len(decisions)})")
+        md_lines.append("")
+        for d in decisions[-10:]:
+            t = d["t"][11:19]
+            md_lines.append(
+                f"- **{t}Z** · {d['decision']} on "
+                f"`{(d['entity_id'] or '')[:14]}` by {d['operator']}"
+                + (f" — {d['reason']}" if d.get("reason") else "")
+            )
+        md_lines.append("")
+
+    if dark_rows:
+        md_lines.append(f"## Top dark vessels ({len(dark_rows)} by priority)")
+        md_lines.append("")
+        md_lines.append("| Entity | Lat | Lon | Priority | Last seen |")
+        md_lines.append("| --- | --- | --- | --- | --- |")
+        for d in dark_rows:
+            md_lines.append(
+                f"| `{d['entity_id'][:14]}` | "
+                f"{d['lat']:.3f} | {d['lon']:.3f} | "
+                f"{d['priority']:.2f} | {d['last_seen'][11:16]}Z |"
+            )
+        md_lines.append("")
+
+    md_lines.append(
+        "_Every dispatch and decision in this brief is hash-chained to the "
+        "audit log. Verify by walking the chain back from the head above._"
+    )
+
+    return {
+        "now": now.isoformat(),
+        "window_hours": hours,
+        "audit_head": head,
+        "type_counts": dict(type_counts),
+        "n_convoys": len(convoy_ids),
+        "dispatches": dispatches,
+        "decisions": decisions,
+        "top_dark_vessels": dark_rows,
+        "markdown": "\n".join(md_lines),
+    }
+
+
 @app.get("/maritime/daily_brief.pdf")
 def maritime_daily_brief():
     """Generate a one-page PDF brief summarizing the last 24 h.
@@ -1275,6 +1436,23 @@ def maritime_daily_brief():
     )
 
 
+@app.get("/maritime/sanctions")
+def maritime_sanctions():
+    """Full sanctioned-vessel catalog — MMSI/IMO + flag + program.
+
+    Returned as one bulk response so the frontend can build an
+    indexed lookup on entities-tick without N round trips. Cache
+    header set since the catalog only changes via a code deploy
+    (or, when Phase 5 lands, via the scheduled SDN-feed pull task).
+    """
+    import sanctions
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        {"vessels": sanctions.list_sanctioned()},
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
 @app.get("/maritime/entities/{eid}/registry")
 def maritime_entity_registry(eid: str):
     """Public-registry enrichment for an entity (MMSI → flag state, etc).
@@ -1286,6 +1464,7 @@ def maritime_entity_registry(eid: str):
     can show 'pending — Equasis key not configured' for those slots.
     """
     import mmsi_mid
+    import sanctions as _sanctions
 
     ent = maritime.entities.get(eid)
     if ent is None:
@@ -1293,6 +1472,7 @@ def maritime_entity_registry(eid: str):
     mmsi = (ent.attrs or {}).get("mmsi")
     flag = mmsi_mid.mid_country(mmsi)
     kind = mmsi_mid.mmsi_kind(mmsi)
+    sanction = _sanctions.is_sanctioned(mmsi, (ent.attrs or {}).get("imo"))
     return {
         "entity_id": eid,
         "mmsi": mmsi,
@@ -1316,6 +1496,7 @@ def maritime_entity_registry(eid: str):
             "Owner / IMO / class society require an Equasis or "
             "MarineTraffic API key — not configured."
         ),
+        "sanction": sanction,    # null OR {mmsi, imo, name, flag, source, program, note}
     }
 
 
