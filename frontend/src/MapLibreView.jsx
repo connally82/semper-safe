@@ -146,6 +146,24 @@ const AOI_DRAW_FILL_LAYER_ID = "ss-aoi-draw-fill";
 const AOI_DRAW_LINE_LAYER_ID = "ss-aoi-draw-line";
 const AOI_DRAW_VERTEX_LAYER_ID = "ss-aoi-draw-vertex";
 
+// Anomaly vessel trails — last-hour track polylines drawn behind every
+// anomaly entity so the map tells the "where have these been" story
+// at a glance. Distinct from the per-selection TRACK_SOURCE — these
+// render for ALL anomalies simultaneously, in their type-meta color.
+const ANOMALY_TRAILS_SOURCE_ID = "ss-anomaly-trails";
+const ANOMALY_TRAILS_LAYER_ID = "ss-anomaly-trails-line";
+
+// Cap how many trails we fetch — saves the backend from N parallel
+// /entities/{id}/track hits when there are 50+ anomalies on the map.
+// 25 covers all dark/spoofed/port-skipping vessels in normal operation
+// and the most-recent loitering ones; ais_gap is excluded entirely
+// because there are 100s of those during normal traffic and the
+// trails would clutter the map.
+const ANOMALY_TRAIL_MAX = 25;
+const ANOMALY_TRAIL_TYPES = new Set([
+  "dark_vessel", "ais_spoofed", "port_skipping", "loitering_vessel",
+]);
+
 // Ray-casting point-in-polygon. Coordinates in [lon, lat] order.
 function _pointInPolygon(lon, lat, polygon) {
   let inside = false;
@@ -861,10 +879,34 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
       });
     };
 
+    // Anomaly trails — last-hour polyline per anomaly entity. Color
+    // and opacity come from per-feature properties so each trail can
+    // be tinted to match its entity's typeMeta on the marker layer.
+    const ensureAnomalyTrailsLayers = () => {
+      if (map.getSource(ANOMALY_TRAILS_SOURCE_ID)) return;
+      map.addSource(ANOMALY_TRAILS_SOURCE_ID, {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+      map.addLayer({
+        id: ANOMALY_TRAILS_LAYER_ID,
+        type: "line",
+        source: ANOMALY_TRAILS_SOURCE_ID,
+        filter: ["==", "$type", "LineString"],
+        paint: {
+          "line-color": ["get", "color"],
+          "line-width": 1.6,
+          "line-opacity": 0.55,
+        },
+        layout: { "line-cap": "round", "line-join": "round" },
+      });
+    };
+
     map.on("style.load", ensureTrackLayers);
     map.on("style.load", ensureCandidateLayers);
     map.on("style.load", ensureConvoyLayers);
     map.on("style.load", ensureAoiLayers);
+    map.on("style.load", ensureAnomalyTrailsLayers);
     map.on("style.load", ensureSarLayers);
 
     // Click → popup. Detections are densely packed so attach to the
@@ -1602,6 +1644,92 @@ export default function MapLibreView({ entities, selectedId, onSelect, cfg }) {
              _pointInPolygon(e.lon, e.lat, aoiPoints),
     ).length;
   }, [aoiMode, aoiPoints, renderEntities]);
+
+  // ------------------------------------------------------------------
+  // Anomaly trails — fetch the last-hour track for every anomaly
+  // entity (capped at ANOMALY_TRAIL_MAX) and render as a fading
+  // polyline tinted to the entity's typeMeta color. Caches per-entity
+  // tracks by (id, last_seen) so the fetch doesn't re-fire on every
+  // tick — only when an entity is new or has reported a new position.
+  // ------------------------------------------------------------------
+  const trailCacheRef = useRef(new Map()); // id → { last_seen, points }
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const src = map.getSource(ANOMALY_TRAILS_SOURCE_ID);
+    if (!src) return;
+
+    // Pick the anomalies we'd actually want trails for. Sort by
+    // priority desc so high-priority entities win the cap.
+    const candidates = renderEntities
+      .filter((e) => ANOMALY_TRAIL_TYPES.has(e.type))
+      .sort((a, b) => (b.priority || 0) - (a.priority || 0))
+      .slice(0, ANOMALY_TRAIL_MAX);
+
+    let cancelled = false;
+    const cache = trailCacheRef.current;
+
+    const renderFromCache = () => {
+      if (cancelled) return;
+      const features = [];
+      for (const e of candidates) {
+        const c = cache.get(e.id);
+        if (!c || !c.points || c.points.length < 2) continue;
+        const meta = cfg.typeMeta[e.type];
+        features.push({
+          type: "Feature",
+          geometry: {
+            type: "LineString",
+            coordinates: c.points.map((p) => [p.lon, p.lat]),
+          },
+          properties: {
+            entity_id: e.id,
+            color: (meta && meta.color) || "#ff5c5c",
+            type: e.type,
+          },
+        });
+      }
+      src.setData({ type: "FeatureCollection", features });
+    };
+
+    // Render immediately from whatever's cached; fetch missing tracks.
+    renderFromCache();
+
+    const ctrls = [];
+    for (const e of candidates) {
+      const cached = cache.get(e.id);
+      // Re-fetch when the entity is new or has a fresher last_seen.
+      if (cached && cached.last_seen === e.last_seen) continue;
+      const ctrl = new AbortController();
+      ctrls.push(ctrl);
+      fetchTrack(cfg.apiPath, e.id, ctrl.signal)
+        .then((data) => {
+          if (cancelled) return;
+          const pts = (data.track || []).filter(
+            (p) => typeof p.lon === "number" && typeof p.lat === "number",
+          );
+          cache.set(e.id, { last_seen: e.last_seen, points: pts });
+          renderFromCache();
+        })
+        .catch((err) => {
+          if (err.name === "AbortError") return;
+          // eslint-disable-next-line no-console
+          console.warn(`anomaly trail fetch failed for ${e.id}:`, err);
+        });
+    }
+
+    // Evict cache for entities that aren't candidates anymore so the
+    // map doesn't drift to a stale cardinality.
+    const liveIds = new Set(candidates.map((e) => e.id));
+    for (const id of [...cache.keys()]) {
+      if (!liveIds.has(id)) cache.delete(id);
+    }
+
+    return () => {
+      cancelled = true;
+      for (const c of ctrls) c.abort();
+    };
+  }, [renderEntities, cfg, ready]);
 
   // ------------------------------------------------------------------
   // Convoy lines: group entities by attrs.convoy_id (backend-tagged by
