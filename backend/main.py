@@ -128,6 +128,34 @@ SAR_AUTO_MAX_AGE_HOURS = int(os.environ.get("SAR_AUTO_MAX_AGE_HOURS", "48"))
 IN_MEMORY_OBS_WINDOW_MINUTES = int(os.environ.get("IN_MEMORY_OBS_WINDOW_MINUTES", "30"))
 
 
+# Track when sanctions feeds were last pulled. The gap-sweeper loop
+# calls _maybe_refresh_sanctions() every tick; it returns early unless
+# 24 h have elapsed since the last successful pull (or it's never run).
+_SANCTIONS_REFRESH_INTERVAL_S = 24 * 60 * 60
+_last_sanctions_refresh_ts: float = 0.0
+
+
+def _maybe_refresh_sanctions() -> None:
+    """Refresh sanctions feeds if a day has elapsed since the last pull.
+    Synchronous — caller runs us via asyncio.to_thread."""
+    import time as _t
+    import sanctions
+    global _last_sanctions_refresh_ts
+    now = _t.time()
+    if (now - _last_sanctions_refresh_ts) < _SANCTIONS_REFRESH_INTERVAL_S:
+        return
+    try:
+        result = sanctions.refresh_from_public_feeds()
+        _last_sanctions_refresh_ts = now
+        audit_log.append(
+            actor="system",
+            event_type="sanctions_feeds_refreshed",
+            payload=result,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("sanctions refresh crashed: %s", exc)
+
+
 def _evict_stale_in_memory_obs() -> int:
     """Drop observations older than IN_MEMORY_OBS_WINDOW_MINUTES from each
     engine's in-memory dict. Returns total count evicted across both
@@ -190,6 +218,13 @@ async def _gap_sweeper_loop(cancel: asyncio.Event) -> None:
                 )
             except Exception as exc:  # noqa: BLE001
                 log.exception("port-skipping sweep crashed: %s", exc)
+            # Sanctions feed refresh — runs once per 24 h. Cheap when
+            # not due (just checks a timestamp); expensive (~5-10s,
+            # network-bound) when it actually pulls. Threadpool offload.
+            try:
+                await asyncio.to_thread(_maybe_refresh_sanctions)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("sanctions refresh check crashed: %s", exc)
             try:
                 evicted = await asyncio.to_thread(_evict_stale_in_memory_obs)
                 if evicted:

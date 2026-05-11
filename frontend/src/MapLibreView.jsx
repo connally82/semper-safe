@@ -904,6 +904,17 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
   const [scrubSnapshot, setScrubSnapshot] = useState(null);
   const [scrubLoading, setScrubLoading] = useState(false);
 
+  // Source the markers either from live `entities` (now) or the
+  // snapshot fetched for the scrubbed-to time. Hoisted up here from
+  // below the scrub-fetch effect because several effects further down
+  // (watchlist toasts, anomaly trails, etc) reference `renderEntities`
+  // in their dependency arrays. Hoist required: const variables are in
+  // the temporal dead zone until their declaration line is hit, so
+  // referencing them earlier throws a ReferenceError on initial render
+  // (= black screen). Symptom seen 2026-05-11 after the watchlist
+  // effect was added before this declaration.
+  const renderEntities = scrubSnapshot ?? entities;
+
   // Raw track for the selected entity (full Postgres history). Re-derived
   // into GeoJSON features whenever scrubMinutes changes so the polyline
   // clips correctly to the scrubbed-to instant.
@@ -2047,9 +2058,10 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
     return () => ctrl.abort();
   }, [scrubMinutes, cfg.apiPath]);
 
-  // Source the markers either from live `entities` (now) or the
-  // snapshot fetched for the scrubbed-to time.
-  const renderEntities = scrubSnapshot ?? entities;
+  // renderEntities is now declared earlier in the function so the
+  // watchlist + anomaly-trail effects can reference it in their dep
+  // arrays without hitting the const TDZ. See the hoisted declaration
+  // up near the scrubSnapshot state for the explanation.
 
   // ------------------------------------------------------------------
   // Sync markers whenever entities change. Reuse existing marker DOM
@@ -4532,8 +4544,58 @@ function ToastStack({ toasts, soundEnabled, onToggleSound, onClick, cfg }) {
 const REPLAY_FROM_MIN = 60;
 const REPLAY_DURATION_MS = 12_000;
 
+// Capture the map canvas as a WebM video for the duration of a replay
+// sequence. Uses MediaRecorder + canvas.captureStream(). Limited to
+// browsers that support it (~all modern Chrome/Edge/Firefox; Safari
+// 14.1+ via the MediaRecorder polyfill in MapLibre's canvas pipeline).
+// Returns {stop} so the caller can finalize when the animation ends.
+function _startCanvasCapture(canvas, mimeType = "video/webm;codecs=vp9") {
+  if (!canvas || typeof canvas.captureStream !== "function") return null;
+  let stream;
+  try {
+    stream = canvas.captureStream(30);   // 30 fps
+  } catch {
+    return null;
+  }
+  let recorder;
+  try {
+    // Try VP9 first, fall back to default codec, then to WebM only.
+    if (window.MediaRecorder?.isTypeSupported?.(mimeType)) {
+      recorder = new MediaRecorder(stream, { mimeType });
+    } else if (window.MediaRecorder?.isTypeSupported?.("video/webm")) {
+      recorder = new MediaRecorder(stream, { mimeType: "video/webm" });
+    } else if (window.MediaRecorder) {
+      recorder = new MediaRecorder(stream);
+    } else {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  const chunks = [];
+  recorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) chunks.push(e.data);
+  };
+  let stopResolve;
+  const stopped = new Promise((res) => { stopResolve = res; });
+  recorder.onstop = () => stopResolve(chunks);
+  recorder.start(200);
+  return {
+    stop: async () => {
+      if (recorder.state === "inactive") return null;
+      recorder.stop();
+      const c = await stopped;
+      if (!c.length) return null;
+      const blob = new Blob(c, { type: recorder.mimeType || "video/webm" });
+      return blob;
+    },
+  };
+}
+
 function ScrubBar({ minutes, loading, live, onChange, onLive }) {
   const [playing, setPlaying] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const recorderRef = useRef(null);
   const playStartRef = useRef(null);
   const rafRef = useRef(null);
 
@@ -4553,10 +4615,28 @@ function ScrubBar({ minutes, loading, live, onChange, onLive }) {
       onChange(m);
       if (progress >= 1) {
         setPlaying(false);
-        // Tail of the animation lands on live (minutes=0) — no need to
-        // call onLive explicitly, but do it so the "LIVE" pill flips
-        // green in the UI immediately.
         onLive();
+        // If recording, finalize and download the WebM.
+        if (recorderRef.current) {
+          const rec = recorderRef.current;
+          recorderRef.current = null;
+          setRecording(false);
+          // Small delay so the final frame is captured.
+          setTimeout(async () => {
+            const blob = await rec.stop();
+            if (!blob) return;
+            const url = URL.createObjectURL(blob);
+            const stamp = new Date().toISOString()
+              .replace(/[:.]/g, "-").slice(0, 19);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `semper-safe-replay-${stamp}.webm`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 500);
+          }, 200);
+        }
         return;
       }
       rafRef.current = requestAnimationFrame(tick);
@@ -4643,6 +4723,44 @@ function ScrubBar({ minutes, loading, live, onChange, onLive }) {
         }}
       >
         {playing ? "■ stop" : "▶ replay"}
+      </button>
+      <button
+        type="button"
+        disabled={playing}
+        title="Record the next replay as a WebM video (analyst-friendly)"
+        onClick={() => {
+          // Locate the map canvas. MapLibre renders into a single
+          // <canvas> inside the parent container — query the document.
+          const canvas = document.querySelector(".maplibregl-canvas");
+          if (!canvas) return;
+          const rec = _startCanvasCapture(canvas);
+          if (!rec) {
+            window.alert("Browser doesn't support MediaRecorder on canvas. "
+                       + "Use Chrome / Edge / Firefox.");
+            return;
+          }
+          recorderRef.current = rec;
+          setRecording(true);
+          setPlaying(true);
+        }}
+        style={{
+          appearance: "none",
+          border: `1px solid ${recording ? "#ff5c5c" : "rgba(255,255,255,0.25)"}`,
+          background: recording ? "rgba(255,92,92,0.22)"
+            : (playing ? "rgba(255,255,255,0.02)" : "rgba(255,255,255,0.04)"),
+          color: recording ? "#ff8a8a" : "rgba(255,255,255,0.85)",
+          padding: "3px 8px",
+          borderRadius: 3,
+          fontSize: 10,
+          fontFamily: "inherit",
+          letterSpacing: "0.08em",
+          cursor: playing && !recording ? "default" : "pointer",
+          textTransform: "uppercase",
+          minWidth: 56,
+          opacity: playing && !recording ? 0.5 : 1,
+        }}
+      >
+        {recording ? "● rec" : "⏺ record"}
       </button>
       <input
         type="range"

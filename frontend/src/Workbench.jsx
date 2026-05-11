@@ -128,12 +128,40 @@ const DOMAINS = {
   },
 };
 
-const PALETTE = {
+// Two themes — dark for ops floors / mission rooms, light for printed
+// reports and embedded screenshots. PALETTE is a mutable object so the
+// hundreds of inline style references throughout the file pick up the
+// active theme on every re-render. setTheme() Object.assigns the
+// chosen swatch onto PALETTE and bumps a state counter to force
+// re-render of the entire React tree.
+const DARK_PALETTE = {
   bg: "#070c14", surface: "#0e1622", surface2: "#152030",
   border: "rgba(255,255,255,0.07)", borderStrong: "rgba(255,255,255,0.13)",
   text: "#e6edf5", muted: "#7c8aa0", dim: "#4a5668",
   good: "#5fd093", warn: "#f0a830", alert: "#ff5c5c",
+  accent: "#5dd6c4",
 };
+const LIGHT_PALETTE = {
+  bg: "#f3f5f8", surface: "#ffffff", surface2: "#eef2f7",
+  border: "rgba(10,14,24,0.10)", borderStrong: "rgba(10,14,24,0.18)",
+  text: "#1a2330", muted: "#536174", dim: "#8997ab",
+  good: "#2a8c5a", warn: "#b87000", alert: "#c43b3b",
+  accent: "#1a5f6e",
+};
+const PALETTE = { ...DARK_PALETTE };
+const THEME_STORAGE_KEY = "ss-theme";
+function _applyTheme(name) {
+  Object.assign(PALETTE, name === "light" ? LIGHT_PALETTE : DARK_PALETTE);
+  try {
+    document.body.style.background = PALETTE.bg;
+    document.body.style.color = PALETTE.text;
+  } catch { /* SSR or no body */ }
+}
+// Apply persisted theme on module load so the first render is correct.
+try {
+  const saved = window.localStorage.getItem(THEME_STORAGE_KEY);
+  if (saved === "light") _applyTheme("light");
+} catch {}
 
 // =============================================================
 //   Map projection
@@ -181,7 +209,7 @@ function Banner() {
   );
 }
 
-function Header({ domainKey, setDomainKey, conn, auditHead, auditCount, decisionsCount }) {
+function Header({ domainKey, setDomainKey, conn, auditHead, auditCount, decisionsCount, theme, onThemeChange }) {
   const cfg = DOMAINS[domainKey];
   return (
     <div style={{
@@ -224,12 +252,41 @@ function Header({ domainKey, setDomainKey, conn, auditHead, auditCount, decision
       </div>
 
       <div style={{ flex: 1 }} />
+      <ThemeToggle theme={theme} onChange={onThemeChange} />
       <ConnIndicator conn={conn} />
       <KV label="AUDIT HEAD" value={(auditHead || "").slice(0, 16) + "…"} />
       <KV label="ENTRIES"   value={String(auditCount)} />
       <KV label="DECISIONS" value={String(decisionsCount)} />
       <KV label="OPERATOR"  value={cfg.operator} />
     </div>
+  );
+}
+
+// Theme pill — toggles dark↔light. Lives next to ConnIndicator in
+// the top bar. Mutates the module-level PALETTE in place + bumps a
+// state counter passed in via prop so React re-renders the whole
+// app. localStorage-persisted.
+function ThemeToggle({ theme, onChange }) {
+  return (
+    <button
+      type="button"
+      onClick={() => onChange(theme === "light" ? "dark" : "light")}
+      title={`Switch to ${theme === "light" ? "dark" : "light"} mode`}
+      style={{
+        appearance: "none",
+        background: "transparent",
+        border: `1px solid ${PALETTE.borderStrong || PALETTE.border}`,
+        color: PALETTE.text,
+        fontFamily: "'IBM Plex Mono', monospace",
+        fontSize: 10,
+        letterSpacing: "0.12em",
+        padding: "4px 10px",
+        cursor: "pointer",
+        borderRadius: 2,
+      }}
+    >
+      {theme === "light" ? "☾ DARK" : "☀ LIGHT"}
+    </button>
   );
 }
 
@@ -2056,6 +2113,23 @@ export default function Workbench() {
   const [decisions, setDecisions] = useState({});
   const [auditExtras, setAuditExtras] = useState([]);
 
+  // Theme state — swaps PALETTE in place via _applyTheme and bumps a
+  // counter to force re-render of every consumer (all inline-styled
+  // components read the mutated PALETTE on next render). Persists
+  // across reloads in localStorage.
+  const [theme, setTheme] = useState(() => {
+    if (typeof window === "undefined") return "dark";
+    try {
+      return window.localStorage.getItem(THEME_STORAGE_KEY) === "light"
+        ? "light" : "dark";
+    } catch { return "dark"; }
+  });
+  const handleThemeChange = (next) => {
+    _applyTheme(next);
+    setTheme(next);
+    try { window.localStorage.setItem(THEME_STORAGE_KEY, next); } catch {}
+  };
+
   // Probe API once on mount
   useEffect(() => {
     let canceled = false;
@@ -2203,6 +2277,8 @@ export default function Workbench() {
           auditHead={auditHead}
           auditCount={auditCount}
           decisionsCount={Object.keys(decisions).length}
+          theme={theme}
+          onThemeChange={handleThemeChange}
         />
         <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
           <div style={{ width: 280, flexShrink: 0 }}>
