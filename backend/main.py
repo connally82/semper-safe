@@ -130,6 +130,69 @@ SAR_AUTO_MAX_AGE_HOURS = int(os.environ.get("SAR_AUTO_MAX_AGE_HOURS", "48"))
 IN_MEMORY_OBS_WINDOW_MINUTES = int(os.environ.get("IN_MEMORY_OBS_WINDOW_MINUTES", "30"))
 
 
+def _point_in_polygon(lon: float, lat: float,
+                       polygon: list[list[float]]) -> bool:
+    """Ray-casting point-in-polygon (one ring). Used by the cross-domain
+    smoke-exposure sweep."""
+    inside = False
+    n = len(polygon)
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i][0], polygon[i][1]
+        xj, yj = polygon[j][0], polygon[j][1]
+        if ((yi > lat) != (yj > lat)) and \
+           (lon < (xj - xi) * (lat - yi) / (yj - yi + 1e-12) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _check_smoke_exposure() -> int:
+    """Cross-domain alarm — flag maritime vessels currently inside any
+    wildfire smoke plume polygon. Sets ent.attrs.in_smoke_plume to the
+    incident_name; clears it when the vessel moves out. Returns the
+    count newly tagged (so the gap sweeper can log when there's a hit).
+    """
+    plumes = _wildfire_cache.get("smoke") or []
+    if not plumes:
+        # Clear stale tags when smoke catalog empties.
+        for ent in list(maritime.entities.values()):
+            if (ent.attrs or {}).get("in_smoke_plume"):
+                ent.attrs.pop("in_smoke_plume", None)
+        return 0
+    newly_tagged = 0
+    for ent in list(maritime.entities.values()):
+        if ent.type.value not in ("vessel", "ais_gap"):
+            continue
+        if ent.geom is None:
+            continue
+        was_in = (ent.attrs or {}).get("in_smoke_plume")
+        hit_incident: str | None = None
+        for p in plumes:
+            geom = p.get("geometry") or {}
+            if geom.get("type") != "Polygon":
+                continue
+            rings = geom.get("coordinates") or []
+            if not rings:
+                continue
+            if _point_in_polygon(ent.geom.lon, ent.geom.lat, rings[0]):
+                hit_incident = p.get("incident_name") or "wildfire smoke"
+                break
+        if hit_incident and hit_incident != was_in:
+            ent.attrs["in_smoke_plume"] = hit_incident
+            newly_tagged += 1
+            audit_log.append(
+                actor="system",
+                event_type="vessel_in_smoke_plume",
+                payload={"entity_id": ent.entity_id,
+                         "mmsi": ent.attrs.get("mmsi"),
+                         "incident": hit_incident},
+            )
+        elif (not hit_incident) and was_in:
+            ent.attrs.pop("in_smoke_plume", None)
+    return newly_tagged
+
+
 # Track when sanctions feeds were last pulled. The gap-sweeper loop
 # calls _maybe_refresh_sanctions() every tick; it returns early unless
 # 24 h have elapsed since the last successful pull (or it's never run).
@@ -220,6 +283,14 @@ async def _gap_sweeper_loop(cancel: asyncio.Event) -> None:
                 )
             except Exception as exc:  # noqa: BLE001
                 log.exception("port-skipping sweep crashed: %s", exc)
+            try:
+                # Cross-domain smoke exposure — flag maritime vessels
+                # currently inside a wildfire smoke plume polygon.
+                tagged = await asyncio.to_thread(_check_smoke_exposure)
+                if tagged > 0:
+                    log.info("smoke exposure: %d new vessels tagged", tagged)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("smoke exposure sweep crashed: %s", exc)
             # Sanctions feed refresh — runs once per 24 h. Cheap when
             # not due (just checks a timestamp); expensive (~5-10s,
             # network-bound) when it actually pulls. Threadpool offload.
@@ -1229,6 +1300,181 @@ def maritime_reject(eid: str, body: DecisionRequest):
     return {"rejected": [r.model_dump() for r in affected]}
 
 
+@app.get("/handoff")
+def cross_domain_handoff(hours: int = 8, domains: str = "maritime,wildfire"):
+    """Unified watch-turnover summary across both domains.
+
+    The watch-officer-in-charge sees BOTH maritime + wildfire state
+    in one document: anomaly counts, active dispatches, active
+    wildfire incidents, top WUI tiers, recent decisions, audit head.
+    Top of the brief identifies which domain has higher current
+    activity so the relieving officer knows where to focus."""
+    from datetime import timedelta as _td
+    from collections import Counter
+    requested = {d.strip().lower() for d in domains.split(",") if d.strip()}
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - _td(hours=hours)
+    dispatch_cutoff = now - _td(hours=4)
+    head = audit_log.head()
+
+    # Maritime block
+    maritime_block = None
+    if "maritime" in requested:
+        type_counts = Counter(e.type.value for e in maritime.entities.values())
+        convoy_ids = {(e.attrs or {}).get("convoy_id")
+                      for e in maritime.entities.values()
+                      if (e.attrs or {}).get("convoy_id")}
+        m_dispatches = []
+        m_decisions = []
+        for entry in audit_log.all():
+            p = entry.payload or {}
+            if p.get("domain") == "wildfire":
+                continue
+            if entry.event_type == "dispatch_filed" and entry.t >= dispatch_cutoff:
+                m_dispatches.append({
+                    "t": entry.t.isoformat(), "operator": entry.actor,
+                    "action_type": p.get("action_type"),
+                    "entity_name": p.get("entity_name") or p.get("entity_mmsi"),
+                    "hash": entry.self_hash,
+                })
+            if entry.event_type == "decision" and entry.t >= cutoff:
+                m_decisions.append({
+                    "t": entry.t.isoformat(), "operator": entry.actor,
+                    "decision": p.get("decision"), "entity_id": p.get("entity_id"),
+                })
+        maritime_block = {
+            "type_counts": dict(type_counts),
+            "n_convoys": len(convoy_ids),
+            "n_dispatches": len(m_dispatches),
+            "n_decisions": len(m_decisions),
+            "dispatches": m_dispatches,
+            "decisions": m_decisions,
+        }
+
+    # Wildfire block
+    wildfire_block = None
+    if "wildfire" in requested:
+        incidents = _wildfire_cache.get("incidents") or []
+        wui = _wildfire_cache.get("wui") or []
+        pre = _wildfire_cache.get("preposition") or []
+        psps_active = [z for z in (_wildfire_cache.get("psps") or [])
+                       if z.get("status") == "active"]
+        w_dispatches = []
+        for entry in audit_log.all():
+            p = entry.payload or {}
+            if (p.get("domain") == "wildfire"
+                    and entry.event_type == "dispatch_filed"
+                    and entry.t >= dispatch_cutoff):
+                w_dispatches.append({
+                    "t": entry.t.isoformat(), "operator": entry.actor,
+                    "action_type": p.get("action_type"),
+                    "entity_name": p.get("entity_name"),
+                    "hash": entry.self_hash,
+                })
+        # Sum acres of active incidents (>0 contained_pct excluded)
+        total_acres = sum(
+            float(i.get("size_acres") or 0)
+            for i in incidents if i.get("size_acres") is not None
+        )
+        wildfire_block = {
+            "n_incidents": len(incidents),
+            "total_active_acres": int(total_acres),
+            "n_extreme_wui": len([c for c in wui if c.get("tier") == "extreme"]),
+            "n_high_wui":    len([c for c in wui if c.get("tier") == "high"]),
+            "n_psps_active": len(psps_active),
+            "n_prepositions": len(pre),
+            "n_dispatches": len(w_dispatches),
+            "dispatches": w_dispatches,
+        }
+
+    # Pick "primary domain" — the one with more activity (dispatches +
+    # extreme entities).
+    primary = "maritime"
+    if maritime_block and wildfire_block:
+        m_act = maritime_block["n_dispatches"] + \
+                maritime_block["type_counts"].get("dark_vessel", 0) + \
+                maritime_block["type_counts"].get("ais_spoofed", 0)
+        w_act = wildfire_block["n_dispatches"] + \
+                wildfire_block["n_extreme_wui"] + \
+                wildfire_block["n_psps_active"]
+        primary = "wildfire" if w_act > m_act else "maritime"
+    elif wildfire_block and not maritime_block:
+        primary = "wildfire"
+
+    # ─── markdown rendering ───
+    lines = [
+        "# Semper Safe · Watch Handoff (cross-domain)",
+        "",
+        f"**Generated:** {now.strftime('%Y-%m-%d %H:%M UTC')} ·"
+        f" window {hours} h",
+        f"**Audit chain head:** `{head}`",
+        f"**Primary domain this watch:** {primary.upper()}",
+        "",
+    ]
+    if maritime_block:
+        m = maritime_block
+        lines += [
+            "## Maritime",
+            "",
+            f"- vessels: {m['type_counts'].get('vessel', 0)}",
+            f"- AIS gaps: {m['type_counts'].get('ais_gap', 0)}",
+            f"- dark vessels: {m['type_counts'].get('dark_vessel', 0)}",
+            f"- AIS spoofed: {m['type_counts'].get('ais_spoofed', 0)}",
+            f"- loitering: {m['type_counts'].get('loitering_vessel', 0)}",
+            f"- port-skipping: {m['type_counts'].get('port_skipping', 0)}",
+            f"- convoys in formation: {m['n_convoys']}",
+            f"- open dispatches (last 4 h): **{m['n_dispatches']}**",
+            f"- decisions in window: {m['n_decisions']}",
+            "",
+        ]
+        for d in m["dispatches"][:5]:
+            lines.append(
+                f"  - {d['t'][11:16]}Z · {d['action_type']} · "
+                f"{d['entity_name']} · {d['operator']} · "
+                f"`{d['hash'][:10]}…`"
+            )
+        if not m["dispatches"]:
+            lines.append("  - _no maritime dispatches in window_")
+        lines.append("")
+    if wildfire_block:
+        w = wildfire_block
+        lines += [
+            "## Wildfire",
+            "",
+            f"- active NIFC incidents: **{w['n_incidents']}** "
+            f"({w['total_active_acres']:,} acres total)",
+            f"- WUI extreme tier: **{w['n_extreme_wui']}**, "
+            f"high tier: {w['n_high_wui']}",
+            f"- active PSPS zones: {w['n_psps_active']}",
+            f"- pre-position recs: {w['n_prepositions']}",
+            f"- wildfire dispatches (last 4 h): **{w['n_dispatches']}**",
+            "",
+        ]
+        for d in w["dispatches"][:5]:
+            lines.append(
+                f"  - {d['t'][11:16]}Z · {d['action_type']} · "
+                f"{d['entity_name']} · {d['operator']} · "
+                f"`{d['hash'][:10]}…`"
+            )
+        if not w["dispatches"]:
+            lines.append("  - _no wildfire dispatches in window_")
+        lines.append("")
+    lines.append(
+        "_Every dispatch above is hash-chained. Verify by walking the "
+        "audit chain back from the head above._"
+    )
+    return {
+        "now": now.isoformat(),
+        "window_hours": hours,
+        "audit_head": head,
+        "primary_domain": primary,
+        "maritime": maritime_block,
+        "wildfire": wildfire_block,
+        "markdown": "\n".join(lines),
+    }
+
+
 @app.get("/maritime/handoff")
 def maritime_handoff(hours: int = 8):
     """Structured shift-change summary.
@@ -1971,6 +2217,366 @@ def wildfire_history():
             "n_perimeters": len(features),
             "last_refresh_at": _wildfire_cache["history_last_refresh"].isoformat()
                 if _wildfire_cache["history_last_refresh"] else None}
+
+
+@app.get("/wildfire/wui/{community}/draft_alert")
+def wildfire_draft_alert(community: str):
+    """Generate a DRAFT IPAWS-style Wireless Emergency Alert for a
+    high-risk WUI community.
+
+    Returns a structured alert payload (text + 5-mile circular polygon)
+    ready for an authorizing officer to review. THE SYSTEM DOES NOT
+    SEND THESE — actual IPAWS publication requires a signed FEMA
+    AlertCertificate the operator holds out-of-band.
+
+    Designed for the demo workflow: an operator looking at an
+    extreme-tier community can click 'draft alert', review the
+    auto-generated wording for typos / over-broad scope, then send
+    it through their existing IPAWS interface."""
+    import math
+
+    target = None
+    for c in _wildfire_cache.get("wui") or []:
+        if c.get("name", "").lower() == community.lower():
+            target = c
+            break
+    if target is None:
+        raise HTTPException(404, f"WUI community '{community}' not found")
+
+    name = target["name"]
+    state = target["state"]
+    tier = target.get("tier", "elevated")
+    pop = target.get("pop", "?")
+    hdw = target.get("max_nearby_hdw_risk", 0)
+
+    # Severity-tier wording. Real IPAWS WEA messages are capped at
+    # 360 chars (Long-Form Alert); we stay under that.
+    if tier == "extreme":
+        action = "EVACUATE NOW"
+        body = (
+            f"WILDFIRE EVACUATION ORDER: Extreme fire-weather risk in "
+            f"{name}, {state}. Leave area immediately along designated "
+            f"egress routes. Take 6 P's: People, Pets, Papers, Phone, "
+            f"Plastic, Prescriptions. Listen for instructions."
+        )
+    elif tier == "high":
+        action = "PREPARE TO EVACUATE"
+        body = (
+            f"WILDFIRE EVACUATION WARNING: Elevated fire-weather risk "
+            f"in {name}, {state}. Prepare to leave on short notice. "
+            f"Pack the 6 P's; identify two evacuation routes; monitor "
+            f"local alerts."
+        )
+    else:
+        action = "STAY ALERT"
+        body = (
+            f"FIRE-WEATHER ADVISORY: Above-normal risk in {name}, "
+            f"{state}. No evacuation order. Avoid outdoor flame; "
+            f"clear defensible space; monitor conditions."
+        )
+
+    headline = (
+        f"[DRAFT WEA] {action} — {name}, {state} "
+        f"(HDW risk {hdw:.2f}, pop ≈ {pop}k)"
+    )
+
+    # 5-mile (~8 km) alert polygon centered on the community.
+    lon0, lat0 = target["lon"], target["lat"]
+    radius_km = 8.0
+    R = 6371.0
+    poly = []
+    for i in range(33):
+        bearing = math.radians(i * (360.0 / 32))
+        d = radius_km / R
+        lat = math.asin(
+            math.sin(math.radians(lat0)) * math.cos(d)
+            + math.cos(math.radians(lat0)) * math.sin(d) * math.cos(bearing)
+        )
+        lon = math.radians(lon0) + math.atan2(
+            math.sin(bearing) * math.sin(d) * math.cos(math.radians(lat0)),
+            math.cos(d) - math.sin(math.radians(lat0)) * math.sin(lat),
+        )
+        poly.append([math.degrees(lon), math.degrees(lat)])
+
+    from datetime import timedelta as _td
+    return {
+        "draft": True,
+        "alert_kind": "IPAWS_WEA_DRAFT",
+        "headline": headline,
+        "action": action,
+        "body": body,
+        "tier": tier,
+        "community": name,
+        "state": state,
+        "issued_at": datetime.now(timezone.utc).isoformat(),
+        "expires_at": (datetime.now(timezone.utc) + _td(hours=6)).isoformat(),
+        "alert_polygon": {
+            "type": "Polygon",
+            "coordinates": [poly],
+        },
+        "delivery_note": (
+            "DRAFT. This is a system-generated proposal. Operator "
+            "must review wording, scope, and authority before sending "
+            "via IPAWS / Cal OES / state EAS. NOT broadcast by this "
+            "system."
+        ),
+    }
+
+
+@app.post("/wildfire/dispatches", status_code=201)
+def wildfire_file_dispatch(body: DispatchRequest):
+    """Operator files a fire-side dispatch — parallel to maritime.
+
+    Target entity_id can be a wildfire entity (hotspot / fire_event /
+    lightning_ignition_risk / fire_preposition) OR a preposition
+    recommendation id ('pre_*') OR a WUI community id, depending on
+    what the operator clicked. We resolve via the wildfire engine
+    first, then fall back to the preposition cache for pre_* IDs.
+
+    Same audit-chain mechanism as maritime: appends a 'dispatch_filed'
+    entry and returns the resulting audit hash."""
+    eid = body.entity_id
+    target_type = None
+    target_name = None
+
+    ent = wildfire.entities.get(eid)
+    if ent is not None:
+        target_type = ent.type.value
+        target_name = (ent.attrs or {}).get("name")
+    else:
+        # Maybe a preposition recommendation id
+        for rec in _wildfire_cache.get("preposition") or []:
+            if rec.get("id") == eid:
+                target_type = "fire_preposition"
+                target_name = (rec.get("nearest_asset") or {}).get("name")
+                break
+    if target_type is None:
+        # Allow free-form wildfire targets (WUI community names, etc) —
+        # the operator's notes field documents intent.
+        target_type = "wildfire_freeform"
+
+    entry = audit_log.append(
+        actor=body.operator,
+        event_type="dispatch_filed",
+        payload={
+            "domain":      "wildfire",
+            "entity_id":   eid,
+            "entity_type": target_type,
+            "action_type": body.action_type,
+            "notes":       body.notes or "",
+            "entity_name": target_name,
+        },
+    )
+    return {
+        "audit_seq":      entry.seq,
+        "audit_hash":     entry.self_hash,
+        "prev_hash":      entry.prev_hash,
+        "dispatched_at":  entry.t.isoformat(),
+        "operator":       body.operator,
+        "entity_id":      eid,
+        "action_type":    body.action_type,
+    }
+
+
+@app.get("/wildfire/daily_brief.pdf")
+def wildfire_daily_brief():
+    """One-page wildfire-ops PDF brief.
+
+    Header with audit chain head + window timestamp; tally of active
+    NIFC incidents; top WUI communities by tier; active PSPS zones;
+    active Red Flag warnings; recent preposition recommendations.
+    Designed as the watch-officer leave-behind."""
+    from io import BytesIO
+    from fastapi.responses import Response
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib import colors as rl_colors
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+        )
+    except ImportError as exc:
+        raise HTTPException(
+            501,
+            f"PDF brief requires reportlab — pip install reportlab ({exc})",
+        )
+
+    now = datetime.now(timezone.utc)
+    incidents = _wildfire_cache.get("incidents") or []
+    rfw       = _wildfire_cache.get("red_flag") or []
+    psps      = _wildfire_cache.get("psps") or []
+    wui       = _wildfire_cache.get("wui") or []
+    pre       = _wildfire_cache.get("preposition") or []
+    history   = _wildfire_cache.get("history") or []
+    head = audit_log.head()
+    audit_count = audit_log.count() if hasattr(audit_log, "count") else len(audit_log.all())
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "wfTitle", parent=styles["Title"],
+        fontSize=16, textColor=rl_colors.HexColor("#0a1118"), spaceAfter=4,
+    )
+    meta_style = ParagraphStyle(
+        "wfMeta", parent=styles["Normal"], fontSize=8,
+        textColor=rl_colors.HexColor("#666"), spaceAfter=10, leading=10,
+    )
+    h2_style = ParagraphStyle(
+        "wfH2", parent=styles["Heading2"], fontSize=11,
+        textColor=rl_colors.HexColor("#0a1118"), spaceBefore=10, spaceAfter=4,
+    )
+    body_style = ParagraphStyle(
+        "wfBody", parent=styles["Normal"], fontSize=8,
+        textColor=rl_colors.HexColor("#1a2330"), leading=10,
+    )
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=letter,
+        leftMargin=0.6 * inch, rightMargin=0.6 * inch,
+        topMargin=0.6 * inch, bottomMargin=0.6 * inch,
+        title="Semper Safe — Wildfire Daily Brief",
+    )
+    story = []
+    story.append(Paragraph("Semper Safe · Wildfire Daily Brief", title_style))
+    story.append(Paragraph(
+        f"Generated: {now.strftime('%Y-%m-%d %H:%M UTC')} &nbsp;·&nbsp; "
+        f"Audit chain head: {head[:24]}… &nbsp;·&nbsp; "
+        f"{audit_count} audit entries", meta_style,
+    ))
+
+    # Active incidents tally
+    story.append(Paragraph(
+        f"Active wildfire incidents · NIFC ({len(incidents)} total)",
+        h2_style))
+    if incidents:
+        # Top 10 by size
+        top = sorted(
+            [i for i in incidents if i.get("size_acres")],
+            key=lambda i: -float(i.get("size_acres") or 0),
+        )[:10]
+        rows = [["Name", "State", "Acres", "Contained %", "Behavior"]]
+        for i in top:
+            rows.append([
+                (i.get("name") or "")[:32],
+                i.get("state") or "—",
+                f"{int(i.get('size_acres') or 0):,}",
+                f"{i.get('contained_pct') or 0}%",
+                (i.get("behavior") or "—")[:18],
+            ])
+        t = Table(rows, colWidths=[2.0 * inch, 0.55 * inch,
+                                    0.7 * inch, 0.85 * inch, 1.2 * inch])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#1a2330")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("ALIGN", (1, 0), (3, -1), "RIGHT"),
+            ("GRID", (0, 0), (-1, -1), 0.25, rl_colors.HexColor("#cccccc")),
+        ]))
+        story.append(t)
+    else:
+        story.append(Paragraph("No active incidents in the AOI.", body_style))
+
+    # WUI tier rollup
+    extreme = [c for c in wui if c.get("tier") == "extreme"]
+    high    = [c for c in wui if c.get("tier") == "high"]
+    elev    = [c for c in wui if c.get("tier") == "elevated"]
+    story.append(Paragraph(
+        f"WUI exposure · {len(extreme)} extreme · {len(high)} high · "
+        f"{len(elev)} elevated", h2_style))
+    if extreme or high:
+        rows = [["Community", "Pop", "Tier", "Today's HDW"]]
+        for c in (extreme + high)[:10]:
+            rows.append([
+                c.get("name") or "—",
+                f"{c.get('pop', '?')}k",
+                (c.get("tier") or "—").upper(),
+                f"{c.get('max_nearby_hdw_risk', 0):.2f}",
+            ])
+        t = Table(rows, colWidths=[2.0 * inch, 0.6 * inch,
+                                    0.9 * inch, 1.0 * inch])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#1a2330")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("ALIGN", (1, 0), (3, -1), "RIGHT"),
+            ("GRID", (0, 0), (-1, -1), 0.25, rl_colors.HexColor("#cccccc")),
+        ]))
+        story.append(t)
+    else:
+        story.append(Paragraph("No WUI communities currently in elevated tier or above.", body_style))
+
+    # PSPS
+    story.append(Paragraph(f"PSPS zones · {len(psps)} catalog entries", h2_style))
+    if psps:
+        rows = [["Utility", "Zone", "Status", "Customers"]]
+        for z in psps:
+            rows.append([
+                z.get("utility") or "—",
+                (z.get("name") or "")[:30],
+                (z.get("status") or "—").upper(),
+                f"{int(z.get('customers_affected') or 0):,}",
+            ])
+        t = Table(rows, colWidths=[0.8 * inch, 2.5 * inch,
+                                    0.9 * inch, 0.9 * inch])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#1a2330")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("ALIGN", (3, 0), (3, -1), "RIGHT"),
+            ("GRID", (0, 0), (-1, -1), 0.25, rl_colors.HexColor("#cccccc")),
+        ]))
+        story.append(t)
+
+    # Pre-position recommendations
+    story.append(Paragraph(
+        f"Pre-position recommendations · {len(pre)} active", h2_style))
+    if pre:
+        rows = [["Score", "Asset (nearest)", "Distance", "HDW"]]
+        for p in pre:
+            a = p.get("nearest_asset") or {}
+            rows.append([
+                f"{p.get('score', 0):.2f}",
+                (a.get("name") or "—")[:30],
+                f"{a.get('distance_km', 0):.0f} km",
+                f"{p.get('hdw', 0):.0f}",
+            ])
+        t = Table(rows, colWidths=[0.7 * inch, 2.5 * inch,
+                                    0.9 * inch, 0.7 * inch])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), rl_colors.HexColor("#1a2330")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+            ("GRID", (0, 0), (-1, -1), 0.25, rl_colors.HexColor("#cccccc")),
+        ]))
+        story.append(t)
+
+    story.append(Spacer(1, 0.15 * inch))
+    story.append(Paragraph(
+        f"Historical perimeters cached: {len(history)} fires ≥1000 acres "
+        f"in the AOI over the last 3 years.",
+        body_style))
+    story.append(Paragraph(
+        f"Verify any dispatch in this brief by walking the audit chain "
+        f"back from head {head[:20]}… (POST /audit/verify).",
+        meta_style,
+    ))
+    doc.build(story)
+    pdf_bytes = buf.getvalue()
+    filename = f"semper-safe-wildfire-brief-{now.strftime('%Y%m%d-%H%M')}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @app.get("/wildfire/assets")

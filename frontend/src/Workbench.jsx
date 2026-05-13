@@ -1284,7 +1284,11 @@ function DispatchSection({ entity, cfg, apiBase }) {
   const file = async () => {
     setBusy(true); setErr(null);
     try {
-      const r = await fetch(`${apiBase}/maritime/dispatches`, {
+      // Route to /maritime/dispatches OR /wildfire/dispatches based
+      // on the active domain. Both endpoints share the same request
+      // shape and return the same hash-chain receipt.
+      const url = (cfg.apiPath || "/maritime") + "/dispatches";
+      const r = await fetch(`${apiBase}${url}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
