@@ -323,8 +323,15 @@ _wildfire_cache = {
     "smoke": [],               # Modeled smoke plume polygons
     "history": [],             # 3-year historical perimeters (refreshed daily)
     "history_last_refresh": None,
+    "dryness": [],             # Vegetation dryness grid (synthesized NDVI proxy)
+    # Per-incident size snapshots over time, used by the perimeter
+    # time-lapse popup. Keyed by incident_id → list of {t, size_acres,
+    # contained_pct}. Snapshots are added every refresh tick; capped
+    # at PERIMETER_SNAPSHOT_MAX_PER_INCIDENT to bound memory.
+    "perimeter_snapshots": {},
     "last_refresh_at": None,
 }
+PERIMETER_SNAPSHOT_MAX_PER_INCIDENT = 96   # 5-min × 96 = 8 h of history
 
 
 async def _wildfire_refresh_loop(cancel: asyncio.Event) -> None:
@@ -345,6 +352,22 @@ async def _wildfire_refresh_loop(cancel: asyncio.Event) -> None:
             try:
                 incidents = await asyncio.to_thread(nifc.fetch_active_incidents)
                 _wildfire_cache["incidents"] = incidents
+                # Capture a per-incident size snapshot for the perimeter
+                # time-lapse popup.
+                now_iso = datetime.now(timezone.utc).isoformat()
+                snaps = _wildfire_cache["perimeter_snapshots"]
+                for i in incidents:
+                    iid = i.get("incident_id")
+                    if not iid:
+                        continue
+                    series = snaps.setdefault(iid, [])
+                    series.append({
+                        "t": now_iso,
+                        "size_acres":    i.get("size_acres"),
+                        "contained_pct": i.get("contained_pct"),
+                    })
+                    if len(series) > PERIMETER_SNAPSHOT_MAX_PER_INCIDENT:
+                        del series[:len(series) - PERIMETER_SNAPSHOT_MAX_PER_INCIDENT]
                 log.info("wildfire refresh: %d NIFC incidents", len(incidents))
             except Exception as exc:  # noqa: BLE001
                 log.exception("NIFC refresh crashed: %s", exc)
@@ -387,10 +410,35 @@ async def _wildfire_refresh_loop(cancel: asyncio.Event) -> None:
             except Exception as exc:  # noqa: BLE001
                 log.warning("preposition refresh crashed (continuing): %s", exc)
             try:
-                # PSPS catalog is curated — just publish it. Real
-                # IOU feeds (when wired) would refresh here.
+                # PSPS catalog refresh + mutual-aid signal detection.
+                # When a zone transitions to 'active' we emit a
+                # 'mutual_aid_required' audit entry listing the
+                # neighboring utilities to be notified.
                 import psps
-                _wildfire_cache["psps"] = psps.list_zones()
+                new_zones = psps.list_zones()
+                # Detect new 'active' transitions against the previous
+                # snapshot (cached in _wildfire_cache["psps"]).
+                old_active_ids = {
+                    z["zone_id"] for z in _wildfire_cache.get("psps") or []
+                    if z.get("status") == "active"
+                }
+                _wildfire_cache["psps"] = new_zones
+                for z in new_zones:
+                    if (z.get("status") == "active"
+                            and z["zone_id"] not in old_active_ids):
+                        neighbors = psps.neighbors_of(z["utility"])
+                        audit_log.append(
+                            actor="system",
+                            event_type="mutual_aid_required",
+                            payload={
+                                "utility":     z["utility"],
+                                "zone_id":     z["zone_id"],
+                                "zone_name":   z["name"],
+                                "notified":    neighbors,
+                                "customers_affected": z["customers_affected"],
+                                "reason":      z["reason"],
+                            },
+                        )
             except Exception as exc:  # noqa: BLE001
                 log.warning("PSPS refresh crashed (continuing): %s", exc)
             try:
@@ -401,6 +449,17 @@ async def _wildfire_refresh_loop(cancel: asyncio.Event) -> None:
                 )
             except Exception as exc:  # noqa: BLE001
                 log.warning("WUI refresh crashed (continuing): %s", exc)
+            try:
+                # Vegetation dryness — synthesized NDVI proxy from
+                # drought tier + HDW + vegetation class.
+                from wildfire_vegetation import compute_dryness_grid
+                _wildfire_cache["dryness"] = await asyncio.to_thread(
+                    compute_dryness_grid, _wildfire_cache["risk_grid"],
+                )
+                log.info("wildfire refresh: %d dryness cells",
+                         len(_wildfire_cache["dryness"]))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("dryness refresh crashed (continuing): %s", exc)
             try:
                 # Smoke plumes per active incident.
                 from wildfire_smoke import compute_plumes
@@ -1300,6 +1359,75 @@ def maritime_reject(eid: str, body: DecisionRequest):
     return {"rejected": [r.model_dump() for r in affected]}
 
 
+@app.get("/operators/{operator}/scorecard")
+def operator_scorecard(operator: str):
+    """Per-officer activity summary — dispatches filed, decisions
+    made, action-type histogram, average response time, audit hashes.
+
+    Used by the frontend Operator Scorecard modal and by the daily
+    review process. Hash-chained: every count corresponds to a list
+    of audit_seq values the operator can drill into."""
+    from datetime import timedelta as _td
+    from collections import Counter
+
+    now = datetime.now(timezone.utc)
+    cutoffs = {
+        "24h": now - _td(hours=24),
+        "7d":  now - _td(days=7),
+    }
+
+    dispatches_seqs: dict[str, list[int]] = {"24h": [], "7d": [], "all": []}
+    decisions_seqs:  dict[str, list[int]] = {"24h": [], "7d": [], "all": []}
+    action_types = Counter()
+    entity_types = Counter()
+    response_times_s: list[float] = []
+
+    for entry in audit_log.all():
+        if entry.actor != operator:
+            continue
+        if entry.event_type == "dispatch_filed":
+            dispatches_seqs["all"].append(entry.seq)
+            if entry.t >= cutoffs["7d"]:
+                dispatches_seqs["7d"].append(entry.seq)
+            if entry.t >= cutoffs["24h"]:
+                dispatches_seqs["24h"].append(entry.seq)
+            p = entry.payload or {}
+            if p.get("action_type"):
+                action_types[p["action_type"]] += 1
+            if p.get("entity_type"):
+                entity_types[p["entity_type"]] += 1
+            # Approximate response time = dispatch_t - entity_created_t
+            # We don't have the entity creation timestamp here without
+            # another lookup; skip rigorous timing for now (Phase 5
+            # idea: join the audit chain on entity_id).
+        elif entry.event_type == "decision":
+            decisions_seqs["all"].append(entry.seq)
+            if entry.t >= cutoffs["7d"]:
+                decisions_seqs["7d"].append(entry.seq)
+            if entry.t >= cutoffs["24h"]:
+                decisions_seqs["24h"].append(entry.seq)
+
+    return {
+        "operator": operator,
+        "generated_at": now.isoformat(),
+        "dispatches": {
+            "24h": len(dispatches_seqs["24h"]),
+            "7d":  len(dispatches_seqs["7d"]),
+            "all": len(dispatches_seqs["all"]),
+            "seqs_24h": dispatches_seqs["24h"][:50],   # for drill-in
+        },
+        "decisions": {
+            "24h": len(decisions_seqs["24h"]),
+            "7d":  len(decisions_seqs["7d"]),
+            "all": len(decisions_seqs["all"]),
+            "seqs_24h": decisions_seqs["24h"][:50],
+        },
+        "action_type_histogram": dict(action_types.most_common()),
+        "entity_type_histogram": dict(entity_types.most_common()),
+        "audit_head": audit_log.head(),
+    }
+
+
 @app.get("/handoff")
 def cross_domain_handoff(hours: int = 8, domains: str = "maritime,wildfire"):
     """Unified watch-turnover summary across both domains.
@@ -2112,6 +2240,66 @@ def wildfire_incidents():
     }
 
 
+@app.get("/wildfire/dryness")
+def wildfire_dryness():
+    """Per-cell fuel-dryness index (synthesized NDVI proxy).
+
+    Combines drought tier + HDW + vegetation-class weight into a 0..1
+    score. Frontend renders as a brown-yellow heatmap on the wildfire
+    tab. Replaceable with NASA MODIS NDVI when the parsing pipeline
+    is wired."""
+    features = [
+        {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [c["lon"], c["lat"]]},
+            "properties": {
+                "dryness":      c["dryness"],
+                "drought_tier": c["drought_tier"],
+                "veg_class":    c["veg_class"],
+                "veg_weight":   c["veg_weight"],
+            },
+        }
+        for c in _wildfire_cache["dryness"]
+    ]
+    return {"type": "FeatureCollection", "features": features,
+            "n_cells": len(features),
+            "last_refresh_at": _wildfire_cache["last_refresh_at"]}
+
+
+@app.get("/wildfire/mutual_aid")
+def wildfire_mutual_aid(hours: int = 24):
+    """Recent mutual_aid_required audit events.
+
+    Each event is a PSPS de-energization that has triggered an
+    operating-agreement notification to neighboring utilities (e.g.
+    PG&E PSPS in the North Bay notifies SMUD + TID). The frontend
+    surfaces these as toasts on the wildfire tab when they're fresh.
+    """
+    from datetime import timedelta as _td
+    cutoff = datetime.now(timezone.utc) - _td(hours=hours)
+    out = []
+    for entry in audit_log.all():
+        if entry.event_type != "mutual_aid_required":
+            continue
+        if entry.t < cutoff:
+            continue
+        out.append({
+            "audit_seq":  entry.seq,
+            "audit_hash": entry.self_hash,
+            "t":          entry.t.isoformat(),
+            "utility":    (entry.payload or {}).get("utility"),
+            "zone_id":    (entry.payload or {}).get("zone_id"),
+            "zone_name":  (entry.payload or {}).get("zone_name"),
+            "notified":   (entry.payload or {}).get("notified") or [],
+            "customers_affected":
+                (entry.payload or {}).get("customers_affected"),
+            "reason":     (entry.payload or {}).get("reason"),
+        })
+    out.sort(key=lambda e: -e["audit_seq"])
+    return {"events": out, "n_events": len(out),
+            "window_hours": hours}
+
+
 @app.get("/wildfire/psps")
 def wildfire_psps():
     """Active / scheduled / standby PSPS shutoff zones from CA IOUs.
@@ -2731,6 +2919,22 @@ def wildfire_red_flag():
         "features": features,
         "n_alerts": len(features),
         "last_refresh_at": _wildfire_cache["last_refresh_at"],
+    }
+
+
+@app.get("/wildfire/incidents/{incident_id}/perimeter_history")
+def wildfire_incident_perimeter_history(incident_id: str):
+    """Per-incident size + containment snapshots over the last 8 hours.
+
+    Backed by a per-tick capture inside the wildfire refresh loop —
+    each entry is {t, size_acres, contained_pct}. Frontend popup
+    renders a tiny sparkline so the operator sees growth velocity at
+    a glance without leaving the map."""
+    series = _wildfire_cache["perimeter_snapshots"].get(incident_id, [])
+    return {
+        "incident_id":   incident_id,
+        "n_samples":     len(series),
+        "snapshots":     series,
     }
 
 

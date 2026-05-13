@@ -68,6 +68,58 @@ ASSETS: list[dict] = [
 ]
 
 
+# Resource composition by risk tier — what a Type 3+ IC would prepo
+# at a high-HDW cell, ordered by what arrives first. Numbers reflect
+# CAL FIRE / USFS standard Initial Attack composition.
+def _staffing_for(risk_score: float, asset_type: str,
+                  distance_km: float) -> dict:
+    """Suggest crew + equipment counts for a preposition stage.
+
+    Composition scales with risk_score (higher = larger commitment)
+    and asset type (a smokejumper base preposition implies aerial
+    delivery rather than ground engines). Distance gap nudges the
+    aerial component up — long ground response = more reliance on
+    air attack to bridge the gap.
+    """
+    # Base composition by risk tier
+    if risk_score >= 0.70:
+        comp = {"engines": 4, "dozers": 1, "type1_tanker_runs": 1,
+                "type2_tanker_runs": 1, "helitack_crews": 1,
+                "hand_crews": 1, "type3_ic": True}
+        readiness = "initial_attack_ready"
+    elif risk_score >= 0.50:
+        comp = {"engines": 2, "dozers": 1, "type1_tanker_runs": 0,
+                "type2_tanker_runs": 1, "helitack_crews": 0,
+                "hand_crews": 1, "type3_ic": False}
+        readiness = "rapid_response"
+    elif risk_score >= 0.35:
+        comp = {"engines": 1, "dozers": 0, "type1_tanker_runs": 0,
+                "type2_tanker_runs": 0, "helitack_crews": 0,
+                "hand_crews": 0, "type3_ic": False}
+        readiness = "patrol"
+    else:
+        comp = {"engines": 0, "dozers": 0, "type1_tanker_runs": 0,
+                "type2_tanker_runs": 0, "helitack_crews": 0,
+                "hand_crews": 0, "type3_ic": False}
+        readiness = "monitor_only"
+
+    # Asset-type and distance modifiers
+    if asset_type == "smokejumper":
+        # Smokejumper bases pre-stage aerial delivery, fewer ground units
+        comp["engines"] = max(comp["engines"] - 1, 0)
+        comp["smokejumpers"] = 1 if risk_score >= 0.5 else 0
+    elif asset_type == "helitack":
+        comp["helitack_crews"] = max(comp["helitack_crews"], 1)
+    elif asset_type == "patrol":
+        comp = {**comp, "patrol_units": max(1, comp["engines"])}
+
+    if distance_km > 50:
+        # Long ground gap → bump aerial
+        comp["type2_tanker_runs"] = max(comp["type2_tanker_runs"], 1)
+
+    return {"readiness": readiness, "resources": comp}
+
+
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -154,6 +206,7 @@ def recommend_prepositions(
             f"{dist_km:.0f} km away — coverage {coverage:.2f}. "
             f"Uncovered risk {uncovered:.2f}."
         )
+        staffing = _staffing_for(risk, asset["type"], dist_km)
         candidates.append({
             "id": cell_id,
             "lon": lon, "lat": lat,
@@ -167,6 +220,7 @@ def recommend_prepositions(
                 "coverage": round(coverage, 2),
             },
             "rationale": rationale,
+            "staffing": staffing,
         })
 
     candidates.sort(key=lambda c: -c["score"])

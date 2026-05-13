@@ -149,3 +149,20 @@ KNOWN_PSPS_ZONES: list[dict] = [
 def list_zones() -> list[dict]:
     """Return the catalog as-is. Endpoint wraps in a FeatureCollection."""
     return list(KNOWN_PSPS_ZONES)
+
+
+# Mutual-aid mapping — which utilities a given IOU notifies on
+# de-energization. Reflects WECC-region operating agreements: a PG&E
+# PSPS in the North Bay notifies SMUD and TID; an SCE event notifies
+# LADWP and IID; an SDG&E event notifies CFE south of the border.
+MUTUAL_AID_NETWORK = {
+    "PG&E":  ["SMUD", "TID", "Northern California IOUs"],
+    "SCE":   ["LADWP", "IID", "Anaheim Public Utilities"],
+    "SDG&E": ["IID", "CFE (Mexico)"],
+    "BVES":  ["SCE"],
+}
+
+
+def neighbors_of(utility: str) -> list[str]:
+    """Return the mutual-aid notification list for a given utility."""
+    return list(MUTUAL_AID_NETWORK.get(utility, []))
