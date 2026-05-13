@@ -88,6 +88,10 @@ class _InMemoryAuditLog:
     def head(self) -> str:
         return self._entries[-1].self_hash if self._entries else GENESIS_HASH
 
+    def prune_archived(self, *, retain_tail: int = 2000) -> int:
+        """In-memory mode never grows past process lifetime — no-op."""
+        return 0
+
     def verify(self) -> tuple[bool, int | None]:
         prev_hash = GENESIS_HASH
         for e in self._entries:
@@ -257,6 +261,58 @@ class _PostgresAuditLog:
                     return False, r.seq
                 prev_hash = r.self_hash
             return True, None
+
+    def prune_archived(self, *, retain_tail: int = 2000) -> int:
+        """Delete audit_log rows that have already been mirrored to R2.
+
+        Caps the active audit_log table size so /health and any other
+        query that touches the table stays cheap even under heavy
+        write load. The chain is *not* truncated — every retained row
+        still hash-links to its predecessor — but rows older than the
+        archive bookmark (ArchiveStateRow.last_seq) become redundant
+        once they're sitting in R2 as gzipped JSONL.
+
+        Safety rails:
+          - Only runs if R2 is configured AND archive_audit_chain has
+            advanced its bookmark past the rows we're about to delete.
+            (We never delete rows that aren't yet archived.)
+          - Retains the last `retain_tail` rows regardless of archive
+            state, so the hash-chain head we serve from `head()` and
+            `verify()` always has a reachable chain back through several
+            recent process_started markers. This makes the panel-side
+            audit view remain useful for an operator inspecting the
+            most recent operational period.
+          - Bookmark `last_seq` is the floor; we delete only seq <
+            min(last_seq, max_seq - retain_tail).
+
+        Returns the number of rows deleted (0 if nothing to prune).
+        """
+        from sqlalchemy import delete as sa_delete, func
+        from db import models as dbm
+        from db.session import session_scope
+
+        with self._lock, session_scope() as s:
+            archive_state = s.execute(
+                select(dbm.ArchiveStateRow)
+                .where(dbm.ArchiveStateRow.name == "audit")
+            ).scalar_one_or_none()
+            if archive_state is None:
+                return 0
+            archived_through = archive_state.last_seq
+            max_seq = s.execute(
+                select(func.max(dbm.AuditEntryRow.seq))
+            ).scalar_one()
+            if max_seq is None:
+                return 0
+            tail_floor = max_seq - retain_tail
+            cutoff = min(archived_through, tail_floor)
+            if cutoff < 0:
+                return 0
+            result = s.execute(
+                sa_delete(dbm.AuditEntryRow)
+                .where(dbm.AuditEntryRow.seq <= cutoff)
+            )
+            return int(result.rowcount or 0)
 
     def bulk_append_from(self, in_mem: "_InMemoryAuditLog") -> int:
         """Copy entries from an in-memory log to Postgres in a single INSERT.

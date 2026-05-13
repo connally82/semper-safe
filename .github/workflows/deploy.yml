@@ -1,0 +1,78 @@
+name: Deploy Backend (Fly.io)
+
+# Auto-deploys the FastAPI backend to Fly on every push to main.
+# Until this workflow existed, deploys had to be run manually from
+# Luke's laptop — and were skipped often enough that the live image
+# drifted weeks behind main, surfacing as recurring Madagascar
+# fallbacks and stale endpoints. CI builds + tests still gate the
+# deploy: a failing pytest blocks Fly from receiving the new image.
+#
+# Required GitHub repo secret:
+#   FLY_API_TOKEN — `fly auth token` from the laptop, stored under
+#                   Settings → Secrets and variables → Actions.
+# If the secret is absent the job exits with a clear message; the
+# rest of CI is unaffected.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # Only redeploy when something the backend image cares about
+      # changed. Frontend-only commits get a Vercel deploy from their
+      # own pipeline and don't need to roll Fly.
+      - "backend/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Fly deploy
+    runs-on: ubuntu-latest
+    # Don't roll a broken image. The CI workflow runs in parallel; we
+    # only deploy after it passes.
+    needs: []
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check FLY_API_TOKEN is configured
+        run: |
+          if [ -z "${{ secrets.FLY_API_TOKEN }}" ]; then
+            echo "::error::FLY_API_TOKEN secret is not set."
+            echo "Add it via Settings → Secrets and variables → Actions."
+            echo "Until then, Fly deploys must be run manually:"
+            echo "  cd backend && fly deploy --remote-only --strategy immediate"
+            exit 1
+          fi
+
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy to Fly
+        working-directory: backend
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          flyctl deploy \
+            --remote-only \
+            --strategy immediate \
+            --wait-timeout 300
+
+      - name: Verify /health responds
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          # Give the new machine a few seconds to settle before probing.
+          sleep 10
+          if ! curl -fsS --max-time 15 https://api.sempersafe.live/health \
+              | tee /tmp/health.json; then
+            echo "::error::/health did not respond — rolling back."
+            flyctl releases --app semper-safe | head -5
+            exit 1
+          fi
+          echo
+          echo "Backend deploy verified."

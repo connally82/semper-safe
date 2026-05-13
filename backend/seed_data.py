@@ -26,13 +26,19 @@ from models import Observation, SourceType, Geom
 
 SCENARIO_START = datetime(2026, 5, 7, 6, 0, tzinfo=timezone.utc)
 
-# Synthetic ocean patch — somewhere off the coast of NW Madagascar
-# (no actual operational meaning; deterministic for the demo)
-LON_MIN, LON_MAX = 47.5, 49.0
-LAT_MIN, LAT_MAX = -14.5, -13.0
+# Synthetic ocean patch — Texas Gulf shoreline (Galveston Bay region).
+# STAYS INSIDE the frontend FIT_CLAMP for /maritime (lon -98.5..-93.0,
+# lat 25..31). The earlier seed lived off NW Madagascar (lon ~48,
+# lat ~-14); persisted rows from that era used to leak through and
+# pull the auto-fit camera across the planet. Relocating the seed
+# itself means a fresh deploy never reproduces the Madagascar incident
+# even before the AOI auto-purge runs on bootstrap.
+LON_MIN, LON_MAX = -96.5, -94.5
+LAT_MIN, LAT_MAX = 27.5, 29.5
 
-# A made-up "MPA" inside the patch — IUU activity will cluster here
-MPA_LON, MPA_LAT, MPA_RADIUS_DEG = 48.2, -13.7, 0.25
+# A made-up "MPA" inside the patch — IUU activity will cluster here.
+# Centered ~30 nm off Galveston, well inside the Texas Gulf clamp.
+MPA_LON, MPA_LAT, MPA_RADIUS_DEG = -95.4, 28.6, 0.25
 
 
 def _h3_stub(lon: float, lat: float) -> str:

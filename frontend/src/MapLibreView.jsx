@@ -615,7 +615,18 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
   const [scrubMinutes, setScrubMinutes] = useState(0);
   const [scrubSnapshot, setScrubSnapshot] = useState(null);
   const [scrubLoading, setScrubLoading] = useState(false);
-  const renderEntities = scrubSnapshot ?? entities;
+  // Source list before the AOI clamp. We keep the unclamped version
+  // around for diagnostics but every downstream pass renders the clamped
+  // list so a stray entity outside the active-domain AOI (e.g. legacy
+  // Madagascar seed rows that leaked past the backend purge) can never
+  // pollute markers, auto-fit bounds, anomaly trails, or selection state.
+  const _rawRenderEntities = scrubSnapshot ?? entities;
+  const renderEntities = (() => {
+    if (!cfg || !cfg.apiPath) return _rawRenderEntities;
+    return _rawRenderEntities.filter(
+      (e) => _insideFitClamp(e.lon, e.lat, cfg.apiPath)
+    );
+  })();
 
   // Anomaly state tracker. Per-entity-id record of the LAST observed
   // type, so we can detect transitions (vessel → dark_vessel, etc) on
@@ -2797,6 +2808,17 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
     if (!map || !ready || !selectedId) return;
     const ent = entitiesById.get(selectedId);
     if (!ent || typeof ent.lon !== "number" || typeof ent.lat !== "number") return;
+    // Guardrail: never fly the camera outside the active-domain AOI clamp.
+    // A stale persisted entity (e.g. the old Madagascar seed at lon ~48,
+    // lat ~-14) used to yank the map across the globe if it sneaked into
+    // the entity list. The clamp keeps the camera bound to Texas Gulf
+    // for /maritime and the Western US for /wildfire — anything outside
+    // is ignored. The backend purge endpoint should evict it permanently,
+    // but this is the defense-in-depth so an operator never sees the
+    // map jump to a stale location.
+    if (!_insideFitClamp(ent.lon, ent.lat, cfg.apiPath)) {
+      return;
+    }
     if (map.getZoom() >= 12.5) {
       // Already close enough — just pan smoothly.
       map.easeTo({ center: [ent.lon, ent.lat], duration: 600 });
@@ -2808,7 +2830,7 @@ export default function MapLibreView({ entities, selectedId, pinnedId, onSelect,
         essential: true,   // respect prefers-reduced-motion but still fly
       });
     }
-  }, [selectedId, ready, entitiesById]);
+  }, [selectedId, ready, entitiesById, cfg]);
 
   // ------------------------------------------------------------------
   // Candidate-hull halos: when an anomaly is selected, ring the 5-km

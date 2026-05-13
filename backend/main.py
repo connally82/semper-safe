@@ -729,6 +729,18 @@ async def _audit_archive_loop(cancel: asyncio.Event) -> None:
                         payload={"rows": total},
                     )
                     log.info("audit archive: drained %d rows to R2", total)
+                # Even if no new rows were archived this tick, we still
+                # want to attempt a prune — earlier ticks may have
+                # archived rows that this loop hasn't yet pruned. The
+                # method respects a 2000-row tail so the active table
+                # never falls below a few minutes of recent activity,
+                # which keeps the operator-side audit view useful.
+                try:
+                    pruned = await asyncio.to_thread(audit_log.prune_archived)
+                    if pruned:
+                        log.info("audit prune: deleted %d archived rows", pruned)
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("audit prune failed: %s", exc)
             except Exception as exc:  # noqa: BLE001
                 log.exception("audit archive crashed: %s", exc)
 
@@ -836,6 +848,63 @@ def _bootstrap():
                 actor="system", event_type="seed_persisted",
                 payload={"maritime": mar_counts, "wildfire": fire_counts},
             )
+
+    # Self-healing AOI sweep — drop any maritime entity outside the
+    # Texas Gulf clamp BEFORE we ever serve /maritime/entities. The
+    # frontend auto-fit treats anything inside the clamp as ground
+    # truth and ignores everything else, but a stale row in the entity
+    # set still wasted memory and made the suspect-details panel ugly.
+    # This used to be a manual /admin/maritime/purge-non-aoi call; now
+    # it runs every bootstrap so any image that ever held Madagascar
+    # seed data heals itself on next deploy.
+    _MAR_AOI = (-98.0, -93.5, 25.5, 30.5)   # lon_min, lon_max, lat_min, lat_max
+    purged = 0
+    for eid in list(maritime.entities.keys()):
+        ent = maritime.entities[eid]
+        geom = getattr(ent, "geom", None)
+        lon = getattr(geom, "lon", None) if geom else None
+        lat = getattr(geom, "lat", None) if geom else None
+        if lon is None or lat is None:
+            continue
+        if not (_MAR_AOI[0] <= lon <= _MAR_AOI[1]
+                and _MAR_AOI[2] <= lat <= _MAR_AOI[3]):
+            maritime.entities.pop(eid, None)
+            purged += 1
+    if purged:
+        # Also purge the persisted row so a restart doesn't reload it.
+        if persistent:
+            try:
+                from sqlalchemy import delete as _sa_delete, and_, or_
+                from geoalchemy2.functions import ST_X, ST_Y
+                from db import models as dbm
+                from db.session import session_scope
+                with session_scope() as s:
+                    s.execute(
+                        _sa_delete(dbm.EntityRow).where(
+                            and_(
+                                dbm.EntityRow.domain == "maritime",
+                                or_(
+                                    ST_X(dbm.EntityRow.geom) < _MAR_AOI[0],
+                                    ST_X(dbm.EntityRow.geom) > _MAR_AOI[1],
+                                    ST_Y(dbm.EntityRow.geom) < _MAR_AOI[2],
+                                    ST_Y(dbm.EntityRow.geom) > _MAR_AOI[3],
+                                ),
+                            )
+                        )
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("[bootstrap] AOI persisted-row purge failed: %s", exc)
+        # Rebuild MMSI index in case any purged entity held a mapping.
+        maritime._mmsi_index = {  # noqa: SLF001
+            str(e.attrs.get("mmsi")): e.entity_id
+            for e in list(maritime.entities.values())
+            if e.attrs.get("mmsi")
+        }
+        log.info("[bootstrap] AOI sweep purged %d non-Texas maritime entities", purged)
+        audit_log.append(
+            actor="system", event_type="aoi_bootstrap_purge",
+            payload={"domain": "maritime", "purged": purged, "aoi": list(_MAR_AOI)},
+        )
 
     # Boot marker — written AFTER any seed so the seed entries take seq=0..N-1
     # and process_started follows them. Restarts append more process_started
